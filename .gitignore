@@ -1,0 +1,14 @@
+# Zig build artifacts and caches
+zig-out/
+.zig-cache/
+
+# Upstream reference code
+references/
+
+# Agent configuration
+AGENTS.md
+
+# Editor and OS temporaries
+*.swp
+*~
+.DS_Store

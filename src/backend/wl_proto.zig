@@ -1,0 +1,232 @@
+//! xdg-shell wire tables, hand-written from proto/xdg-shell.xml.
+//! Replaces wayland-scanner output: wl_interface/wl_message descriptors for
+//! xdg_wm_base, xdg_surface, xdg_toplevel plus request opcode constants.
+//! Core interfaces (registry/compositor/shm/surface/...) are extern symbols
+//! from libwayland-client; only xdg tables live here.
+
+const c = @import("c");
+
+extern const wl_registry_interface: c.wl_interface;
+extern const wl_compositor_interface: c.wl_interface;
+extern const wl_shm_interface: c.wl_interface;
+extern const wl_shm_pool_interface: c.wl_interface;
+extern const wl_surface_interface: c.wl_interface;
+extern const wl_buffer_interface: c.wl_interface;
+extern const wl_callback_interface: c.wl_interface;
+extern const wl_seat_interface: c.wl_interface;
+extern const wl_keyboard_interface: c.wl_interface;
+
+pub const core = struct {
+    pub const registry: *const c.wl_interface = &wl_registry_interface;
+    pub const compositor: *const c.wl_interface = &wl_compositor_interface;
+    pub const shm: *const c.wl_interface = &wl_shm_interface;
+    pub const shm_pool: *const c.wl_interface = &wl_shm_pool_interface;
+    pub const surface: *const c.wl_interface = &wl_surface_interface;
+    pub const buffer: *const c.wl_interface = &wl_buffer_interface;
+    pub const callback: *const c.wl_interface = &wl_callback_interface;
+    pub const seat: *const c.wl_interface = &wl_seat_interface;
+    pub const keyboard: *const c.wl_interface = &wl_keyboard_interface;
+
+    // Core request opcodes (stable ABI).
+    pub const DISPLAY_SYNC: u32 = 0;
+    pub const DISPLAY_GET_REGISTRY: u32 = 1;
+    pub const REGISTRY_BIND: u32 = 0;
+    pub const COMPOSITOR_CREATE_SURFACE: u32 = 0;
+    pub const SHM_CREATE_POOL: u32 = 0;
+    pub const POOL_CREATE_BUFFER: u32 = 0;
+    pub const POOL_DESTROY: u32 = 1;
+    pub const SURFACE_ATTACH: u32 = 1;
+    pub const SURFACE_FRAME: u32 = 3;
+    pub const SURFACE_COMMIT: u32 = 6;
+    pub const SURFACE_DAMAGE_BUFFER: u32 = 9;
+    pub const SEAT_GET_KEYBOARD: u32 = 1;
+
+    pub const SHM_FORMAT_ARGB8888: u32 = 0;
+    pub const SHM_FORMAT_XRGB8888: u32 = 1;
+};
+
+/// Protocol-level proxy objects. Opaque: only addresses cross FFI.
+pub const Compositor = opaque {};
+pub const Shm = opaque {};
+pub const ShmPool = opaque {};
+pub const Surface = opaque {};
+pub const Buffer = opaque {};
+pub const Callback = opaque {};
+pub const Seat = opaque {};
+pub const Keyboard = opaque {};
+pub const WmBase = opaque {};
+pub const XdgSurface = opaque {};
+pub const XdgToplevel = opaque {};
+
+/// wl_array mirror (wayland-util). Only size/data are read.
+pub const Array = extern struct {
+    size: usize,
+    alloc: usize,
+    data: ?*anyopaque,
+};
+
+// ---------------------------------------------------------------------------
+// xdg_wm_base (opcodes: destroy=0, create_positioner=1, get_xdg_surface=2, pong=3)
+// ---------------------------------------------------------------------------
+
+pub const wm_base = struct {
+    pub const version: c_int = 7;
+    pub const GET_XDG_SURFACE: u32 = 2;
+    pub const PONG: u32 = 3;
+
+    var types_get_xdg_surface = [_]?*const c.wl_interface{ null, null };
+    var methods = [_]c.wl_message{
+        .{ .name = "destroy", .signature = "", .types = null },
+        .{ .name = "create_positioner", .signature = "n", .types = null },
+        .{ .name = "get_xdg_surface", .signature = "no", .types = &types_get_xdg_surface },
+        .{ .name = "pong", .signature = "u", .types = null },
+    };
+    var types_ping = [_]?*const c.wl_interface{null};
+    var events = [_]c.wl_message{
+        .{ .name = "ping", .signature = "u", .types = &types_ping },
+    };
+
+    pub var interface: c.wl_interface = .{
+        .name = "xdg_wm_base",
+        .version = version,
+        .method_count = 4,
+        .methods = &methods,
+        .event_count = 1,
+        .events = &events,
+    };
+
+    pub fn link(surface_iface: *const c.wl_interface) void {
+        types_get_xdg_surface[0] = @ptrCast(&xdg_surface.interface);
+        types_get_xdg_surface[1] = surface_iface;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// xdg_surface (opcodes: destroy=0, get_toplevel=1, get_popup=2,
+//              set_window_geometry=3, ack_configure=4)
+// ---------------------------------------------------------------------------
+
+pub const xdg_surface = struct {
+    pub const version: c_int = 7;
+    pub const GET_TOPLEVEL: u32 = 1;
+    pub const ACK_CONFIGURE: u32 = 4;
+
+    var types_get_toplevel = [_]?*const c.wl_interface{null};
+    var methods = [_]c.wl_message{
+        .{ .name = "destroy", .signature = "", .types = null },
+        .{ .name = "get_toplevel", .signature = "n", .types = &types_get_toplevel },
+        .{ .name = "get_popup", .signature = "n?oo", .types = null },
+        .{ .name = "set_window_geometry", .signature = "iiii", .types = null },
+        .{ .name = "ack_configure", .signature = "u", .types = null },
+    };
+    var types_configure = [_]?*const c.wl_interface{null};
+    var events = [_]c.wl_message{
+        .{ .name = "configure", .signature = "u", .types = &types_configure },
+    };
+
+    pub var interface: c.wl_interface = .{
+        .name = "xdg_surface",
+        .version = version,
+        .method_count = 5,
+        .methods = &methods,
+        .event_count = 1,
+        .events = &events,
+    };
+
+    pub fn link(toplevel_iface: *const c.wl_interface) void {
+        types_get_toplevel[0] = toplevel_iface;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// xdg_toplevel (selected opcodes: set_title=2, set_app_id=3, ...)
+// ---------------------------------------------------------------------------
+
+pub const xdg_toplevel = struct {
+    pub const version: c_int = 7;
+    pub const SET_TITLE: u32 = 2;
+    pub const SET_APP_ID: u32 = 3;
+
+    var methods = [_]c.wl_message{
+        .{ .name = "destroy", .signature = "", .types = null },
+        .{ .name = "set_parent", .signature = "?o", .types = null },
+        .{ .name = "set_title", .signature = "s", .types = null },
+        .{ .name = "set_app_id", .signature = "s", .types = null },
+        .{ .name = "show_window_menu", .signature = "ouii", .types = null },
+        .{ .name = "move", .signature = "ou", .types = null },
+        .{ .name = "resize", .signature = "ouu", .types = null },
+        .{ .name = "set_max_size", .signature = "ii", .types = null },
+        .{ .name = "set_min_size", .signature = "ii", .types = null },
+        .{ .name = "set_maximized", .signature = "", .types = null },
+        .{ .name = "unset_maximized", .signature = "", .types = null },
+        .{ .name = "set_fullscreen", .signature = "?o", .types = null },
+        .{ .name = "unset_fullscreen", .signature = "", .types = null },
+        .{ .name = "set_minimized", .signature = "", .types = null },
+    };
+    var types_configure = [_]?*const c.wl_interface{ null, null, null };
+    var events = [_]c.wl_message{
+        .{ .name = "configure", .signature = "iia", .types = &types_configure },
+        .{ .name = "close", .signature = "", .types = null },
+        .{ .name = "configure_bounds", .signature = "ii", .types = null },
+        .{ .name = "wm_capabilities", .signature = "a", .types = null },
+    };
+
+    pub var interface: c.wl_interface = .{
+        .name = "xdg_toplevel",
+        .version = version,
+        .method_count = 14,
+        .methods = &methods,
+        .event_count = 4,
+        .events = &events,
+    };
+};
+
+/// Cross-link xdg tables (must run before any marshal using them).
+pub fn linkAll() void {
+    xdg_surface.link(&xdg_toplevel.interface);
+    wm_base.link(core.surface);
+}
+
+const std = @import("std");
+
+fn cstr(p: [*c]const u8) ?[]const u8 {
+    if (p == null) return null;
+    return std.mem.span(@as([*:0]const u8, @ptrCast(p)));
+}
+
+fn expectName(iface: *const c.wl_interface, want: []const u8) !void {
+    const got = cstr(iface.name) orelse return error.Fail;
+    try std.testing.expectEqualStrings(want, got);
+}
+
+// Validates table shape against proto/xdg-shell.xml: every interface has a
+// name, sane counts, non-null methods/events, and link() wires the object
+// references marshal reads. Catches hand-table typos without a compositor.
+test "xdg tables sane + linked" {
+    linkAll();
+    const ifaces = [_]*const c.wl_interface{
+        &wm_base.interface,
+        &xdg_surface.interface,
+        &xdg_toplevel.interface,
+    };
+    const names = [_][]const u8{ "xdg_wm_base", "xdg_surface", "xdg_toplevel" };
+    const methods = [_]c_int{ 4, 5, 14 };
+    const events = [_]c_int{ 1, 1, 4 };
+    for (ifaces, names, methods, events) |iface, want_name, want_m, want_e| {
+        try expectName(iface, want_name);
+        try std.testing.expectEqual(want_m, iface.method_count);
+        try std.testing.expectEqual(want_e, iface.event_count);
+        try std.testing.expect(iface.methods != null);
+        try std.testing.expect(iface.events != null);
+    }
+    // get_xdg_surface "no": [xdg_surface, wl_surface].
+    try std.testing.expect(wm_base.types_get_xdg_surface[0] != null);
+    try std.testing.expect(wm_base.types_get_xdg_surface[1] != null);
+    try expectName(wm_base.types_get_xdg_surface[0].?, "xdg_surface");
+    try expectName(wm_base.types_get_xdg_surface[1].?, "wl_surface");
+    try std.testing.expect(xdg_surface.types_get_toplevel[0] != null);
+    // Opcode sanity (must match proto/xdg-shell.xml order).
+    try std.testing.expectEqual(@as(u32, 2), wm_base.GET_XDG_SURFACE);
+    try std.testing.expectEqual(@as(u32, 1), xdg_surface.GET_TOPLEVEL);
+    try std.testing.expectEqual(@as(u32, 4), xdg_surface.ACK_CONFIGURE);
+}
