@@ -31,10 +31,10 @@ pub const Config = struct {
     pad_x: u32 = 25,
     pad_y: u32 = 25,
 
-    // Theme (dark bg, bright fg; ANSI palette is starlight).
+    // Theme (dark bg, soft white fg; ANSI palette matches foot defaults).
     bg: u32 = 0x0B0F11,
-    fg: u32 = 0xFFFFFF,
-    cursor_color: u32 = 0xFFFFFF,
+    fg: u32 = 0xDCDCCC,
+    cursor_color: u32 = 0xDCDCCC,
     /// Background opacity (0x00 transparent .. 0xFF opaque). Below 0xFF the
     /// compositor blends/blurs the window (needs an ARGB-capable compositor).
     bg_opacity: u8 = 0xC7, // ≈0.78, foot.ini match

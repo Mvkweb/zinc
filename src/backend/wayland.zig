@@ -659,7 +659,12 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         bg_straight = t;
                     }
                     const bg = themed(bg_straight);
-                    if (cell.attr.dim) fg = 0xFF000000 | ((fg >> 1) & 0x7F7F7F);
+                    if (cell.attr.dim) {
+                        const r = ((fg >> 16) & 0xFF) * 2 / 3;
+                        const g = ((fg >> 8) & 0xFF) * 2 / 3;
+                        const b = (fg & 0xFF) * 2 / 3;
+                        fg = 0xFF000000 | (r << 16) | (g << 8) | b;
+                    }
                     const x: u32 = @intCast(px + @as(i32, col) * cw);
                     const y: u32 = @intCast(py + @as(i32, row) * ch);
                     software.fillRect(self.pool_pixels, W, H, x, y, @intCast(cw), @intCast(ch), bg, null);
@@ -797,9 +802,24 @@ pub fn App(comptime cfg: config_mod.Config) type {
             return dmg;
         }
 
+        var prof_frames: u32 = 0;
+        var prof_last_sec: i64 = 0;
+
         fn present(self: *Self) void {
             self.recreatePool() catch return;
+            const is_prof = std.c.getenv("ZINC_PROFILE") != null;
+            const t0: i64 = if (is_prof) context_mod.nowMs() else 0;
             const dmg = self.renderCells();
+            const t1: i64 = if (is_prof) context_mod.nowMs() else 0;
+            if (is_prof) {
+                prof_frames += 1;
+                const now = context_mod.nowMs();
+                if (now - prof_last_sec >= 1000) {
+                    std.debug.print("[zinc profile] fps: {}, render: {}ms\n", .{ prof_frames, t1 - t0 });
+                    prof_frames = 0;
+                    prof_last_sec = now;
+                }
+            }
             c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_ATTACH, self.buffer, @as(i32, 0), @as(i32, 0));
             if (dmg.empty) {
                 c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_DAMAGE_BUFFER, @as(i32, 0), @as(i32, 0), self.width, self.height);
@@ -866,9 +886,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         if (rrc < pty_buf.len) break;
                     }
                 }
-                if (self.needs_render and self.configured and !self.frame_pending) {
-                    self.present();
-                }
                 if (nfds == 3 and (fds[2].revents & linux.POLL.IN) != 0) {
                     // Repeat tick: drain the timer, re-emit, go periodic.
                     var exp: u64 = 0;
@@ -883,6 +900,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     }
                 }
                 if (self.ctx.tick()) self.needs_render = true;
+                if (self.needs_render and self.configured and !self.frame_pending) {
+                    self.present();
+                }
             }
         }
 
@@ -1063,7 +1083,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (cb) |f| c.wl_proxy_destroy(@ptrCast(f));
             if (self.frame_cb == cb) self.frame_cb = null;
             self.frame_pending = false;
-            self.needs_render = true;
         }
 
         fn appOnKeymap(data: ?*anyopaque, kb: ?*P.Keyboard, format: u32, fd: i32, size: u32) callconv(.c) void {

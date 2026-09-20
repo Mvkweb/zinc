@@ -401,14 +401,14 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             };
             for (osc_answers) |oa| {
                 if (std.mem.indexOf(u8, win, oa.pat) != null) {
-                    var ob: [48]u8 = undefined;
+                    var ob: [64]u8 = undefined;
                     const num = std.mem.indexOf(u8, oa.pat, "?").?;
                     const code = oa.pat[0..num];
-                    const msg = std.fmt.bufPrint(&ob, "\x1b]{s};rgb:{x:0>2}/{x:0>2}/{x:0>2}\x1b\\", .{
-                        code,
-                        (oa.color >> 16) & 0xFF,
-                        (oa.color >> 8) & 0xFF,
-                        oa.color & 0xFF,
+                    const r: u32 = (oa.color >> 16) & 0xFF;
+                    const g: u32 = (oa.color >> 8) & 0xFF;
+                    const b: u32 = oa.color & 0xFF;
+                    const msg = std.fmt.bufPrint(&ob, "\x1b]{s};rgb:{x:0>2}{x:0>2}/{x:0>2}{x:0>2}/{x:0>2}{x:0>2}\x1b\\", .{
+                        code, r, r, g, g, b, b,
                     }) catch null;
                     if (msg) |m| self.emit(m);
                     replied = true;
@@ -482,12 +482,12 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         }
 
         fn defaultAnsi() [16]u32 {
-            // foot starlight V4 default palette.
+            // foot default palette (Zenburn-derived).
             return .{
-                0x242424, 0xF62B5A, 0x47B413, 0xE3C401,
-                0x24ACD4, 0xF2AFFD, 0x13C299, 0xE6E6E6,
-                0x616161, 0xFF4D51, 0x35D450, 0xE9E836,
-                0x5DC5F8, 0xFEABF2, 0x24DFC4, 0xFFFFFF,
+                0x222222, 0xCC9393, 0x7F9F7F, 0xD0BF8F,
+                0x6CA0A3, 0xDC8CC3, 0x93E0E3, 0xDCDCCC,
+                0x666666, 0xDCA3A3, 0xBFEBBF, 0xF0DFAF,
+                0x8CD0D3, 0xFCACE3, 0xB3FFFF, 0xFFFFFF,
             };
         }
 
@@ -570,15 +570,17 @@ pub fn Context(comptime cfg: config_mod.Config) type {
 
         /// Earliest ms until animated state needs redraw; -1 = static.
         pub fn getTimeoutMs(self: *const Self) i32 {
-            _ = self;
-            if (cfg.cursor_blink) return @intCast(cfg.cursor_blink_rate_ms);
-            return -1;
+            if (!cfg.cursor_blink or !self.focused) return -1;
+            const now = nowMs();
+            const elapsed = now - self.blink_last_ms;
+            if (elapsed >= cfg.cursor_blink_rate_ms) return 0;
+            return @intCast(cfg.cursor_blink_rate_ms - elapsed);
         }
 
         /// Advance time-based state (cursor blink). Returns true when the
         /// visual state changed and the frame must be re-rendered.
         pub fn tick(self: *Self) bool {
-            if (!cfg.cursor_blink) return false;
+            if (!cfg.cursor_blink or !self.focused) return false;
             const now = nowMs();
             if (now - self.blink_last_ms < cfg.cursor_blink_rate_ms) return false;
             self.blink_last_ms = now;
