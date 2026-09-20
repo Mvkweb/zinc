@@ -4,6 +4,11 @@
 
 const std = @import("std");
 const c = @import("c");
+
+/// libc file append for ZINC_TRACE (see tracePty). pty.zig precedent.
+extern "c" fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
+extern "c" fn fwrite(ptr: [*]const u8, size: usize, nmemb: usize, stream: *anyopaque) usize;
+extern "c" fn fclose(stream: *anyopaque) c_int;
 const wl_proto = @import("wl_proto.zig");
 
 pub const BackendError = error{
@@ -574,6 +579,15 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         // -- render + present (text via atlas; images in phase 4) -----------
 
+        /// Debug: with ZINC_TRACE=1, append raw PTY bytes to
+        /// /tmp/zinc-trace.bin for offline escape-stream analysis.
+        fn tracePty(bytes: []const u8) void {
+            if (std.c.getenv("ZINC_TRACE") == null) return;
+            const f = fopen("/tmp/zinc-trace.bin", "ab") orelse return;
+            _ = fwrite(bytes.ptr, 1, bytes.len, f);
+            _ = fclose(f);
+        }
+
         fn dmgMerge(dst: *software.Damage, src: software.Damage) void {
             if (!src.empty) dst.add(src.x, src.y, src.w, src.h);
         }
@@ -833,6 +847,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                             self.running = false;
                             break;
                         }
+                        tracePty(pty_buf[0..rrc]);
                         self.ctx.answerQueries(pty_buf[0..rrc]);
                         self.ctx.parse(pty_buf[0..rrc]);
                         self.needs_render = true;
