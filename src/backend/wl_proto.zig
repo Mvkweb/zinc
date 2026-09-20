@@ -146,6 +146,7 @@ pub const xdg_toplevel = struct {
     pub const version: c_int = 7;
     pub const SET_TITLE: u32 = 2;
     pub const SET_APP_ID: u32 = 3;
+    pub const SET_MIN_SIZE: u32 = 8;
 
     var methods = [_]c.wl_message{
         .{ .name = "destroy", .signature = "", .types = null },

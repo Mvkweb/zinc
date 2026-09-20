@@ -411,6 +411,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
             c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.SET_TITLE, @as([*:0]const u8, "zinc"));
             c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.SET_APP_ID, @as([*:0]const u8, "zinc"));
+            const min_w = @as(i32, 15) * self.cell_w + 2 * @as(i32, @intCast(cfg.pad_x));
+            const min_h = @as(i32, 3) * self.cell_h + 2 * @as(i32, @intCast(cfg.pad_y));
+            c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.SET_MIN_SIZE, min_w, min_h);
             c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_COMMIT);
 
             // Roundtrip until the compositor sends the first configure.
@@ -837,8 +840,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (w == self.width and h == self.height) return;
             self.width = w;
             self.height = h;
-            const cols: u16 = @intCast(@max(1, @divFloor(w - 2 * @as(i32, @intCast(cfg.pad_x)), self.cell_w)));
-            const rows: u16 = @intCast(@max(1, @divFloor(h - 2 * @as(i32, @intCast(cfg.pad_y)), self.cell_h)));
+            const cols: u16 = @intCast(@max(15, @divFloor(w - 2 * @as(i32, @intCast(cfg.pad_x)), self.cell_w)));
+            const rows: u16 = @intCast(@max(3, @divFloor(h - 2 * @as(i32, @intCast(cfg.pad_y)), self.cell_h)));
 
             if (self.is_resizing or self.resize_settle_ms > 0) {
                 // Interactive drag in progress: delay reflow and SIGWINCH until drag settles (Foot parity).

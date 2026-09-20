@@ -26,6 +26,71 @@ fn isCellBlank(comptime cfg: config_mod.Config, cell: cell_mod.Cell(cfg), def_bg
     return true;
 }
 
+/// libc file append for ZINC_REFLOW_LOG (wayland.zig tracePty precedent).
+extern "c" fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
+extern "c" fn fwrite(ptr: [*]const u8, size: usize, nmemb: usize, stream: *anyopaque) usize;
+extern "c" fn fclose(stream: *anyopaque) c_int;
+
+/// Debug: with ZINC_REFLOW_LOG=1, append a before/after snapshot (dims,
+/// cursor, pull/fill counts, every screen + scrollback row as text with a
+/// [W] suffix on wrapped rows) to /tmp/zinc-reflow.log on each reflowGrid
+/// call. Offline analysis for resize-corruption bugs; one getenv when unset.
+fn logReflow(
+    comptime cfg: config_mod.Config,
+    gpa: std.mem.Allocator,
+    grid: anytype,
+    tag: []const u8,
+    cols: u16,
+    rows: u16,
+    tgt_cols: u16,
+    tgt_rows: u16,
+    ccol: u16,
+    crow: u16,
+    pull_count: usize,
+    fill_top: usize,
+) void {
+    if (std.c.getenv("ZINC_REFLOW_LOG") == null) return;
+    const f = fopen("/tmp/zinc-reflow.log", "ab") orelse return;
+    defer _ = fclose(f);
+    var aw: std.Io.Writer.Allocating = .init(gpa);
+    defer aw.deinit();
+    aw.writer.print("=== {s} {d}x{d} -> {d}x{d} cursor={d},{d} sb_len={d} pull={d} fill={d}\n", .{
+        tag, cols, rows, tgt_cols, tgt_rows, ccol, crow, grid.sb_len, pull_count, fill_top,
+    }) catch return;
+    var r: usize = 0;
+    while (r < rows) : (r += 1) {
+        aw.writer.print("S{d:4} |", .{r}) catch return;
+        var c: usize = 0;
+        while (c < cols) : (c += 1) {
+            const v: u32 = grid.cells[r * cols + c].rune;
+            const ch: u8 = if (v >= 32 and v < 127) @intCast(v) else '?';
+            aw.writer.print("{c}", .{ch}) catch return;
+        }
+        const w = grid.cells[r * cols + cols - 1].wrapped;
+        aw.writer.print("|{s}\n", .{if (w) "[W]" else ""}) catch return;
+    }
+    if (comptime cfg.scrollback_cap > 0) {
+        var i: usize = 0;
+        while (i < grid.sb_len) : (i += 1) {
+            const phys = (grid.sb_head + i) % cfg.scrollback_cap;
+            aw.writer.print("H{d:4} |", .{i}) catch return;
+            if (grid.sb_rows[phys]) |row| {
+                for (row) |cell| {
+                    const v: u32 = cell.rune;
+                    const ch: u8 = if (v >= 32 and v < 127) @intCast(v) else '?';
+                    aw.writer.print("{c}", .{ch}) catch return;
+                }
+                const w = row.len > 0 and row[row.len - 1].wrapped;
+                aw.writer.print("|{s}\n", .{if (w) "[W]" else ""}) catch return;
+            } else {
+                aw.writer.print("(null)\n", .{}) catch return;
+            }
+        }
+    }
+    const bytes = aw.written();
+    if (bytes.len > 0) _ = fwrite(bytes.ptr, 1, bytes.len, f);
+}
+
 pub fn reflowGrid(
     comptime cfg: config_mod.Config,
     gpa: std.mem.Allocator,
@@ -43,36 +108,14 @@ pub fn reflowGrid(
     if (new_cols == old_cols and new_rows == old_rows) return;
     if (new_cols == 0 or new_rows == 0) return;
 
-    // 1. Identify active screen rows.
-    // In normal shell operation, cursor_row.* marks the active editing line. Any content
-    // below cursor_row.* is either stale artifacts from previous resizes or blank space;
-    // clamping active_screen_rows to cursor_row.* + 1 guarantees that ghost lines below
-    // the prompt are never gathered and are cleanly wiped.
+    logReflow(cfg, gpa, grid, "before", old_cols, old_rows, new_cols, new_rows, cursor_col.*, cursor_row.*, 0, 0);
+
+    // 1. Gather all input rows in chronological order:
+    // First, all history rows in the scrollback ring (oldest -> newest).
+    // Second, all active screen rows up to cursor_row.* + 1.
     const active_screen_rows = @min(@as(usize, cursor_row.*) + 1, @as(usize, old_rows));
-
-    // 2. Determine how many rows to pull from scrollback.
-    // Only pull if the newest scrollback row soft-wrapped into the top screen row.
-    // Do NOT pull rows on simple window height growth (Ghostty parity) to prevent
-    // shifting the prompt downwards and desynchronizing the shell's cursor calculations.
-    var pull_count: usize = 0;
-    if (comptime cfg.scrollback_cap > 0) {
-        if (grid.sb_len > 0) {
-            const newest_phys = (grid.sb_head + grid.sb_len - 1) % cfg.scrollback_cap;
-            const newest_sb = grid.sb_rows[newest_phys];
-            const sb_wrapped = if (newest_sb) |sb| (sb.len > 0 and sb[sb.len - 1].wrapped) else false;
-
-            if (sb_wrapped) {
-                var k: usize = 0;
-                while (k < grid.sb_len) : (k += 1) {
-                    const phys = (grid.sb_head + grid.sb_len - 1 - k) % cfg.scrollback_cap;
-                    if (grid.sb_rows[phys]) |row| {
-                        pull_count += 1;
-                        if (row.len == 0 or !row[row.len - 1].wrapped) break;
-                    } else break;
-                }
-            }
-        }
-    }
+    const sb_count: usize = if (comptime cfg.scrollback_cap > 0) grid.sb_len else 0;
+    const total_input = sb_count + active_screen_rows;
 
     const InputRow = struct {
         cells: []const C,
@@ -80,42 +123,36 @@ pub fn reflowGrid(
         is_cursor: bool,
     };
 
-    const total_input = pull_count + active_screen_rows;
     const input_rows = try gpa.alloc(InputRow, total_input);
     defer gpa.free(input_rows);
 
-    // Pull rows from scrollback ring (oldest pulled to newest pulled)
     if (comptime cfg.scrollback_cap > 0) {
-        if (pull_count > 0) {
-            const start_logical = grid.sb_len - pull_count;
-            for (0..pull_count) |i| {
-                const phys = (grid.sb_head + start_logical + i) % cfg.scrollback_cap;
-                const rslice = grid.sb_rows[phys] orelse &.{};
-                const is_wrap = if (rslice.len > 0) rslice[rslice.len - 1].wrapped else false;
-                input_rows[i] = .{
-                    .cells = rslice,
-                    .wrapped = is_wrap,
-                    .is_cursor = false,
-                };
-            }
-            grid.sb_len -= pull_count;
+        for (0..sb_count) |i| {
+            const phys = (grid.sb_head + i) % cfg.scrollback_cap;
+            const rslice = grid.sb_rows[phys] orelse &.{};
+            const is_wrap = if (rslice.len > 0) rslice[rslice.len - 1].wrapped else false;
+            input_rows[i] = .{
+                .cells = rslice,
+                .wrapped = is_wrap,
+                .is_cursor = false,
+            };
         }
     }
 
-    // Grid screen rows up to active_screen_rows
     for (0..active_screen_rows) |r| {
         const start = r * @as(usize, old_cols);
         const rslice = grid.cells[start .. start + old_cols];
         const is_wrap = if (rslice.len > 0) rslice[rslice.len - 1].wrapped else false;
-        input_rows[pull_count + r] = .{
+        input_rows[sb_count + r] = .{
             .cells = rslice,
             .wrapped = is_wrap,
             .is_cursor = (r == cursor_row.*),
         };
     }
 
-    var out_rows = try std.ArrayList([]C).initCapacity(gpa, new_rows + 16);
-    defer {
+    // 2. Linear stream rewrapping into out_rows of width new_cols
+    var out_rows = try std.ArrayList([]C).initCapacity(gpa, total_input + 16);
+    errdefer {
         for (out_rows.items) |r| gpa.free(r);
         out_rows.deinit(gpa);
     }
@@ -146,11 +183,12 @@ pub fn reflowGrid(
             }
 
             if (!is_last_row) {
-                // Continuation row: keep all cells
+                // Continuation row: soft wrap, keep ALL cells intact (sfte: if (row[cols-1].wrapped) return cols).
+                // Never trim continuation rows, preserving internal spaces across wrapped columns.
                 try line_cells.appendSlice(gpa, ir.cells);
                 current_cell_count += ir.cells.len;
             } else {
-                // Final row of logical line: trim trailing blank cells unless cursor is there
+                // Final row of logical line: trim trailing blank cells (width padding) unless cursor is sitting there.
                 var last_non_blank: usize = 0;
                 var c = ir.cells.len;
                 while (c > 0) {
@@ -158,46 +196,6 @@ pub fn reflowGrid(
                     if (!isCellBlank(cfg, ir.cells[c], def_bg)) {
                         last_non_blank = c + 1;
                         break;
-                    }
-                }
-                // In the prompt zone (cursor row or lines immediately above it):
-                // If there is a large gap of whitespace (>= 4 blanks) leading to right-aligned
-                // text at the right margin (such as Starship's $fill / $git_metrics or Fish's rprompt),
-                // trim that right-aligned text! The shell will redraw its prompt and right-aligned
-                // decorations cleanly for the new width upon receiving SIGWINCH. Preserving obsolete
-                // right-margin padding across a resize causes the line to wrap onto extra rows,
-                // breaking multiline prompts, stranding ghost rows, and drifting the cursor.
-                const cursor_input_row = pull_count + @as(usize, cursor_row.*);
-                const ir_idx = line_start + line_row_idx;
-                const is_prompt_zone = (ir_idx + 2 >= cursor_input_row and ir_idx <= cursor_input_row);
-
-                if (!ir.wrapped and is_prompt_zone and last_non_blank > 0) {
-                    const min_col_for_gap = if (ir.is_cursor) @as(usize, cursor_col.*) else 0;
-                    if (last_non_blank > min_col_for_gap) {
-                        var scan = last_non_blank;
-                        var run_blanks: usize = 0;
-                        var found_gap = false;
-                        var gap_start: usize = last_non_blank;
-                        while (scan > min_col_for_gap) {
-                            scan -= 1;
-                            if (isCellBlank(cfg, ir.cells[scan], def_bg)) {
-                                run_blanks += 1;
-                                if (run_blanks >= 4) {
-                                    found_gap = true;
-                                    gap_start = scan;
-                                }
-                            } else {
-                                if (found_gap) break;
-                                run_blanks = 0;
-                            }
-                        }
-                        if (found_gap) {
-                            if (ir.is_cursor) {
-                                last_non_blank = @min(last_non_blank, @max(@as(usize, cursor_col.*) + 1, gap_start));
-                            } else {
-                                last_non_blank = gap_start;
-                            }
-                        }
                     }
                 }
 
@@ -240,7 +238,6 @@ pub fn reflowGrid(
                 const cell = line_cells.items[i];
                 const is_wide = utf8_mod.isWide(cellCp(cell.rune));
                 if (is_wide and col == new_cols - 1) {
-                    // Wide char doesn't fit in last column; pad and wrap
                     cur_row.?[col] = .{ .bg = def_bg, .wrapped = true };
                     try out_rows.append(gpa, cur_row.?);
                     cur_row = try gpa.alloc(C, new_cols);
@@ -255,6 +252,7 @@ pub fn reflowGrid(
                 }
 
                 cur_row.?[col] = cell;
+                cur_row.?[col].wrapped = false;
                 col += 1;
 
                 if (col == new_cols) {
@@ -299,36 +297,67 @@ pub fn reflowGrid(
         }
     }
 
-    const R = out_rows.items.len;
+    const total_lines = out_rows.items.len;
+    const cursor_line = tracked_cursor_row orelse (if (total_lines > 0) total_lines - 1 else 0);
+    const cursor_col_val = @min(tracked_cursor_col, new_cols - 1);
+
+    // 3. Viewport & Scrollback Extraction (sfte parity)
+    const was_at_bottom = cursor_row.* >= old_rows -| 1;
+    const r: usize = if (was_at_bottom)
+        @min(@as(usize, cursor_line), @as(usize, new_rows -| 1))
+    else
+        @min(@as(usize, cursor_row.*), @as(usize, new_rows -| 1));
+
+    var screen_top: i64 = @as(i64, @intCast(cursor_line)) - @as(i64, @intCast(r));
+    if (screen_top < 0) screen_top = 0;
+    const st: usize = @intCast(screen_top);
+
+    // Free all old rows in scrollback ring
+    if (comptime cfg.scrollback_cap > 0) {
+        for (0..grid.sb_len) |i| {
+            const phys = (grid.sb_head + i) % cfg.scrollback_cap;
+            if (grid.sb_rows[phys]) |old_r| {
+                gpa.free(old_r);
+                grid.sb_rows[phys] = null;
+            }
+        }
+        grid.sb_head = 0;
+        grid.sb_len = 0;
+    }
+
+    // Scrollback gets rows 0 .. st (capped at scrollback_cap)
+    if (comptime cfg.scrollback_cap > 0) {
+        const drop_count = if (st > cfg.scrollback_cap) st - cfg.scrollback_cap else 0;
+        for (out_rows.items[0..drop_count]) |old_r| gpa.free(old_r);
+        for (out_rows.items[drop_count..st]) |sb_r| {
+            grid.sb_rows[grid.sb_len] = sb_r;
+            grid.sb_len += 1;
+        }
+    } else {
+        for (out_rows.items[0..st]) |old_r| gpa.free(old_r);
+    }
+
+    // Live screen gets rows st .. min(st + new_rows, total_lines)
+    const copy_lines = @min(total_lines - st, @as(usize, new_rows));
     const new_cells = try gpa.alloc(C, @as(usize, new_cols) * new_rows);
     @memset(new_cells, .{ .bg = def_bg });
 
-    if (R > new_rows) {
-        const overflow = R - new_rows;
-        for (out_rows.items[0..overflow]) |r| {
-            grid.pushScrollbackRow(r);
-        }
-        for (out_rows.items[overflow..R], 0..) |r, dest_r| {
-            @memcpy(new_cells[dest_r * new_cols .. (dest_r + 1) * new_cols], r);
-        }
-        if (tracked_cursor_row) |tcr| {
-            cursor_row.* = @intCast(tcr -| overflow);
-            cursor_row.* = @min(cursor_row.*, new_rows - 1);
-            cursor_col.* = @min(tracked_cursor_col, new_cols - 1);
-        }
-    } else {
-        for (out_rows.items[0..R], 0..) |r, dest_r| {
-            @memcpy(new_cells[dest_r * new_cols .. (dest_r + 1) * new_cols], r);
-        }
-        if (tracked_cursor_row) |tcr| {
-            cursor_row.* = @intCast(@min(tcr, new_rows - 1));
-            cursor_col.* = @min(tracked_cursor_col, new_cols - 1);
-        }
+    for (0..copy_lines) |line_i| {
+        const src_r = out_rows.items[st + line_i];
+        @memcpy(new_cells[line_i * new_cols .. (line_i + 1) * new_cols], src_r);
+        gpa.free(src_r);
     }
+
+    // Free any remaining rows in out_rows past the visible screen
+    for (out_rows.items[st + copy_lines ..]) |extra_r| {
+        gpa.free(extra_r);
+    }
+    out_rows.deinit(gpa);
 
     grid.gpa.free(grid.cells);
     grid.cells = new_cells;
 
+    // Alt-screen crop
     if (cfg.alt_screen and grid.alt_cells.len > 0) {
         const new_alt = try grid.gpa.alloc(C, @as(usize, new_cols) * new_rows);
         @memset(new_alt, .{ .bg = def_bg });
@@ -345,9 +374,12 @@ pub fn reflowGrid(
         grid.alt_cells = new_alt;
     }
 
+    cursor_row.* = @intCast(cursor_line - st);
+    cursor_col.* = cursor_col_val;
     grid.cols = new_cols;
     grid.rows = new_rows;
-    grid.view_offset = @min(grid.view_offset, grid.sb_len);
+    grid.view_offset = 0;
+    logReflow(cfg, gpa, grid, "after", new_cols, new_rows, new_cols, new_rows, cursor_col.*, cursor_row.*, 0, 0);
     grid.markAllDirty();
 }
 
@@ -444,9 +476,9 @@ test "horizontal reflow does not pull unrelated scrollback rows" {
     var g = try G.init(std.testing.allocator, 20, 10);
     defer g.deinit();
 
-    // Push 3 lines to scrollback (e.g. earlier commands)
+    // Push 3 lines to scrollback (20 'S' characters each)
     var dummy: [20]cell_mod.Cell(cfg) = [_]cell_mod.Cell(cfg){.{}} ** 20;
-    dummy[0].setRune('S');
+    for (&dummy) |*c| c.setRune('S');
     g.pushScrollbackRow(&dummy);
     g.pushScrollbackRow(&dummy);
     g.pushScrollbackRow(&dummy);
@@ -461,48 +493,329 @@ test "horizontal reflow does not pull unrelated scrollback rows" {
     // Rows 2..9 are completely blank
 
     // Narrowing width from 20 to 15: new_rows is still 10!
-    // Must NOT pull the 3 scrollback rows onto the screen!
+    // Each 20-char line wraps to 2 rows at width 15 (3x2 = 6 rows in scrollback).
+    // Screen lines (Hi + prompt) stay on screen.
     try reflowGrid(cfg, std.testing.allocator, &g, 15, 10, &cur_col, &cur_row, cfg.bg);
     try std.testing.expectEqual(@as(u16, 15), g.cols);
     try std.testing.expectEqual(@as(u16, 10), g.rows);
-    try std.testing.expectEqual(@as(usize, 3), g.sb_len); // Scrollback intact!
+    try std.testing.expectEqual(@as(usize, 6), g.sb_len);
+    var si: usize = 0;
+    while (si < g.sb_len) : (si += 1) {
+        const phys = (g.sb_head + si) % 8;
+        const row = g.sb_rows[phys] orelse return error.Fail;
+        try std.testing.expectEqual(@as(usize, 15), row.len);
+    }
+    try std.testing.expectEqual(@as(u32, 'S'), (g.sb_rows[g.sb_head] orelse return error.Fail)[0].rune);
     try std.testing.expectEqual(@as(u32, 'H'), g.at(0, 0).rune);
     try std.testing.expectEqual(@as(u32, 'i'), g.at(1, 0).rune);
     try std.testing.expectEqual(@as(u16, 0), cur_col);
     try std.testing.expectEqual(@as(u16, 1), cur_row); // Prompt stays at row 1!
 }
 
-test "prompt zone trims right-aligned decorations across resize" {
+test "box with default background and interior space gaps restores byte-identical" {
+    // Fastfetch / neofetch boxes with default background (cfg.bg), internal spaces
+    // between labels and values (e.g. "mem        12.20 GiB"), and right borders.
+    // When resized narrower (so lines wrap across the spaces) and widened back, all spaces
+    // and borders must restore byte-identical without eating spaces or shifting borders.
+    const grid_mod = @import("grid.zig");
+    const cfg = config_mod.Config{ .scrollback_cap = 16, .alt_screen = false };
+    const G = grid_mod.Grid(cfg);
+    var g = try G.init(std.testing.allocator, 40, 5);
+    defer g.deinit();
+
+    // Line 0: "│ mem        12.20 GiB │"
+    g.at(0, 0).setRune(0x2502);
+    g.at(1, 0).setRune(' ');
+    g.at(2, 0).setRune('m');
+    g.at(3, 0).setRune('e');
+    g.at(4, 0).setRune('m');
+    // cols 5..12 are 8 spaces
+    const val = "12.20 GiB";
+    for (val, 0..) |ch, i| g.at(@intCast(13 + i), 0).setRune(ch);
+    g.at(22, 0).setRune(' ');
+    g.at(23, 0).setRune(0x2502);
+
+    // Line 1: prompt "> " with cursor at col 2
+    g.at(0, 1).setRune('>');
+    g.at(1, 1).setRune(' ');
+    var cur_col: u16 = 2;
+    var cur_row: u16 = 1;
+
+    var snap: [24]u32 = undefined;
+    for (0..24) |c| snap[c] = g.at(@intCast(c), 0).rune;
+
+    // Narrowing to 15 cols: forces Line 0 to soft-wrap across the spaces into 2 rows
+    try reflowGrid(cfg, std.testing.allocator, &g, 15, 5, &cur_col, &cur_row, cfg.bg);
+    try std.testing.expectEqual(@as(u16, 15), g.cols);
+
+    // Widen back to 40 cols: all 8 spaces and right border must be preserved!
+    try reflowGrid(cfg, std.testing.allocator, &g, 40, 5, &cur_col, &cur_row, cfg.bg);
+    try std.testing.expectEqual(@as(u16, 40), g.cols);
+    for (0..24) |c| {
+        try std.testing.expectEqual(snap[c], g.at(@intCast(c), 0).rune);
+    }
+}
+
+test "scrollback pops back after super-thin excursion" {
     const grid_mod = @import("grid.zig");
     const cfg = config_mod.Config{ .scrollback_cap = 8, .alt_screen = false };
     const G = grid_mod.Grid(cfg);
-    var g = try G.init(std.testing.allocator, 20, 5);
+    var g = try G.init(std.testing.allocator, 4, 2);
     defer g.deinit();
 
-    // Row 0: Starship line 1 with directory and right git status: "dir" ... "git"
-    g.at(0, 0).setRune('d');
-    g.at(1, 0).setRune('i');
-    g.at(2, 0).setRune('r');
-    // cols 3..16 are blanks
-    g.at(17, 0).setRune('g');
-    g.at(18, 0).setRune('i');
-    g.at(19, 0).setRune('t');
-
-    // Row 1: Starship line 2 with prompt char and input cursor: "> "
-    g.at(0, 1).setRune('>');
-    var cur_col: u16 = 1;
+    g.at(0, 0).setRune('A');
+    g.at(1, 0).setRune('B');
+    g.at(2, 0).setRune('C');
+    g.at(3, 0).setRune('D');
+    g.at(0, 1).setRune('E');
+    g.at(1, 1).setRune('F');
+    g.at(2, 1).setRune('G');
+    g.at(3, 1).setRune('H');
+    g.scrollUp(true);
+    g.scrollUp(true); // sb = [ABCD, EFGH] at width 4, screen blank
+    var cur_col: u16 = 0;
     var cur_row: u16 = 1;
 
-    // Narrowing to 12 cols:
-    // Row 0's gap and "git" should be trimmed so Row 0 stays on Row 0 and does not wrap into Row 1!
-    // Cursor must stay on Row 1, Col 1!
-    try reflowGrid(cfg, std.testing.allocator, &g, 12, 5, &cur_col, &cur_row, cfg.bg);
-    try std.testing.expectEqual(@as(u16, 12), g.cols);
-    try std.testing.expectEqual(@as(u16, 5), g.rows);
-    try std.testing.expectEqual(@as(u32, 'd'), g.at(0, 0).rune);
-    try std.testing.expectEqual(@as(u32, 'i'), g.at(1, 0).rune);
-    try std.testing.expectEqual(@as(u32, 'r'), g.at(2, 0).rune);
-    try std.testing.expectEqual(@as(u32, '>'), g.at(0, 1).rune);
-    try std.testing.expectEqual(@as(u16, 1), cur_col);
-    try std.testing.expectEqual(@as(u16, 1), cur_row);
+    // Crush to 1 col: lines wrap into 1-col rows.
+    try reflowGrid(cfg, std.testing.allocator, &g, 1, 4, &cur_col, &cur_row, cfg.bg);
+    try std.testing.expect(g.sb_len > 0);
+
+    // Widen back to 4 cols x 4 rows: all lines (ABCD, EFGH, prompt) fit on screen!
+    // Top-anchored: ABCD at row 0, EFGH at row 1, prompt at row 2, sb_len = 0.
+    try reflowGrid(cfg, std.testing.allocator, &g, 4, 4, &cur_col, &cur_row, cfg.bg);
+    try std.testing.expectEqual(@as(usize, 0), g.sb_len);
+    try std.testing.expectEqual(@as(u32, 'A'), g.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'B'), g.at(1, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'C'), g.at(2, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'D'), g.at(3, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'E'), g.at(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, 'F'), g.at(1, 1).rune);
+    try std.testing.expectEqual(@as(u32, 'G'), g.at(2, 1).rune);
+    try std.testing.expectEqual(@as(u32, 'H'), g.at(3, 1).rune);
+    try std.testing.expectEqual(@as(u16, 3), cur_row);
+}
+
+test "mixed-width scrollback heals even on height-only resize" {
+    const grid_mod = @import("grid.zig");
+    const cfg = config_mod.Config{ .scrollback_cap = 8, .alt_screen = false };
+    const G = grid_mod.Grid(cfg);
+    var g = try G.init(std.testing.allocator, 4, 2);
+    defer g.deinit();
+
+    g.at(0, 0).setRune('A');
+    g.scrollUp(true); // sb = [A...] at width 4
+    // Simulate a stale narrow row left by an earlier thin excursion.
+    var stale: [2]cell_mod.Cell(cfg) = [_]cell_mod.Cell(cfg){.{}} ** 2;
+    stale[0].setRune('X');
+    stale[1].setRune('Y');
+    g.pushScrollbackRow(&stale);
+    var cur_col: u16 = 0;
+    var cur_row: u16 = 1;
+
+    // Same width, taller window: 4 lines (A, XY, blank, prompt) on 3-row screen.
+    // Line 0 (A) remains in scrollback, XY at row 0, prompt at row 2.
+    try reflowGrid(cfg, std.testing.allocator, &g, 4, 3, &cur_col, &cur_row, cfg.bg);
+    try std.testing.expectEqual(@as(u16, 4), g.cols);
+    try std.testing.expectEqual(@as(u16, 3), g.rows);
+    try std.testing.expectEqual(@as(usize, 1), g.sb_len);
+    const h0 = g.sb_rows[g.sb_head] orelse return error.Fail;
+    try std.testing.expectEqual(@as(usize, 4), h0.len);
+    try std.testing.expectEqual(@as(u32, 'A'), h0[0].rune);
+    try std.testing.expectEqual(@as(u32, 'X'), g.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'Y'), g.at(1, 0).rune);
+    try std.testing.expectEqual(@as(u16, 0), cur_col);
+    try std.testing.expectEqual(@as(u16, 2), cur_row);
+}
+
+test "widen-back refills screen from scrollback" {
+    // Top-anchored layout: when space is freed, content flows back from
+    // scrollback starting at row 0, prompt follows its line, and clean space
+    // stays below the prompt (never shifting the entire screen down).
+    const grid_mod = @import("grid.zig");
+    const cfg = config_mod.Config{ .scrollback_cap = 8, .alt_screen = false };
+    const G = grid_mod.Grid(cfg);
+    var g = try G.init(std.testing.allocator, 4, 2);
+    defer g.deinit();
+
+    var head0: [4]cell_mod.Cell(cfg) = [_]cell_mod.Cell(cfg){.{}} ** 4;
+    head0[0].setRune('A');
+    head0[1].setRune('B');
+    head0[2].setRune('C');
+    head0[3].setRune('D');
+    var head1: [4]cell_mod.Cell(cfg) = [_]cell_mod.Cell(cfg){.{}} ** 4;
+    head1[0].setRune('E');
+    head1[1].setRune('F');
+    head1[2].setRune('G');
+    head1[3].setRune('H');
+    g.pushScrollbackRow(&head0);
+    g.pushScrollbackRow(&head1);
+    g.at(0, 0).setRune('h');
+    g.at(1, 0).setRune('i');
+    var cur_col: u16 = 0;
+    var cur_row: u16 = 1; // prompt at row 1
+
+    // Taller window, same width: ABCD/EFGH flow back onto the screen at rows 0 and 1,
+    // hi at row 2, prompt at row 3, row 4 blank below.
+    try reflowGrid(cfg, std.testing.allocator, &g, 4, 5, &cur_col, &cur_row, cfg.bg);
+    try std.testing.expectEqual(@as(usize, 0), g.sb_len);
+    try std.testing.expectEqual(@as(u32, 'A'), g.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'D'), g.at(3, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'E'), g.at(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, 'H'), g.at(3, 1).rune);
+    try std.testing.expectEqual(@as(u32, 'h'), g.at(0, 2).rune);
+    try std.testing.expectEqual(@as(u32, 'i'), g.at(1, 2).rune);
+    try std.testing.expectEqual(@as(u16, 0), cur_col);
+    try std.testing.expectEqual(@as(u16, 3), cur_row);
+}
+
+test "pull heals chain split across scrollback boundary" {
+    // Single-pass reflow connects the wrapped scrollback row "CD" with screen row 0 "EF"
+    // into one logical line "CDEF".
+    const grid_mod = @import("grid.zig");
+    const cfg = config_mod.Config{ .scrollback_cap = 8, .alt_screen = false };
+    const G = grid_mod.Grid(cfg);
+    var g = try G.init(std.testing.allocator, 4, 3);
+    defer g.deinit();
+
+    // sb tail "CD" (2-col wrapped row) continues onto screen row 0 "EF" (one logical "CDEF").
+    var tail: [2]cell_mod.Cell(cfg) = [_]cell_mod.Cell(cfg){.{}} ** 2;
+    tail[0].setRune('C');
+    tail[1].setRune('D');
+    tail[1].wrapped = true;
+    g.pushScrollbackRow(&tail);
+    g.at(0, 0).setRune('E');
+    g.at(1, 0).setRune('F');
+    var cur_col: u16 = 0;
+    var cur_row: u16 = 2; // prompt at row 2
+
+    try reflowGrid(cfg, std.testing.allocator, &g, 4, 5, &cur_col, &cur_row, cfg.bg);
+    try std.testing.expectEqual(@as(usize, 0), g.sb_len); // head joined cleanly
+    try std.testing.expectEqual(@as(u32, 'C'), g.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'D'), g.at(1, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'E'), g.at(2, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'F'), g.at(3, 0).rune);
+    try std.testing.expectEqual(@as(u16, 2), cur_row);
+}
+
+test "box with right-aligned values restores byte-identical" {
+    // Fastfetch-style box (borders, PUA icon, right-aligned values) on a
+    // short screen so narrowing overflows into scrollback, plus a prompt
+    // two rows below the box. Repeated narrow/wide cycles must restore
+    // every box line exactly: no trimmed values, no shifted borders, no
+    // filler blanks baked mid-line. Box bg differs from the default (as in
+    // real themes), which keeps the prompt-zone trim inert here.
+    const grid_mod = @import("grid.zig");
+    const cfg = config_mod.Config{ .scrollback_cap = 32, .alt_screen = false };
+    const G = grid_mod.Grid(cfg);
+    var g = try G.init(std.testing.allocator, 44, 6);
+    defer g.deinit();
+
+    const icon: u32 = 0xE615; // PUA icon: narrow per isWide
+    const labels = [_][]const u8{ "kernel", "hname", "distro" };
+    const values = [_][]const u8{ "7.2.6-1-cachyos", "Mvk", "CachyOS" };
+    for (labels, values, 0..) |lab, val, r| {
+        const row: u16 = @intCast(r);
+        g.at(0, row).setRune(0x2502);
+        g.at(1, row).setRune(' ');
+        g.at(2, row).setRune(icon);
+        g.at(3, row).setRune(' ');
+        for (lab, 0..) |ch, li| g.at(@intCast(4 + li), row).setRune(ch);
+        const vstart: u16 = @intCast(38 - val.len);
+        for (val, 0..) |ch, vi| g.at(vstart + @as(u16, @intCast(vi)), row).setRune(ch);
+        g.at(38, row).setRune(' ');
+        g.at(39, row).setRune(0x2502);
+        for (0..44) |c| g.at(@intCast(c), row).bg = 0x111111;
+    }
+    g.at(0, 4).setRune('>');
+    g.at(1, 4).setRune(' ');
+    var cur_col: u16 = 2;
+    var cur_row: u16 = 4;
+
+    var snap: [3][40]u32 = undefined;
+    for (0..3) |r| {
+        for (0..40) |c| snap[r][c] = g.at(@intCast(c), @intCast(r)).rune;
+    }
+
+    var cycle: usize = 0;
+    while (cycle < 3) : (cycle += 1) {
+        try reflowGrid(cfg, std.testing.allocator, &g, 30, 6, &cur_col, &cur_row, cfg.bg);
+        try reflowGrid(cfg, std.testing.allocator, &g, 44, 6, &cur_col, &cur_row, cfg.bg);
+        try std.testing.expectEqual(@as(u16, 44), g.cols);
+        try std.testing.expect(cur_col < 44 and cur_row < 6);
+        // Every box line must reappear intact, in order (position may float
+        // with bottom-anchoring, content must not).
+        var found: usize = 0;
+        var sr: u16 = 0;
+        while (sr < g.rows) : (sr += 1) {
+            if (found >= 3) break;
+            var same = true;
+            for (0..40) |c| {
+                if (g.at(@intCast(c), sr).rune != snap[found][c]) {
+                    same = false;
+                    break;
+                }
+            }
+            if (same) found += 1;
+        }
+        try std.testing.expectEqual(@as(usize, 3), found);
+    }
+}
+
+test "extreme narrow 3-column squeeze restores box byte-identical at top" {
+    // Mirrors the user's exact failure scenario: terminal with fastfetch-style
+    // box is crushed down to 3 columns (overflowing into dozens of scrollback rows),
+    // then widened back to 44 columns.
+    // Content must restore byte-identical at rows 0, 1, 2 (top-anchored),
+    // prompt at row 4, with zero split lines, zero blank gaps, and zero corrupted borders.
+    const grid_mod = @import("grid.zig");
+    const cfg = config_mod.Config{ .scrollback_cap = 64, .alt_screen = false };
+    const G = grid_mod.Grid(cfg);
+    var g = try G.init(std.testing.allocator, 44, 6);
+    defer g.deinit();
+
+    const icon: u32 = 0xE615;
+    const labels = [_][]const u8{ "kernel", "hname", "distro" };
+    const values = [_][]const u8{ "7.2.6-1-cachyos", "Mvk", "CachyOS" };
+    for (labels, values, 0..) |lab, val, r| {
+        const row: u16 = @intCast(r);
+        g.at(0, row).setRune(0x2502);
+        g.at(1, row).setRune(' ');
+        g.at(2, row).setRune(icon);
+        g.at(3, row).setRune(' ');
+        for (lab, 0..) |ch, li| g.at(@intCast(4 + li), row).setRune(ch);
+        const vstart: u16 = @intCast(38 - val.len);
+        for (val, 0..) |ch, vi| g.at(vstart + @as(u16, @intCast(vi)), row).setRune(ch);
+        g.at(38, row).setRune(' ');
+        g.at(39, row).setRune(0x2502);
+        for (0..44) |c| g.at(@intCast(c), row).bg = 0x111111;
+    }
+    g.at(0, 4).setRune('>');
+    g.at(1, 4).setRune(' ');
+    var cur_col: u16 = 2;
+    var cur_row: u16 = 4;
+
+    var snap: [3][40]u32 = undefined;
+    for (0..3) |r| {
+        for (0..40) |c| snap[r][c] = g.at(@intCast(c), @intCast(r)).rune;
+    }
+
+    // Crush to 3 columns (causes extreme wrap + overflow into scrollback)
+    try reflowGrid(cfg, std.testing.allocator, &g, 3, 6, &cur_col, &cur_row, cfg.bg);
+    try std.testing.expect(g.sb_len > 0);
+
+    // Widen back to 44 columns
+    try reflowGrid(cfg, std.testing.allocator, &g, 44, 6, &cur_col, &cur_row, cfg.bg);
+    try std.testing.expectEqual(@as(u16, 44), g.cols);
+    try std.testing.expectEqual(@as(u16, 6), g.rows);
+    try std.testing.expectEqual(@as(usize, 0), g.sb_len);
+
+    // Assert top-anchoring: box lines are exactly at rows 0, 1, 2
+    for (0..3) |r| {
+        for (0..40) |c| {
+            try std.testing.expectEqual(snap[r][c], g.at(@intCast(c), @intCast(r)).rune);
+        }
+    }
+    // Assert prompt is at row 4
+    try std.testing.expectEqual(@as(u16, 4), cur_row);
+    try std.testing.expectEqual(@as(u32, '>'), g.at(0, 4).rune);
 }

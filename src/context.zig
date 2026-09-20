@@ -31,8 +31,15 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         pen: sgr_mod.Attr = .{},
         cursor_col: u16 = 0,
         cursor_row: u16 = 0,
+        /// Last-column flag (Ghostty `pending_wrap` parity): set when a print
+        /// lands on the final column. cursor_col always stays a valid cell
+        /// (< cols); the soft-wrap is performed by the NEXT print. Any
+        /// explicit cursor motion clears it (the cursor sits on the last
+        /// column, no wrap happened).
+        pending_wrap: bool = false,
         saved_col: u16 = 0,
         saved_row: u16 = 0,
+        saved_wrap: bool = false,
         scroll_top: u16 = 0,
         scroll_bot: u16 = 0,
         osc_buf: std.ArrayList(u8),
@@ -70,6 +77,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         alt_active: bool = false,
         alt_saved_col: u16 = 0,
         alt_saved_row: u16 = 0,
+        alt_saved_wrap: bool = false,
         q_overlap: [16]u8 = undefined,
         q_overlap_len: usize = 0,
 
@@ -189,12 +197,15 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 .lf => self.linefeed(),
                 .cr => {
                     self.cursor_col = 0;
+                    self.pending_wrap = false;
                 },
                 .ht => {
+                    self.pending_wrap = false;
                     const tw = cfg.tab_width;
                     self.cursor_col = @min(self.grid.cols - 1, ((self.cursor_col / tw) + 1) * tw);
                 },
                 .bs => {
+                    self.pending_wrap = false;
                     if (self.cursor_col > 0) self.cursor_col -= 1;
                 },
                 .bel => {},
@@ -221,10 +232,12 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 '7' => {
                     self.saved_col = self.cursor_col;
                     self.saved_row = self.cursor_row;
+                    self.saved_wrap = self.pending_wrap;
                 },
                 '8' => {
-                    self.cursor_col = self.saved_col;
-                    self.cursor_row = self.saved_row;
+                    self.cursor_col = @min(self.saved_col, self.grid.cols -| 1);
+                    self.cursor_row = @min(self.saved_row, self.grid.rows -| 1);
+                    self.pending_wrap = self.saved_wrap and self.saved_col < self.grid.cols and self.saved_row < self.grid.rows;
                 },
                 'D' => self.linefeed(),
                 'M' => self.reverseIndex(),
@@ -244,20 +257,38 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 }
             }.get;
             switch (final) {
-                'A' => self.cursor_row -|= n(params, 0, 1),
-                'B' => self.cursor_row = @min(self.grid.rows - 1, self.cursor_row + n(params, 0, 1)),
-                'C' => self.cursor_col = @min(self.grid.cols - 1, self.cursor_col + n(params, 0, 1)),
-                'D' => self.cursor_col -|= n(params, 0, 1),
+                'A' => {
+                    self.pending_wrap = false;
+                    self.cursor_row -|= n(params, 0, 1);
+                },
+                'B' => {
+                    self.pending_wrap = false;
+                    self.cursor_row = @min(self.grid.rows - 1, self.cursor_row + n(params, 0, 1));
+                },
+                'C' => {
+                    self.pending_wrap = false;
+                    self.cursor_col = @min(self.grid.cols - 1, self.cursor_col + n(params, 0, 1));
+                },
+                'D' => {
+                    self.pending_wrap = false;
+                    self.cursor_col -|= n(params, 0, 1);
+                },
                 'E' => {
+                    self.pending_wrap = false;
                     self.cursor_col = 0;
                     self.cursor_row = @min(self.grid.rows - 1, self.cursor_row + n(params, 0, 1));
                 },
                 'F' => {
+                    self.pending_wrap = false;
                     self.cursor_col = 0;
                     self.cursor_row -|= n(params, 0, 1);
                 },
-                'G' => self.cursor_col = @min(self.grid.cols - 1, n(params, 0, 1) -| 1),
+                'G' => {
+                    self.pending_wrap = false;
+                    self.cursor_col = @min(self.grid.cols - 1, n(params, 0, 1) -| 1);
+                },
                 'H', 'f' => {
+                    self.pending_wrap = false;
                     self.cursor_row = @min(self.grid.rows - 1, n(params, 0, 1) -| 1);
                     self.cursor_col = @min(self.grid.cols - 1, n(params, 1, 1) -| 1);
                 },
@@ -267,10 +298,12 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 's' => {
                     self.saved_col = self.cursor_col;
                     self.saved_row = self.cursor_row;
+                    self.saved_wrap = self.pending_wrap;
                 },
                 'u' => {
-                    self.cursor_col = self.saved_col;
-                    self.cursor_row = self.saved_row;
+                    self.cursor_col = @min(self.saved_col, self.grid.cols -| 1);
+                    self.cursor_row = @min(self.saved_row, self.grid.rows -| 1);
+                    self.pending_wrap = self.saved_wrap and self.saved_col < self.grid.cols and self.saved_row < self.grid.rows;
                 },
                 'q' => {}, // DECSCUSR cursor style (phase 4: dynamic cursor)
                 'r' => { // DECSTBM scroll region
@@ -290,9 +323,11 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                             1048 => if (set) {
                                 self.alt_saved_col = self.cursor_col;
                                 self.alt_saved_row = self.cursor_row;
+                                self.alt_saved_wrap = self.pending_wrap;
                             } else {
                                 self.cursor_col = @min(self.alt_saved_col, self.grid.cols -| 1);
                                 self.cursor_row = @min(self.alt_saved_row, self.grid.rows -| 1);
+                                self.pending_wrap = self.alt_saved_wrap and self.alt_saved_col < self.grid.cols and self.alt_saved_row < self.grid.rows;
                             },
                             1000 => self.mouse_mode = if (set) .x10 else .off,
                             1002 => self.mouse_mode = if (set) .button_event else .off,
@@ -316,12 +351,14 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             if (!cfg.alt_screen or self.alt_active or self.grid.alt_cells.len == 0) return;
             self.alt_saved_col = self.cursor_col;
             self.alt_saved_row = self.cursor_row;
+            self.alt_saved_wrap = self.pending_wrap;
             std.mem.swap(@TypeOf(self.grid.cells), &self.grid.cells, &self.grid.alt_cells);
             self.alt_active = true;
             self.grid.view_offset = 0;
             @memset(self.grid.cells, .{});
             self.cursor_col = 0;
             self.cursor_row = 0;
+            self.pending_wrap = false;
             self.scroll_top = 0;
             self.scroll_bot = self.grid.rows - 1;
             self.grid.markAllDirty();
@@ -334,6 +371,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             self.alt_active = false;
             self.cursor_col = @min(self.alt_saved_col, self.grid.cols -| 1);
             self.cursor_row = @min(self.alt_saved_row, self.grid.rows -| 1);
+            self.pending_wrap = self.alt_saved_wrap and self.alt_saved_col < self.grid.cols and self.alt_saved_row < self.grid.rows;
             self.grid.view_offset = 0;
             self.grid.markAllDirty();
         }
@@ -486,8 +524,11 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         }
 
         fn putCodepoint(self: *Self, cp: u21) void {
-            if (self.cursor_col >= self.grid.cols) {
-                // Mark the wrap point for future reflow.
+            if (self.pending_wrap or self.cursor_col >= self.grid.cols) {
+                // Deferred soft-wrap: the previous print filled the last
+                // column. Mark it and start a fresh row (Ghostty LCF parity).
+                // The `>=` half is pure defense; the invariant is col < cols.
+                self.pending_wrap = false;
                 const last = self.grid.at(self.grid.cols - 1, self.cursor_row);
                 last.wrapped = true;
                 self.cursor_col = 0;
@@ -528,7 +569,12 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 .invisible = self.pen.invisible,
             };
             cell.dirty = true;
-            self.cursor_col += 1;
+            if (self.cursor_col + 1 < self.grid.cols) {
+                self.cursor_col += 1;
+            } else {
+                // Sit on the last column with the wrap pending.
+                self.pending_wrap = true;
+            }
         }
 
         fn resolveColor(self: *const Self, c: sgr_mod.Color, def: u32) u32 {
@@ -550,6 +596,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         }
 
         fn linefeed(self: *Self) void {
+            self.pending_wrap = false;
             if (self.cursor_row == self.scroll_bot) {
                 self.scrollRegionUp();
             } else if (self.cursor_row + 1 < self.grid.rows) {
@@ -576,6 +623,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         }
 
         fn reverseIndex(self: *Self) void {
+            self.pending_wrap = false;
             const CellT = @TypeOf(self.grid.cells[0]);
             const blank = CellT{ .fg = self.fg, .bg = self.bg, .ul_color = self.fg };
             if (self.cursor_row == self.scroll_top) {
@@ -632,6 +680,8 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             self.pen = .{};
             self.cursor_col = 0;
             self.cursor_row = 0;
+            self.pending_wrap = false;
+            self.saved_wrap = false;
             self.scroll_top = 0;
             self.scroll_bot = self.grid.rows - 1;
         }
@@ -660,6 +710,9 @@ pub fn Context(comptime cfg: config_mod.Config) type {
 
         pub fn resize(self: *Self, cols: u16, rows: u16) void {
             if (cols == self.grid.cols and rows == self.grid.rows) return;
+            // A pending wrap references the old width; drop the flag and let
+            // reflow track the settled last-column cell instead.
+            self.pending_wrap = false;
             self.grid.resizeWithReflow(
                 cols,
                 rows,
@@ -736,6 +789,7 @@ test "decset cursor visibility + mouse modes" {
 test "tick toggles blink after rate" {
     var ctx = try Context(.{ .cursor_blink_rate_ms = 500 }).init(std.testing.allocator);
     defer ctx.deinit();
+    ctx.focused = true;
     try std.testing.expect(!ctx.tick()); // just initialized
     ctx.blink_last_ms = nowMs() - 1000;
     try std.testing.expect(ctx.tick());
@@ -789,4 +843,67 @@ test "osc 4 and osc 10/11/12 dynamic palette" {
     try std.testing.expectEqual(@as(u32, 0xa1cde1), ctx.grid.cells[0].fg);
     try std.testing.expectEqual(@as(u32, 0xb4cad5), ctx.grid.cells[1].fg);
     try std.testing.expectEqual(@as(u32, 0xd4dfff), ctx.grid.cells[2].fg);
+}
+
+test "pending wrap keeps cursor in bounds at 1 col" {
+    // Every print lands on the last column here; before pending_wrap this
+    // left cursor_col == cols and tick/erase went out of bounds (panic).
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.resize(1, 2);
+    ctx.focused = true;
+    ctx.parse("ab");
+    // 'a' filled (0,0) with the wrap pending; 'b' wrapped onto (0,1).
+    try std.testing.expect(ctx.pending_wrap);
+    try std.testing.expectEqual(@as(u16, 0), ctx.cursor_col);
+    try std.testing.expectEqual(@as(u16, 1), ctx.cursor_row);
+    try std.testing.expectEqual(@as(u32, 'a'), ctx.grid.at(0, 0).rune);
+    try std.testing.expect(ctx.grid.at(0, 0).wrapped);
+    try std.testing.expectEqual(@as(u32, 'b'), ctx.grid.at(0, 1).rune);
+    // All erase modes with a pending wrap must stay in bounds.
+    ctx.eraseLine(0);
+    ctx.eraseLine(1);
+    ctx.eraseLine(2);
+    ctx.eraseDisplay(0);
+    ctx.eraseDisplay(1);
+    ctx.eraseDisplay(2);
+    ctx.blink_last_ms = nowMs() - 1000;
+    try std.testing.expect(ctx.tick());
+}
+
+test "pending wrap cancelled by cursor motion" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.resize(4, 2);
+    ctx.parse("abcd"); // fills row 0, wrap pending, cursor sits on (3,0)
+    try std.testing.expect(ctx.pending_wrap);
+    try std.testing.expectEqual(@as(u16, 3), ctx.cursor_col);
+    ctx.parse("\x08"); // BS cancels the wrap, steps back to col 2
+    try std.testing.expect(!ctx.pending_wrap);
+    try std.testing.expectEqual(@as(u16, 2), ctx.cursor_col);
+    ctx.parse("e"); // overwrites col 2, advances cleanly to col 3
+    try std.testing.expect(!ctx.pending_wrap);
+    try std.testing.expectEqual(@as(u16, 3), ctx.cursor_col);
+    try std.testing.expectEqual(@as(u32, 'e'), ctx.grid.at(2, 0).rune);
+    // Save/restore preserves the pending wrap across the grid.
+    ctx.parse("f"); // col 3, wrap pending again
+    try std.testing.expect(ctx.pending_wrap);
+    ctx.parse("\x1b7\rX\x1b8");
+    try std.testing.expect(ctx.pending_wrap);
+    try std.testing.expectEqual(@as(u16, 3), ctx.cursor_col);
+    try std.testing.expectEqual(@as(u32, 'X'), ctx.grid.at(0, 0).rune);
+    // CPR reports the settled last column while a wrap is pending.
+    const Sink = struct {
+        buf: [32]u8 = undefined,
+        len: usize = 0,
+        fn cb(user: ?*anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(user));
+            @memcpy(self.buf[self.len..][0..data.len], data);
+            self.len += data.len;
+        }
+    };
+    var sink = Sink{};
+    ctx.onWrite(Sink.cb, &sink);
+    ctx.answerQueries("\x1b[6n");
+    try std.testing.expectEqualStrings("\x1b[1;4R", sink.buf[0..sink.len]);
 }
