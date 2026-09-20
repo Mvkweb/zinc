@@ -101,7 +101,12 @@ fn childMain(master: i32, slave_path: [*:0]u8, cols: u16, rows: u16, term_env: ?
     if (slave > 2) _ = linux.close(slave);
 
     // Child-only env tweak (post-fork: parent/system untouched).
-    if (term_env) |t| _ = setenv("TERM", t, 1);
+    if (term_env) |t| {
+        _ = setenv("TERM", t, 1);
+        if (!std.mem.eql(u8, std.mem.span(t), "dumb")) {
+            _ = setenv("COLORTERM", "truecolor", 1);
+        }
+    }
 
     const sh = shellPath();
     const argv: [*:null]const ?[*:0]const u8 = &.{ sh, null };
