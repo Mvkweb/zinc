@@ -722,14 +722,26 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         // curly, dotted and dashed variants.
                         if (cell.ul_style != .none) {
                             const ucol = themed(cell.ul_color);
-                            const uh: u32 = @intCast(@max(1, @divFloor(ch, 14)));
-                            const uy: u32 = @intCast(@as(i32, @intCast(y)) + self.ascent + @max(1, @divFloor(ch, 12)));
+                            // Foot parity: font underline metrics when present,
+                            // estimates otherwise. Clamped inside the cell.
+                            const uh: u32 = if (self.ft_face.ul_thick_px > 0)
+                                self.ft_face.ul_thick_px
+                            else
+                                @intCast(@max(1, @divFloor(ch, 14)));
+                            const uoff: i32 = if (self.ft_face.ul_thick_px > 0)
+                                -@as(i32, self.ft_face.ul_pos_px)
+                            else
+                                @max(1, @divFloor(ch, 12));
+                            const ytop: i32 = @as(i32, @intCast(y));
+                            const ymax: i32 = ytop + ch - @as(i32, @intCast(uh));
+                            const uy: u32 = @intCast(@max(ytop, @min(ytop + self.ascent + uoff, ymax)));
+                            const uy2: u32 = @intCast(@min(@as(i32, @intCast(uy)) + @as(i32, @intCast(uh)) + 1, ymax));
                             const cwu: u32 = @intCast(cw);
                             switch (cell.ul_style) {
                                 .single => software.fillRect(self.pool_pixels, W, H, x, uy, cwu, uh, ucol, &dmg),
                                 .double => {
                                     software.fillRect(self.pool_pixels, W, H, x, uy, cwu, uh, ucol, &dmg);
-                                    software.fillRect(self.pool_pixels, W, H, x, uy + uh + 1, cwu, uh, ucol, &dmg);
+                                    software.fillRect(self.pool_pixels, W, H, x, uy2, cwu, uh, ucol, &dmg);
                                 },
                                 .curly => {
                                     var dx: u32 = 0;

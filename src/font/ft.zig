@@ -112,12 +112,19 @@ const GENERIC_HOME_SUFFIXES = [_][]const u8{
 pub const Face = struct {
     lib: c.FT_Library,
     face: c.FT_Face,
+    /// Real style variants (optional; synthetic embolden/slant otherwise).
+    bold: ?c.FT_Face = null,
+    italic: ?c.FT_Face = null,
+    bold_italic: ?c.FT_Face = null,
     /// Nerd-symbols fallback (optional, silent when absent).
     fallback: ?c.FT_Face = null,
     cell_w: u16,
     cell_h: u16,
     ascent: i16,
     descent: i16, // negative
+    /// Font underline metrics in pixels (0 = missing, use estimates).
+    ul_thick_px: u8 = 0,
+    ul_pos_px: i8 = 0, // negative: below baseline
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, px: u16, config_path: []const u8, nerd_path: []const u8) Error!Face {
         var lib: c.FT_Library = undefined;
@@ -125,17 +132,13 @@ pub const Face = struct {
         errdefer _ = c.FT_Done_FreeType(lib);
 
         var primary: ?Face = null;
+        var ppath_buf: [1024]u8 = undefined;
+        var ppath_len: usize = 0;
         if (std.c.getenv("ZINC_FONT")) |p| {
-            if (tryFace(lib, px, std.mem.span(p))) |f| {
-                std.debug.print("[zinc] font primary: {s}\n", .{std.mem.span(p)});
-                primary = f;
-            }
+            _ = tryPrimary(lib, px, std.mem.span(p), &primary, &ppath_buf, &ppath_len);
         }
         if (primary == null and config_path.len > 0) {
-            if (tryFace(lib, px, config_path)) |f| {
-                std.debug.print("[zinc] font primary: {s}\n", .{config_path});
-                primary = f;
-            }
+            _ = tryPrimary(lib, px, config_path, &primary, &ppath_buf, &ppath_len);
         }
         // Check user $HOME Nerd Fonts first (custom installs):
         if (primary == null) {
@@ -147,21 +150,14 @@ pub const Face = struct {
                     @memcpy(buf[0..home.len], home);
                     @memcpy(buf[home.len..][0..suf.len], suf);
                     const full = buf[0 .. home.len + suf.len];
-                    if (tryFace(lib, px, full)) |f| {
-                        std.debug.print("[zinc] font primary: {s}\n", .{full});
-                        primary = f;
-                        break;
-                    }
+                    if (tryPrimary(lib, px, full, &primary, &ppath_buf, &ppath_len)) break;
                 }
                 // Exact names missed (custom subdirs, distro renames):
                 // bounded recursive scan for *NerdFont* files.
                 if (primary == null) {
                     var scan_buf: [1024]u8 = undefined;
                     if (scanHomePath(lib, gpa, io, px, home, false, &scan_buf)) |found| {
-                        if (tryFace(lib, px, found)) |f| {
-                            std.debug.print("[zinc] font primary (scan): {s}\n", .{found});
-                            primary = f;
-                        }
+                        _ = tryPrimary(lib, px, found, &primary, &ppath_buf, &ppath_len);
                     }
                 }
             }
@@ -169,21 +165,13 @@ pub const Face = struct {
         // Check system Nerd Fonts:
         if (primary == null) {
             for (PRIMARY_NERD_CANDIDATES) |cand| {
-                if (tryFace(lib, px, cand)) |f| {
-                    std.debug.print("[zinc] font primary: {s}\n", .{cand});
-                    primary = f;
-                    break;
-                }
+                if (tryPrimary(lib, px, cand, &primary, &ppath_buf, &ppath_len)) break;
             }
         }
         // Generic monospace fallbacks only if no Nerd Font found:
         if (primary == null) {
             for (GENERIC_CANDIDATES) |cand| {
-                if (tryFace(lib, px, cand)) |f| {
-                    std.debug.print("[zinc] font primary: {s}\n", .{cand});
-                    primary = f;
-                    break;
-                }
+                if (tryPrimary(lib, px, cand, &primary, &ppath_buf, &ppath_len)) break;
             }
         }
         if (primary == null) {
@@ -195,18 +183,99 @@ pub const Face = struct {
                     @memcpy(buf[0..home.len], home);
                     @memcpy(buf[home.len..][0..suf.len], suf);
                     const full = buf[0 .. home.len + suf.len];
-                    if (tryFace(lib, px, full)) |f| {
-                        std.debug.print("[zinc] font primary: {s}\n", .{full});
-                        primary = f;
-                        break;
-                    }
+                    if (tryPrimary(lib, px, full, &primary, &ppath_buf, &ppath_len)) break;
                 }
             }
         }
         var self = primary orelse return error.NoFont;
         errdefer self.deinit();
+        // Real style variants live next to the primary file.
+        const ppath = ppath_buf[0..ppath_len];
+        if (ppath.len > 0) {
+            self.bold = loadVariant(lib, px, ppath, &.{"Bold"});
+            self.italic = loadVariant(lib, px, ppath, &.{ "Italic", "Oblique" });
+            self.bold_italic = loadVariant(lib, px, ppath, &.{ "BoldItalic", "BoldOblique" });
+        }
         self.fallback = loadNerd(lib, gpa, io, px, nerd_path);
         return self;
+    }
+
+    /// Try one primary candidate; records the winning path for variant lookup.
+    fn tryPrimary(
+        lib: c.FT_Library,
+        px: u16,
+        path: []const u8,
+        primary: *?Face,
+        ppath: *[1024]u8,
+        plen: *usize,
+    ) bool {
+        if (primary.* != null) return false;
+        if (tryFace(lib, px, path)) |f| {
+            std.debug.print("[zinc] font primary: {s}\n", .{path});
+            primary.* = f;
+            if (path.len <= ppath.len) {
+                @memcpy(ppath[0..path.len], path);
+                plen.* = path.len;
+            }
+            return true;
+        }
+        return false;
+    }
+
+    /// Sibling style path: "Regular" -> alt, or insert "-Alt" before the
+    /// extension (DejaVuSansMono.ttf -> DejaVuSansMono-Bold.ttf).
+    fn siblingPath(base: []const u8, alt: []const u8, insert: bool, out: *[512]u8) ?[]const u8 {
+        if (!insert) {
+            const idx = std.mem.indexOf(u8, base, "Regular") orelse return null;
+            const tail = base[idx + "Regular".len ..];
+            if (idx + alt.len + tail.len > out.len) return null;
+            @memcpy(out[0..idx], base[0..idx]);
+            @memcpy(out[idx..][0..alt.len], alt);
+            @memcpy(out[idx + alt.len ..][0..tail.len], tail);
+            return out[0 .. idx + alt.len + tail.len];
+        }
+        const dot = std.mem.lastIndexOfScalar(u8, base, '.') orelse return null;
+        const stem = base[0..dot];
+        const ext = base[dot..];
+        if (stem.len + 1 + alt.len + ext.len > out.len) return null;
+        var n: usize = 0;
+        @memcpy(out[n..][0..stem.len], stem);
+        n += stem.len;
+        out[n] = '-';
+        n += 1;
+        @memcpy(out[n..][0..alt.len], alt);
+        n += alt.len;
+        @memcpy(out[n..][0..ext.len], ext);
+        n += ext.len;
+        return out[0..n];
+    }
+
+    /// Load the first existing style sibling (silent when absent).
+    fn loadVariant(lib: c.FT_Library, px: u16, base: []const u8, alts: []const []const u8) ?c.FT_Face {
+        var buf: [512]u8 = undefined;
+        for (alts) |alt| {
+            for ([2]bool{ false, true }) |insert| {
+                const full = siblingPath(base, alt, insert, &buf) orelse continue;
+                if (loadRaw(lib, px, full)) |f| {
+                    std.debug.print("[zinc] font {s}: {s}\n", .{ alt, full });
+                    return f;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Font underline metrics scaled to pixels (0 thick = missing).
+    const UlMetrics = struct { thick: u8, pos: i8 };
+    fn ulMetrics(thick_units: i16, pos_units: i16, asc_px: i64, asc_units: i16) UlMetrics {
+        if (thick_units <= 0 or asc_units <= 0 or asc_px <= 0) return .{ .thick = 0, .pos = 0 };
+        const funit = @as(f32, @floatFromInt(asc_px)) / @as(f32, @floatFromInt(asc_units));
+        const t = @round(@as(f32, @floatFromInt(thick_units)) * funit);
+        const p = @round(@as(f32, @floatFromInt(pos_units)) * funit);
+        return .{
+            .thick = @intFromFloat(@max(1.0, @min(8.0, t))),
+            .pos = @intFromFloat(@max(-32.0, @min(0.0, p))),
+        };
     }
 
     /// Load a raw face handle at px (null when the file won't load).
@@ -382,6 +451,7 @@ pub const Face = struct {
         if (cw <= 0) cw = adv;
         if (cw <= 0 or cw > 256) return null;
 
+        const ulm = ulMetrics(face.*.underline_thickness, face.*.underline_position, asc, face.*.ascender);
         return .{
             .lib = lib,
             .face = face,
@@ -389,31 +459,43 @@ pub const Face = struct {
             .cell_h = @intCast(h),
             .ascent = @intCast(asc),
             .descent = @intCast(desc),
+            .ul_thick_px = ulm.thick,
+            .ul_pos_px = ulm.pos,
         };
     }
 
     pub fn deinit(self: *Face) void {
+        if (self.bold) |f| _ = c.FT_Done_Face(f);
+        if (self.italic) |f| _ = c.FT_Done_Face(f);
+        if (self.bold_italic) |f| _ = c.FT_Done_Face(f);
         if (self.fallback) |fb| _ = c.FT_Done_Face(fb);
         _ = c.FT_Done_Face(self.face);
         _ = c.FT_Done_FreeType(self.lib);
     }
 
-    /// Bake one codepoint+style into the atlas. Falls back to the nerd face
-    /// when the primary has no glyph (char index 0). Returns placement.
+    /// Bake one codepoint+style into the atlas. Style face first, then
+    /// regular, then the nerd fallback (char index 0 = missing everywhere).
+    /// Returns blank metrics instead of .notdef for missing glyphs.
     pub fn bake(self: *Face, atlas: *atlas_mod.Atlas, cp: u21, style: Style) Error!atlas_mod.Baked {
-        var target = self.face;
+        var cands: [3]?c.FT_Face = .{ null, self.face, self.fallback };
+        switch (style) {
+            .regular => cands[0] = self.face,
+            .bold => cands[0] = self.bold,
+            .italic => cands[0] = self.italic,
+            .bold_italic => cands[0] = self.bold_italic,
+        }
+        var target: ?c.FT_Face = null;
         var slot_n: u2 = 0;
-        if (cp != 0 and c.FT_Get_Char_Index(self.face, @intCast(cp)) == 0) {
-            if (self.fallback) |fb| {
-                if (c.FT_Get_Char_Index(fb, @intCast(cp)) != 0) {
-                    target = fb;
-                    slot_n = 1;
-                }
+        var ci: usize = 0;
+        while (ci < cands.len) : (ci += 1) {
+            const f = cands[ci] orelse continue;
+            if (cp == 0 or c.FT_Get_Char_Index(f, @intCast(cp)) != 0) {
+                target = f;
+                slot_n = if (ci == 2) 1 else 0;
+                break;
             }
         }
-        // If neither primary nor fallback has this glyph, return blank metrics
-        // instead of loading glyph index 0 (.notdef) which draws an ugly hollow box.
-        if (cp != 0 and c.FT_Get_Char_Index(target, @intCast(cp)) == 0) {
+        const t = target orelse {
             return .{
                 .x = 0,
                 .y = 0,
@@ -424,15 +506,27 @@ pub const Face = struct {
                 .advance = @intCast(@min(self.cell_w, 255)),
                 .font_slot = 0,
             };
+        };
+        // Synthetic styling only when no real style face won.
+        const want_bold = style == .bold or style == .bold_italic;
+        const want_ital = style == .italic or style == .bold_italic;
+        var real_bold = false;
+        var real_ital = false;
+        if (self.bold) |bf| real_bold = real_bold or t == bf;
+        if (self.italic) |iface| real_ital = real_ital or t == iface;
+        if (self.bold_italic) |bif| {
+            real_bold = real_bold or t == bif;
+            real_ital = real_ital or t == bif;
         }
-        // Oblique for italics (synthetic styles; real italic files later).
+        // Always reset the transform: a stale italic slant would leak into
+        // later regular bakes on the same face.
         var matrix: c.FT_Matrix = .{ .xx = 0x10000, .xy = 0, .yx = 0, .yy = 0x10000 };
-        if (style == .italic or style == .bold_italic) matrix.xy = 14438; // ~0.22 slant
-        c.FT_Set_Transform(target, &matrix, null);
+        if (want_ital and !real_ital) matrix.xy = 14438; // ~0.22 slant
+        c.FT_Set_Transform(t, &matrix, null);
 
-        if (c.FT_Load_Char(target, @intCast(cp), 0) != 0) return error.RenderFailed;
-        const slot = target.*.glyph;
-        if (style == .bold or style == .bold_italic) c.FT_GlyphSlot_Embolden(slot);
+        if (c.FT_Load_Char(t, @intCast(cp), 0) != 0) return error.RenderFailed;
+        const slot = t.*.glyph;
+        if (want_bold and !real_bold) c.FT_GlyphSlot_Embolden(slot);
         if (c.FT_Render_Glyph(slot, 0) != 0) return error.RenderFailed; // NORMAL
 
         const bmp = slot.*.bitmap;
@@ -504,4 +598,23 @@ fn copyBitmap(atlas: *atlas_mod.Atlas, dx: u16, dy: u16, bmp: anytype) void {
             }
         }
     }
+}
+
+test "sibling style paths" {
+    var buf: [512]u8 = undefined;
+    const sub = Face.siblingPath("/f/JetBrainsMonoNerdFontMono-Regular.ttf", "Bold", false, &buf).?;
+    try std.testing.expectEqualStrings("/f/JetBrainsMonoNerdFontMono-Bold.ttf", sub);
+    const ins = Face.siblingPath("/f/DejaVuSansMono.ttf", "Oblique", true, &buf).?;
+    try std.testing.expectEqualStrings("/f/DejaVuSansMono-Oblique.ttf", ins);
+    try std.testing.expect(Face.siblingPath("/f/Mono.ttf", "Bold", false, &buf) == null);
+    try std.testing.expect(Face.siblingPath("nodot", "Bold", true, &buf) == null);
+}
+
+test "underline metrics scale" {
+    // 1000upm, ascender 800u = 13px: 100u thick -> 2px, -200u pos -> -3px.
+    const m = Face.ulMetrics(100, -200, 13, 800);
+    try std.testing.expectEqual(@as(u8, 2), m.thick);
+    try std.testing.expectEqual(@as(i8, -3), m.pos);
+    const missing = Face.ulMetrics(0, 0, 13, 800);
+    try std.testing.expectEqual(@as(u8, 0), missing.thick);
 }
