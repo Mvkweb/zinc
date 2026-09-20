@@ -26,8 +26,8 @@ pub const Style = enum(u2) {
 };
 
 const PRIMARY_NERD_CANDIDATES = [_][]const u8{
-    "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
     "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
+    "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
     "/usr/share/fonts/TTF/JetBrainsMonoNF-Regular.ttf",
     "/usr/share/fonts/TTF/JetBrainsMonoNFM-Regular.ttf",
     "/usr/share/fonts/TTF/JetBrainsMono/JetBrainsMonoNerdFont-Regular.ttf",
@@ -47,8 +47,8 @@ const PRIMARY_NERD_CANDIDATES = [_][]const u8{
 };
 
 const PRIMARY_HOME_NERD_SUFFIXES = [_][]const u8{
-    "/.local/share/fonts/JetBrainsMonoNerdFontMono-Regular.ttf",
     "/.local/share/fonts/JetBrainsMonoNerdFont-Regular.ttf",
+    "/.local/share/fonts/JetBrainsMonoNerdFontMono-Regular.ttf",
     "/.local/share/fonts/JetBrainsMonoNF-Regular.ttf",
     "/.local/share/fonts/JetBrainsMonoNFM-Regular.ttf",
     "/.local/share/fonts/JetBrainsMono/JetBrainsMonoNerdFont-Regular.ttf",
@@ -59,16 +59,16 @@ const PRIMARY_HOME_NERD_SUFFIXES = [_][]const u8{
     "/.local/share/fonts/NerdFonts/JetBrainsMonoNerdFontMono-Regular.ttf",
     "/.local/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
     "/.local/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
-    "/.fonts/JetBrainsMonoNerdFontMono-Regular.ttf",
     "/.fonts/JetBrainsMonoNerdFont-Regular.ttf",
+    "/.fonts/JetBrainsMonoNerdFontMono-Regular.ttf",
     "/.fonts/JetBrainsMono/JetBrainsMonoNerdFont-Regular.ttf",
     "/.fonts/JetBrainsMono/JetBrainsMonoNerdFontMono-Regular.ttf",
     "/.fonts/NerdFonts/JetBrainsMonoNerdFont-Regular.ttf",
 };
 
 const NERD_CANDIDATES = [_][]const u8{
-    "/usr/share/fonts/TTF/SymbolsNerdFontMono-Regular.ttf",
     "/usr/share/fonts/TTF/SymbolsNerdFont-Regular.ttf",
+    "/usr/share/fonts/TTF/SymbolsNerdFontMono-Regular.ttf",
     "/usr/share/fonts/TTF/SymbolsNerdFont/SymbolsNerdFont-Regular.ttf",
     "/usr/share/fonts/truetype/SymbolsNerdFont-Regular.ttf",
     "/usr/share/fonts/truetype/SymbolsNerdFontMono-Regular.ttf",
@@ -76,14 +76,29 @@ const NERD_CANDIDATES = [_][]const u8{
     "/usr/share/fonts/truetype/NerdFonts/SymbolsNerdFontMono-Regular.ttf",
     "/usr/share/fonts/OTF/SymbolsNerdFont-Regular.otf",
     "/usr/share/fonts/opentype/SymbolsNerdFont-Regular.otf",
-    "/usr/share/fonts/TTF/JetBrainsMonoNerdFont-Regular.ttf",
-    "/usr/share/fonts/TTF/JetBrainsMonoNerdFontMono-Regular.ttf",
-    "/usr/share/fonts/truetype/JetBrainsMono/JetBrainsMonoNerdFont-Regular.ttf",
+};
+
+const UNICODE_FALLBACK_CANDIDATES = [_][]const u8{
+    "/usr/share/fonts/TTF/DejaVuSansMono.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/dejavu/DejaVuSansMono.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/noto/NotoSansMono-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSans-Regular.ttf",
+    "/usr/share/fonts/liberation/LiberationMono-Regular.ttf",
+};
+
+const SYMBOLS_FALLBACK_CANDIDATES = [_][]const u8{
+    "/usr/share/fonts/noto/NotoSansSymbols2-Regular.ttf",
+    "/usr/share/fonts/noto/NotoSansSymbols-Regular.ttf",
+    "/usr/share/fonts/TTF/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
 };
 
 const NERD_HOME_SUFFIXES = [_][]const u8{
-    "/.local/share/fonts/SymbolsNerdFontMono-Regular.ttf",
     "/.local/share/fonts/SymbolsNerdFont-Regular.ttf",
+    "/.local/share/fonts/SymbolsNerdFontMono-Regular.ttf",
     "/.local/share/fonts/SymbolsNerdFont/SymbolsNerdFont-Regular.ttf",
     "/.local/share/fonts/NerdFonts/SymbolsNerdFont-Regular.ttf",
     "/.fonts/SymbolsNerdFont-Regular.ttf",
@@ -116,8 +131,8 @@ pub const Face = struct {
     bold: ?c.FT_Face = null,
     italic: ?c.FT_Face = null,
     bold_italic: ?c.FT_Face = null,
-    /// Nerd-symbols fallback (optional, silent when absent).
-    fallback: ?c.FT_Face = null,
+    /// Fallback faces (Nerd symbols, Unicode arrows/math, extended symbols).
+    fallbacks: [3]?c.FT_Face = .{ null, null, null },
     cell_w: u16,
     cell_h: u16,
     ascent: i16,
@@ -196,7 +211,11 @@ pub const Face = struct {
             self.italic = loadVariant(lib, px, ppath, &.{ "Italic", "Oblique" });
             self.bold_italic = loadVariant(lib, px, ppath, &.{ "BoldItalic", "BoldOblique" });
         }
-        self.fallback = loadNerd(lib, gpa, io, px, nerd_path);
+        // Fallbacks: dedicated Nerd symbols, Unicode symbols (DejaVuMono for ↯, math),
+        // and extended symbols (NotoSansSymbols2).
+        self.fallbacks[0] = loadNerd(lib, gpa, io, px, nerd_path, ppath);
+        self.fallbacks[1] = loadFallback(lib, px, &UNICODE_FALLBACK_CANDIDATES, ppath);
+        self.fallbacks[2] = loadFallback(lib, px, &SYMBOLS_FALLBACK_CANDIDATES, ppath);
         return self;
     }
 
@@ -256,7 +275,7 @@ pub const Face = struct {
         for (alts) |alt| {
             for ([2]bool{ false, true }) |insert| {
                 const full = siblingPath(base, alt, insert, &buf) orelse continue;
-                if (loadRaw(lib, px, full)) |f| {
+                if (loadRaw(lib, px, full, true)) |f| {
                     std.debug.print("[zinc] font {s}: {s}\n", .{ alt, full });
                     return f;
                 }
@@ -279,7 +298,7 @@ pub const Face = struct {
     }
 
     /// Load a raw face handle at px (null when the file won't load).
-    fn loadRaw(lib: c.FT_Library, px: u16, path: []const u8) ?c.FT_Face {
+    fn loadRaw(lib: c.FT_Library, px: u16, path: []const u8, check_latin: bool) ?c.FT_Face {
         var path_buf: [512]u8 = undefined;
         if (path.len + 1 > path_buf.len) return null;
         @memcpy(path_buf[0..path.len], path);
@@ -292,33 +311,42 @@ pub const Face = struct {
             return null;
         }
         _ = c.FT_Select_Charmap(face, c.FT_ENCODING_UNICODE);
-        // Reject faces whose charmap can't resolve basic Latin: a wrong or
-        // missing charmap maps every codepoint to .notdef (tofu) instead of
-        // failing loudly, so skip to the next candidate.
-        if (c.FT_Get_Char_Index(face, 'M') == 0) {
-            _ = c.FT_Done_Face(face);
-            return null;
+        if (check_latin) {
+            // Reject faces whose charmap can't resolve basic Latin: a wrong or
+            // missing charmap maps every codepoint to .notdef (tofu) instead of
+            // failing loudly, so skip to the next candidate.
+            if (c.FT_Get_Char_Index(face, 'M') == 0) {
+                _ = c.FT_Done_Face(face);
+                return null;
+            }
+        } else {
+            // Fallback symbols face: verify it actually contains glyphs.
+            if (face.*.num_glyphs == 0) {
+                _ = c.FT_Done_Face(face);
+                return null;
+            }
         }
         return face;
     }
 
     /// Nerd fallback: explicit override > well-known paths > $HOME fonts.
-    fn loadNerd(lib: c.FT_Library, gpa: std.mem.Allocator, io: std.Io, px: u16, nerd_path: []const u8) ?c.FT_Face {
+    fn loadNerd(lib: c.FT_Library, gpa: std.mem.Allocator, io: std.Io, px: u16, nerd_path: []const u8, primary_path: []const u8) ?c.FT_Face {
         if (std.c.getenv("ZINC_FONT_NERD")) |p| {
-            if (loadRaw(lib, px, std.mem.span(p))) |f| {
-                std.debug.print("[zinc] font fallback: {s}\n", .{std.mem.span(p)});
+            if (loadRaw(lib, px, std.mem.span(p), false)) |f| {
+                std.debug.print("[zinc] font fallback (nerd): {s}\n", .{std.mem.span(p)});
                 return f;
             }
         }
         if (nerd_path.len > 0) {
-            if (loadRaw(lib, px, nerd_path)) |f| {
-                std.debug.print("[zinc] font fallback: {s}\n", .{nerd_path});
+            if (loadRaw(lib, px, nerd_path, false)) |f| {
+                std.debug.print("[zinc] font fallback (nerd): {s}\n", .{nerd_path});
                 return f;
             }
         }
         for (NERD_CANDIDATES) |cand| {
-            if (loadRaw(lib, px, cand)) |f| {
-                std.debug.print("[zinc] font fallback: {s}\n", .{cand});
+            if (std.mem.eql(u8, cand, primary_path)) continue;
+            if (loadRaw(lib, px, cand, false)) |f| {
+                std.debug.print("[zinc] font fallback (nerd): {s}\n", .{cand});
                 return f;
             }
         }
@@ -330,21 +358,35 @@ pub const Face = struct {
                 @memcpy(buf[0..home.len], home);
                 @memcpy(buf[home.len..][0..suf.len], suf);
                 const full = buf[0 .. home.len + suf.len];
-                if (loadRaw(lib, px, full)) |f| {
-                    std.debug.print("[zinc] font fallback: {s}\n", .{full});
+                if (std.mem.eql(u8, full, primary_path)) continue;
+                if (loadRaw(lib, px, full, false)) |f| {
+                    std.debug.print("[zinc] font fallback (nerd): {s}\n", .{full});
                     return f;
                 }
             }
             // Same recursive scan, biased toward Symbols Nerd Font.
             var scan_buf: [1024]u8 = undefined;
             if (scanHomePath(lib, gpa, io, px, home, true, &scan_buf)) |found| {
-                if (loadRaw(lib, px, found)) |f| {
-                    std.debug.print("[zinc] font fallback (scan): {s}\n", .{found});
-                    return f;
+                if (!std.mem.eql(u8, found, primary_path)) {
+                    if (loadRaw(lib, px, found, false)) |f| {
+                        std.debug.print("[zinc] font fallback (nerd scan): {s}\n", .{found});
+                        return f;
+                    }
                 }
             }
         }
-        std.debug.print("[zinc] font fallback: none found\n", .{});
+        return null;
+    }
+
+    /// Load the first matching fallback font from a candidate list.
+    fn loadFallback(lib: c.FT_Library, px: u16, candidates: []const []const u8, primary_path: []const u8) ?c.FT_Face {
+        for (candidates) |cand| {
+            if (std.mem.eql(u8, cand, primary_path)) continue;
+            if (loadRaw(lib, px, cand, false)) |f| {
+                std.debug.print("[zinc] font fallback: {s}\n", .{cand});
+                return f;
+            }
+        }
         return null;
     }
 
@@ -367,8 +409,12 @@ pub const Face = struct {
     fn scoreNerd(name: []const u8, prefer_symbols: bool) ?u8 {
         if (!hasFontExt(name)) return null;
         if (!contains(name, "Nerd") and !contains(name, "nerd")) return null;
-        var s: u8 = 1;
-        if (contains(name, "Mono")) s += 2;
+        var s: u8 = 10;
+        // Non-Mono Nerd Fonts preserve full 1.0 em icon proportions (foot/kitty standard).
+        // Deprioritize *Mono variants where icons are horizontally compressed.
+        if (contains(name, "NerdFontMono") or contains(name, "SymbolsNerdFontMono") or contains(name, "NFM")) {
+            s -= 4;
+        }
         if (contains(name, "JetBrainsMono")) s += 4;
         if (contains(name, "Symbols")) s += if (prefer_symbols) 8 else 0;
         if (contains(name, "Regular")) s += 1;
@@ -410,7 +456,7 @@ pub const Face = struct {
                 var full_buf: [1024]u8 = undefined;
                 const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ root, e.path[0..e.path.len] }) catch continue;
                 // Validate the face loads before crowning it.
-                if (loadRaw(lib, px, full)) |face| {
+                if (loadRaw(lib, px, full, !prefer_symbols)) |face| {
                     _ = c.FT_Done_Face(face);
                     if (full.len > out.len) continue;
                     @memcpy(out[0..full.len], full);
@@ -424,7 +470,7 @@ pub const Face = struct {
     }
 
     fn tryFace(lib: c.FT_Library, px: u16, path: []const u8) ?Face {
-        const face = loadRaw(lib, px, path) orelse return null;
+        const face = loadRaw(lib, px, path, true) orelse return null;
         errdefer _ = c.FT_Done_Face(face);
 
         const m = face.*.size.*.metrics;
@@ -468,16 +514,24 @@ pub const Face = struct {
         if (self.bold) |f| _ = c.FT_Done_Face(f);
         if (self.italic) |f| _ = c.FT_Done_Face(f);
         if (self.bold_italic) |f| _ = c.FT_Done_Face(f);
-        if (self.fallback) |fb| _ = c.FT_Done_Face(fb);
+        for (self.fallbacks) |fb| {
+            if (fb) |f| _ = c.FT_Done_Face(f);
+        }
         _ = c.FT_Done_Face(self.face);
         _ = c.FT_Done_FreeType(self.lib);
     }
 
     /// Bake one codepoint+style into the atlas. Style face first, then
-    /// regular, then the nerd fallback (char index 0 = missing everywhere).
+    /// regular, then fallback faces (char index 0 = missing everywhere).
     /// Returns blank metrics instead of .notdef for missing glyphs.
     pub fn bake(self: *Face, atlas: *atlas_mod.Atlas, cp: u21, style: Style) Error!atlas_mod.Baked {
-        var cands: [3]?c.FT_Face = .{ null, self.face, self.fallback };
+        var cands: [5]?c.FT_Face = .{
+            null,
+            self.face,
+            self.fallbacks[0],
+            self.fallbacks[1],
+            self.fallbacks[2],
+        };
         switch (style) {
             .regular => cands[0] = self.face,
             .bold => cands[0] = self.bold,
@@ -491,7 +545,12 @@ pub const Face = struct {
             const f = cands[ci] orelse continue;
             if (cp == 0 or c.FT_Get_Char_Index(f, @intCast(cp)) != 0) {
                 target = f;
-                slot_n = if (ci == 2) 1 else 0;
+                slot_n = switch (ci) {
+                    0, 1 => 0,
+                    2 => 1,
+                    3 => 2,
+                    else => 3,
+                };
                 break;
             }
         }
@@ -556,8 +615,8 @@ pub const Face = struct {
             .y = pos.y,
             .w = @intCast(@min(w, 255)),
             .h = @intCast(@min(h, 255)),
-            .xoff = @intCast(slot.*.bitmap_left),
-            .yoff = @intCast(slot.*.bitmap_top),
+            .xoff = @intCast(@max(-128, @min(127, slot.*.bitmap_left))),
+            .yoff = @intCast(@max(-128, @min(127, slot.*.bitmap_top))),
             .advance = @intCast(@max(0, @min(adv, 255))),
             .font_slot = slot_n,
         };
