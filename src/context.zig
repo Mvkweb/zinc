@@ -45,6 +45,10 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         scratch_backing: []u8,
         write_cb: ?WriteCb = null,
         write_user: ?*anyopaque = null,
+        palette: [256]u32 = [_]u32{0} ** 256,
+        fg: u32 = cfg.fg,
+        bg: u32 = cfg.bg,
+        cursor_color: u32 = cfg.cursor_color,
         title: [256]u8 = [_]u8{0} ** 256,
         title_len: usize = 0,
         /// Cursor blink phase. Reset to visible on any parsed output.
@@ -66,8 +70,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         alt_active: bool = false,
         alt_saved_col: u16 = 0,
         alt_saved_row: u16 = 0,
-        /// Query-reply overlap for split DA/DSR/XTGETTCAP reads.
-        q_overlap: [16]u8 = [_]u8{0} ** 16,
+        q_overlap: [16]u8 = undefined,
         q_overlap_len: usize = 0,
 
         const Self = @This();
@@ -92,6 +95,11 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             errdefer images.deinit();
             const scratch_backing = try std.heap.page_allocator.alloc(u8, 4 * 1024 * 1024);
             errdefer std.heap.page_allocator.free(scratch_backing);
+            var pal: [256]u32 = undefined;
+            const ansi = defaultAnsi();
+            for (0..256) |idx| {
+                pal[idx] = sgr_mod.palette256(@intCast(idx), ansi);
+            }
             return .{
                 .gpa = gpa,
                 .grid = grid,
@@ -101,6 +109,10 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 .images = images,
                 .scratch = scratch_mod.Scratch.init(scratch_backing),
                 .scratch_backing = scratch_backing,
+                .palette = pal,
+                .fg = cfg.fg,
+                .bg = cfg.bg,
+                .cursor_color = cfg.cursor_color,
                 .scroll_bot = cfg.rows - 1,
                 .blink_last_ms = nowMs(),
             };
@@ -343,6 +355,52 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     self.title[n] = 0;
                     self.title_len = n;
                 },
+                .palette => {
+                    var it = std.mem.splitScalar(u8, parts.payload, ';');
+                    var dirty = false;
+                    while (it.next()) |idx_str| {
+                        const spec = it.next() orelse break;
+                        const idx = std.fmt.parseInt(u8, idx_str, 10) catch continue;
+                        if (std.mem.eql(u8, spec, "?")) {
+                            var ob: [64]u8 = undefined;
+                            const c = self.palette[idx];
+                            const r: u32 = (c >> 16) & 0xFF;
+                            const g: u32 = (c >> 8) & 0xFF;
+                            const b: u32 = c & 0xFF;
+                            const msg = std.fmt.bufPrint(&ob, "\x1b]4;{d};rgb:{x:0>2}{x:0>2}/{x:0>2}{x:0>2}/{x:0>2}{x:0>2}\x1b\\", .{
+                                idx, r, r, g, g, b, b,
+                            }) catch null;
+                            if (msg) |m| self.emit(m);
+                        } else if (osc_mod.parseColorSpec(spec)) |c| {
+                            self.palette[idx] = c;
+                            dirty = true;
+                        }
+                    }
+                    if (dirty) self.grid.markAllDirty();
+                },
+                .color_fg => {
+                    if (!std.mem.eql(u8, parts.payload, "?")) {
+                        if (osc_mod.parseColorSpec(parts.payload)) |c| {
+                            self.fg = c;
+                            self.grid.markAllDirty();
+                        }
+                    }
+                },
+                .color_bg => {
+                    if (!std.mem.eql(u8, parts.payload, "?")) {
+                        if (osc_mod.parseColorSpec(parts.payload)) |c| {
+                            self.bg = c;
+                            self.grid.markAllDirty();
+                        }
+                    }
+                },
+                .color_cursor => {
+                    if (!std.mem.eql(u8, parts.payload, "?")) {
+                        if (osc_mod.parseColorSpec(parts.payload)) |c| {
+                            self.cursor_color = c;
+                        }
+                    }
+                },
                 else => {},
             }
         }
@@ -395,9 +453,9 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
             // OSC 10/11/12 color queries, answered from the theme.
             const osc_answers = [_]struct { pat: []const u8, color: u32 }{
-                .{ .pat = "]10;?", .color = cfg.fg },
-                .{ .pat = "]11;?", .color = cfg.bg },
-                .{ .pat = "]12;?", .color = cfg.cursor_color },
+                .{ .pat = "]10;?", .color = self.fg },
+                .{ .pat = "]11;?", .color = self.bg },
+                .{ .pat = "]12;?", .color = self.cursor_color },
             };
             for (osc_answers) |oa| {
                 if (std.mem.indexOf(u8, win, oa.pat) != null) {
@@ -444,13 +502,13 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
             const cell = self.grid.at(self.cursor_col, self.cursor_row);
             cell.setRune(cp);
-            const fg = resolveColor(self.pen.fg, cfg.fg);
+            const fg = self.resolveColor(self.pen.fg, self.fg);
             cell.fg = fg;
-            cell.bg = resolveColor(self.pen.bg, cfg.bg);
+            cell.bg = self.resolveColor(self.pen.bg, self.bg);
             // Underline color defaults to the text color (sfte parity).
             cell.ul_color = switch (self.pen.ul.kind) {
                 .default => fg,
-                else => resolveColor(self.pen.ul, fg),
+                else => self.resolveColor(self.pen.ul, fg),
             };
             cell.ul_style = if (!self.pen.underline) .none else switch (self.pen.ul_style) {
                 2 => .double,
@@ -473,10 +531,10 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             self.cursor_col += 1;
         }
 
-        fn resolveColor(c: sgr_mod.Color, def: u32) u32 {
+        fn resolveColor(self: *const Self, c: sgr_mod.Color, def: u32) u32 {
             return switch (c.kind) {
                 .default => def,
-                .indexed => sgr_mod.palette256(c.indexed, defaultAnsi()),
+                .indexed => self.palette[c.indexed],
                 .rgb => c.rgb,
             };
         }
@@ -512,10 +570,14 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 @memcpy(self.grid.cells[dst..][0..self.grid.cols], self.grid.cells[src..][0..self.grid.cols]);
             }
             const last = @as(usize, self.scroll_bot) * self.grid.cols;
-            @memset(self.grid.cells[last..][0..self.grid.cols], .{});
+            const CellT = @TypeOf(self.grid.cells[0]);
+            const blank = CellT{ .fg = self.fg, .bg = self.bg, .ul_color = self.fg };
+            @memset(self.grid.cells[last..][0..self.grid.cols], blank);
         }
 
         fn reverseIndex(self: *Self) void {
+            const CellT = @TypeOf(self.grid.cells[0]);
+            const blank = CellT{ .fg = self.fg, .bg = self.bg, .ul_color = self.fg };
             if (self.cursor_row == self.scroll_top) {
                 // scroll region down
                 var r = self.scroll_bot;
@@ -524,24 +586,26 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     const src = @as(usize, r - 1) * self.grid.cols;
                     @memcpy(self.grid.cells[dst..][0..self.grid.cols], self.grid.cells[src..][0..self.grid.cols]);
                 }
-                @memset(self.grid.cells[@as(usize, self.scroll_top) * self.grid.cols ..][0..self.grid.cols], .{});
+                @memset(self.grid.cells[@as(usize, self.scroll_top) * self.grid.cols ..][0..self.grid.cols], blank);
             } else if (self.cursor_row > 0) {
                 self.cursor_row -= 1;
             }
         }
 
         fn eraseDisplay(self: *Self, mode: u16) void {
+            const CellT = @TypeOf(self.grid.cells[0]);
+            const blank = CellT{ .fg = self.fg, .bg = self.bg, .ul_color = self.fg };
             switch (mode) {
                 0 => { // cursor -> end
                     const start = self.grid.index(self.cursor_col, self.cursor_row);
-                    @memset(self.grid.cells[start..], .{});
+                    @memset(self.grid.cells[start..], blank);
                 },
                 1 => { // start -> cursor
                     const end = self.grid.index(self.cursor_col, self.cursor_row) + 1;
-                    @memset(self.grid.cells[0..end], .{});
+                    @memset(self.grid.cells[0..end], blank);
                 },
                 2, 3 => {
-                    @memset(self.grid.cells, .{});
+                    @memset(self.grid.cells, blank);
                     if (mode == 3 and cfg.scrollback_clear_on_ed3) self.grid.clearScrollback();
                 },
                 else => {},
@@ -550,17 +614,21 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         }
 
         fn eraseLine(self: *Self, mode: u16) void {
+            const CellT = @TypeOf(self.grid.cells[0]);
+            const blank = CellT{ .fg = self.fg, .bg = self.bg, .ul_color = self.fg };
             const row_off = @as(usize, self.cursor_row) * self.grid.cols;
             switch (mode) {
-                0 => @memset(self.grid.cells[row_off + self.cursor_col ..][0 .. self.grid.cols - self.cursor_col], .{}),
-                1 => @memset(self.grid.cells[row_off..][0 .. self.cursor_col + 1], .{}),
-                2 => @memset(self.grid.cells[row_off..][0..self.grid.cols], .{}),
+                0 => @memset(self.grid.cells[row_off + self.cursor_col ..][0 .. self.grid.cols - self.cursor_col], blank),
+                1 => @memset(self.grid.cells[row_off..][0 .. self.cursor_col + 1], blank),
+                2 => @memset(self.grid.cells[row_off..][0..self.grid.cols], blank),
                 else => {},
             }
         }
 
         fn reset(self: *Self) void {
-            @memset(self.grid.cells, .{});
+            const CellT = @TypeOf(self.grid.cells[0]);
+            const blank = CellT{ .fg = self.fg, .bg = self.bg, .ul_color = self.fg };
+            @memset(self.grid.cells, blank);
             self.pen = .{};
             self.cursor_col = 0;
             self.cursor_row = 0;
@@ -680,4 +748,27 @@ test "modifyOtherKeys query leaves no underline" {
     for (ctx.grid.cells) |c| {
         try std.testing.expect(c.ul_style == .none);
     }
+}
+
+test "osc 4 and osc 10/11/12 dynamic palette" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("\x1b]10;rgb:de/e7/ec\x1b\\");
+    ctx.parse("\x1b]11;rgb:0b/0f/11\x1b\\");
+    ctx.parse("\x1b]12;rgb:b4/ca/d5\x1b\\");
+    ctx.parse("\x1b]4;16;rgb:a1/cd/e1\x1b\\");
+    ctx.parse("\x1b]4;17;rgb:b4/ca/d5\x1b\\");
+    ctx.parse("\x1b]4;18;rgb:d4/df/ff\x1b\\");
+    try std.testing.expectEqual(@as(u32, 0xdee7ec), ctx.fg);
+    try std.testing.expectEqual(@as(u32, 0x0b0f11), ctx.bg);
+    try std.testing.expectEqual(@as(u32, 0xb4cad5), ctx.cursor_color);
+    try std.testing.expectEqual(@as(u32, 0xa1cde1), ctx.palette[16]);
+    try std.testing.expectEqual(@as(u32, 0xb4cad5), ctx.palette[17]);
+    try std.testing.expectEqual(@as(u32, 0xd4dfff), ctx.palette[18]);
+
+    // Fastfetch-style print using 38;5;16 / 17 / 18
+    ctx.parse("\x1b[38;5;16mA\x1b[38;5;17mB\x1b[38;5;18mC");
+    try std.testing.expectEqual(@as(u32, 0xa1cde1), ctx.grid.cells[0].fg);
+    try std.testing.expectEqual(@as(u32, 0xb4cad5), ctx.grid.cells[1].fg);
+    try std.testing.expectEqual(@as(u32, 0xd4dfff), ctx.grid.cells[2].fg);
 }

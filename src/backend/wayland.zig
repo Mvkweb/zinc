@@ -595,8 +595,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// Apply alpha: only the default bg gets translucency (foot alpha-mode=matching).
         /// Stored premultiplied (foot/pixman ARGB8888 convention): RGB is
         /// scaled by alpha so the compositor doesn't over-contribute light.
-        fn themed(color: u32) u32 {
-            const a: u32 = if ((color & 0xFFFFFF) == cfg.bg) cfg.bg_opacity else 0xFF;
+        fn themed(self: *Self, color: u32) u32 {
+            const a: u32 = if ((color & 0xFFFFFF) == (self.ctx.bg & 0xFFFFFF)) cfg.bg_opacity else 0xFF;
             const r = ((color >> 16) & 0xFF) * a / 255;
             const g = ((color >> 8) & 0xFF) * a / 255;
             const b = (color & 0xFF) * a / 255;
@@ -633,7 +633,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const py: i32 = @intCast(cfg.pad_y);
             const cw = self.cell_w;
             const ch = self.cell_h;
-            const bg_all = themed(cfg.bg);
+            const bg_all = self.themed(self.ctx.bg);
             software.fillRect(self.pool_pixels, W, H, 0, 0, W, H, bg_all, &dmg);
 
             var row: u16 = 0;
@@ -658,7 +658,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         fg = bg_straight;
                         bg_straight = t;
                     }
-                    const bg = themed(bg_straight);
+                    const bg = self.themed(bg_straight);
                     if (cell.attr.dim) {
                         const r = ((fg >> 16) & 0xFF) * 2 / 3;
                         const g = ((fg >> 8) & 0xFF) * 2 / 3;
@@ -726,7 +726,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         // Underlines: single/double bars, triangle-wave
                         // curly, dotted and dashed variants.
                         if (cell.ul_style != .none) {
-                            const ucol = themed(cell.ul_color);
+                            const ucol = self.themed(cell.ul_color);
                             // Foot parity: font underline metrics when present,
                             // estimates otherwise. Clamped inside the cell.
                             const uh: u32 = if (self.ft_face.ul_thick_px > 0)
@@ -781,7 +781,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (show_cursor) {
                 const ccx: u32 = @intCast(px + @as(i32, self.ctx.cursor_col) * cw);
                 const ccy: u32 = @intCast(py + @as(i32, self.ctx.cursor_row) * ch);
-                const cur = themed(cfg.cursor_color);
+                const cur = self.themed(self.ctx.cursor_color);
                 const cwu: u32 = @intCast(cw);
                 const chu: u32 = @intCast(ch);
                 const t: u32 = @intCast(@max(1, @as(i32, @intFromFloat(@ceil(cfg.cursor_thick_px)))));
