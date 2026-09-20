@@ -47,8 +47,10 @@ pub const Config = struct {
     cursor_trail_ms: u16 = 0,
     cursor_trail_decay: f32 = 0.01,
 
-    // Font.
+    // Font. Size is points at font_dpi (foot parity: size=12 with
+    // dpi-aware=no renders 12pt @ 96dpi = 16px, never 12px).
     font_default_size: f32 = 12.0,
+    font_dpi: f32 = 96.0,
     /// Explicit TTF path. Empty = auto-discover (see font/ft.zig).
     /// ZINC_FONT env var overrides this when set.
     font_path: []const u8 = "",
@@ -103,6 +105,12 @@ pub const Config = struct {
     osc_init_cap: u32 = 128,
     osc_max_cap: u32 = 16 * 1024 * 1024,
 
+    /// Device pixels for font_default_size (points at font_dpi).
+    pub fn fontPx(comptime cfg: Config) u16 {
+        const px = @round(cfg.font_default_size * cfg.font_dpi / 72.0);
+        return @intFromFloat(@max(1.0, @min(256.0, px)));
+    }
+
     pub fn validate(comptime self: Config) void {
         comptime {
             if (self.cols == 0) @compileError("cols must be >= 1");
@@ -154,6 +162,8 @@ test "config profiles validate" {
     comptime full.validate();
     comptime minimal.validate();
     try std.testing.expect(active.cols >= 1);
+    // 12pt @ 96dpi (foot dpi-aware=no) = 16px, not 12px.
+    try std.testing.expectEqual(@as(u16, 16), full.fontPx());
 }
 
 const std = @import("std");

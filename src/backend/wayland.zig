@@ -283,8 +283,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Font first: cell metrics size the default window.
             // Manual unwind until self exists (then errdefer self.deinit()).
             var ctx = try context_mod.Context(cfg).init(gpa);
-            const px: u16 = @intFromFloat(cfg.font_default_size);
-            var ft_face = ft_mod.Face.init(px, cfg.font_path, cfg.nerd_font_path) catch {
+            const px: u16 = cfg.fontPx();
+            var ft_face = ft_mod.Face.init(gpa, io, px, cfg.font_path, cfg.nerd_font_path) catch {
                 ctx.deinit();
                 return error.FontFailed;
             };
@@ -579,10 +579,14 @@ pub fn App(comptime cfg: config_mod.Config) type {
         }
 
         /// Apply alpha: only the default bg gets translucency (foot alpha-mode=matching).
-        /// Everything else (colored bg, cursor, underline) stays fully opaque.
+        /// Stored premultiplied (foot/pixman ARGB8888 convention): RGB is
+        /// scaled by alpha so the compositor doesn't over-contribute light.
         fn themed(color: u32) u32 {
-            const alpha: u32 = if ((color & 0xFFFFFF) == cfg.bg) cfg.bg_opacity else 0xFF;
-            return (alpha << 24) | (color & 0xFFFFFF);
+            const a: u32 = if ((color & 0xFFFFFF) == cfg.bg) cfg.bg_opacity else 0xFF;
+            const r = ((color >> 16) & 0xFF) * a / 255;
+            const g = ((color >> 8) & 0xFF) * a / 255;
+            const b = (color & 0xFF) * a / 255;
+            return (a << 24) | (r << 16) | (g << 8) | b;
         }
 
         /// Cell rune (u8 in ascii mode, u32 otherwise) to codepoint.
@@ -630,13 +634,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     }
                     const cell_ptr = self.ctx.grid.viewCell(col, row) orelse continue;
                     const cell = cell_ptr.*;
-                    var fg = 0xFF000000 | (cell.fg & 0xFFFFFF);
-                    var bg = themed(cell.bg);
+                    // fg stays straight-opaque for the coverage blend; bg is
+                    // premultiplied for the buffer. Swap before converting so
+                    // reverse video never feeds premult RGB into the blit.
+                    var fg: u32 = 0xFF000000 | (cell.fg & 0xFFFFFF);
+                    var bg_straight: u32 = 0xFF000000 | (cell.bg & 0xFFFFFF);
                     if (cell.attr.reverse) {
                         const t = fg;
-                        fg = bg;
-                        bg = t;
+                        fg = bg_straight;
+                        bg_straight = t;
                     }
+                    const bg = themed(bg_straight);
                     if (cell.attr.dim) fg = 0xFF000000 | ((fg >> 1) & 0x7F7F7F);
                     const x: u32 = @intCast(px + @as(i32, col) * cw);
                     const y: u32 = @intCast(py + @as(i32, row) * ch);

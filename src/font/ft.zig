@@ -119,17 +119,23 @@ pub const Face = struct {
     ascent: i16,
     descent: i16, // negative
 
-    pub fn init(px: u16, config_path: []const u8, nerd_path: []const u8) Error!Face {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, px: u16, config_path: []const u8, nerd_path: []const u8) Error!Face {
         var lib: c.FT_Library = undefined;
         if (c.FT_Init_FreeType(&lib) != 0) return error.InitFailed;
         errdefer _ = c.FT_Done_FreeType(lib);
 
         var primary: ?Face = null;
         if (std.c.getenv("ZINC_FONT")) |p| {
-            if (tryFace(lib, px, std.mem.span(p))) |f| primary = f;
+            if (tryFace(lib, px, std.mem.span(p))) |f| {
+                std.debug.print("[zinc] font primary: {s}\n", .{std.mem.span(p)});
+                primary = f;
+            }
         }
         if (primary == null and config_path.len > 0) {
-            if (tryFace(lib, px, config_path)) |f| primary = f;
+            if (tryFace(lib, px, config_path)) |f| {
+                std.debug.print("[zinc] font primary: {s}\n", .{config_path});
+                primary = f;
+            }
         }
         // Check user $HOME Nerd Fonts first (custom installs):
         if (primary == null) {
@@ -140,9 +146,22 @@ pub const Face = struct {
                     if (home.len + suf.len + 1 > buf.len) continue;
                     @memcpy(buf[0..home.len], home);
                     @memcpy(buf[home.len..][0..suf.len], suf);
-                    if (tryFace(lib, px, buf[0 .. home.len + suf.len])) |f| {
+                    const full = buf[0 .. home.len + suf.len];
+                    if (tryFace(lib, px, full)) |f| {
+                        std.debug.print("[zinc] font primary: {s}\n", .{full});
                         primary = f;
                         break;
+                    }
+                }
+                // Exact names missed (custom subdirs, distro renames):
+                // bounded recursive scan for *NerdFont* files.
+                if (primary == null) {
+                    var scan_buf: [1024]u8 = undefined;
+                    if (scanHomePath(lib, gpa, io, px, home, false, &scan_buf)) |found| {
+                        if (tryFace(lib, px, found)) |f| {
+                            std.debug.print("[zinc] font primary (scan): {s}\n", .{found});
+                            primary = f;
+                        }
                     }
                 }
             }
@@ -151,6 +170,7 @@ pub const Face = struct {
         if (primary == null) {
             for (PRIMARY_NERD_CANDIDATES) |cand| {
                 if (tryFace(lib, px, cand)) |f| {
+                    std.debug.print("[zinc] font primary: {s}\n", .{cand});
                     primary = f;
                     break;
                 }
@@ -160,6 +180,7 @@ pub const Face = struct {
         if (primary == null) {
             for (GENERIC_CANDIDATES) |cand| {
                 if (tryFace(lib, px, cand)) |f| {
+                    std.debug.print("[zinc] font primary: {s}\n", .{cand});
                     primary = f;
                     break;
                 }
@@ -173,7 +194,9 @@ pub const Face = struct {
                     if (home.len + suf.len + 1 > buf.len) continue;
                     @memcpy(buf[0..home.len], home);
                     @memcpy(buf[home.len..][0..suf.len], suf);
-                    if (tryFace(lib, px, buf[0 .. home.len + suf.len])) |f| {
+                    const full = buf[0 .. home.len + suf.len];
+                    if (tryFace(lib, px, full)) |f| {
+                        std.debug.print("[zinc] font primary: {s}\n", .{full});
                         primary = f;
                         break;
                     }
@@ -182,7 +205,7 @@ pub const Face = struct {
         }
         var self = primary orelse return error.NoFont;
         errdefer self.deinit();
-        self.fallback = loadNerd(lib, px, nerd_path);
+        self.fallback = loadNerd(lib, gpa, io, px, nerd_path);
         return self;
     }
 
@@ -200,19 +223,35 @@ pub const Face = struct {
             return null;
         }
         _ = c.FT_Select_Charmap(face, c.FT_ENCODING_UNICODE);
+        // Reject faces whose charmap can't resolve basic Latin: a wrong or
+        // missing charmap maps every codepoint to .notdef (tofu) instead of
+        // failing loudly, so skip to the next candidate.
+        if (c.FT_Get_Char_Index(face, 'M') == 0) {
+            _ = c.FT_Done_Face(face);
+            return null;
+        }
         return face;
     }
 
     /// Nerd fallback: explicit override > well-known paths > $HOME fonts.
-    fn loadNerd(lib: c.FT_Library, px: u16, nerd_path: []const u8) ?c.FT_Face {
+    fn loadNerd(lib: c.FT_Library, gpa: std.mem.Allocator, io: std.Io, px: u16, nerd_path: []const u8) ?c.FT_Face {
         if (std.c.getenv("ZINC_FONT_NERD")) |p| {
-            if (loadRaw(lib, px, std.mem.span(p))) |f| return f;
+            if (loadRaw(lib, px, std.mem.span(p))) |f| {
+                std.debug.print("[zinc] font fallback: {s}\n", .{std.mem.span(p)});
+                return f;
+            }
         }
         if (nerd_path.len > 0) {
-            if (loadRaw(lib, px, nerd_path)) |f| return f;
+            if (loadRaw(lib, px, nerd_path)) |f| {
+                std.debug.print("[zinc] font fallback: {s}\n", .{nerd_path});
+                return f;
+            }
         }
         for (NERD_CANDIDATES) |cand| {
-            if (loadRaw(lib, px, cand)) |f| return f;
+            if (loadRaw(lib, px, cand)) |f| {
+                std.debug.print("[zinc] font fallback: {s}\n", .{cand});
+                return f;
+            }
         }
         if (std.c.getenv("HOME")) |h| {
             const home = std.mem.span(h);
@@ -221,10 +260,98 @@ pub const Face = struct {
                 if (home.len + suf.len + 1 > buf.len) continue;
                 @memcpy(buf[0..home.len], home);
                 @memcpy(buf[home.len..][0..suf.len], suf);
-                if (loadRaw(lib, px, buf[0 .. home.len + suf.len])) |f| return f;
+                const full = buf[0 .. home.len + suf.len];
+                if (loadRaw(lib, px, full)) |f| {
+                    std.debug.print("[zinc] font fallback: {s}\n", .{full});
+                    return f;
+                }
+            }
+            // Same recursive scan, biased toward Symbols Nerd Font.
+            var scan_buf: [1024]u8 = undefined;
+            if (scanHomePath(lib, gpa, io, px, home, true, &scan_buf)) |found| {
+                if (loadRaw(lib, px, found)) |f| {
+                    std.debug.print("[zinc] font fallback (scan): {s}\n", .{found});
+                    return f;
+                }
             }
         }
+        std.debug.print("[zinc] font fallback: none found\n", .{});
         return null;
+    }
+
+    const SCAN_ROOTS = [_][]const u8{ "/.local/share/fonts", "/.fonts" };
+    const SCAN_MAX_DEPTH = 4;
+
+    fn hasFontExt(name: []const u8) bool {
+        const exts = [_][]const u8{ ".ttf", ".otf", ".ttc", ".TTF", ".OTF" };
+        for (exts) |e| {
+            if (name.len >= e.len and std.mem.eql(u8, name[name.len - e.len ..], e)) return true;
+        }
+        return false;
+    }
+
+    fn contains(name: []const u8, needle: []const u8) bool {
+        return std.mem.indexOf(u8, name, needle) != null;
+    }
+
+    /// Desirability of a font file found during a $HOME scan.
+    fn scoreNerd(name: []const u8, prefer_symbols: bool) ?u8 {
+        if (!hasFontExt(name)) return null;
+        if (!contains(name, "Nerd") and !contains(name, "nerd")) return null;
+        var s: u8 = 1;
+        if (contains(name, "Mono")) s += 2;
+        if (contains(name, "JetBrainsMono")) s += 4;
+        if (contains(name, "Symbols")) s += if (prefer_symbols) 8 else 0;
+        if (contains(name, "Regular")) s += 1;
+        return s;
+    }
+
+    /// Bounded recursive scan of $HOME fonts dirs for the best Nerd Font
+    /// path. Best-effort: any I/O error just ends the scan. Writes the
+    /// winning path into out and returns it.
+    fn scanHomePath(
+        lib: c.FT_Library,
+        gpa: std.mem.Allocator,
+        io: std.Io,
+        px: u16,
+        home: []const u8,
+        prefer_symbols: bool,
+        out: *[1024]u8,
+    ) ?[]const u8 {
+        var best_score: u8 = 0;
+        var best_len: usize = 0;
+        for (SCAN_ROOTS) |sub| {
+            var root_buf: [1024]u8 = undefined;
+            const root = std.fmt.bufPrint(&root_buf, "{s}{s}", .{ home, sub }) catch continue;
+            var dir = std.Io.Dir.openDirAbsolute(io, root, .{ .iterate = true }) catch continue;
+            defer dir.close(io);
+            var walker = std.Io.Dir.walk(dir, gpa) catch continue;
+            defer walker.deinit();
+            while (true) {
+                const ent = walker.next(io) catch break;
+                const e = ent orelse break;
+                if (e.kind == .directory) {
+                    if (e.depth() >= SCAN_MAX_DEPTH) walker.leave(io);
+                    continue;
+                }
+                if (e.kind != .file) continue;
+                if (e.depth() > SCAN_MAX_DEPTH) continue;
+                const score = scoreNerd(e.basename[0..e.basename.len], prefer_symbols) orelse continue;
+                if (score <= best_score) continue;
+                var full_buf: [1024]u8 = undefined;
+                const full = std.fmt.bufPrint(&full_buf, "{s}/{s}", .{ root, e.path[0..e.path.len] }) catch continue;
+                // Validate the face loads before crowning it.
+                if (loadRaw(lib, px, full)) |face| {
+                    _ = c.FT_Done_Face(face);
+                    if (full.len > out.len) continue;
+                    @memcpy(out[0..full.len], full);
+                    best_score = score;
+                    best_len = full.len;
+                }
+            }
+        }
+        if (best_len == 0) return null;
+        return out[0..best_len];
     }
 
     fn tryFace(lib: c.FT_Library, px: u16, path: []const u8) ?Face {

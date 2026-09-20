@@ -27,17 +27,21 @@ pub const Damage = struct {
     }
 };
 
+/// Premultiplied src-over: the shm buffer is ARGB8888 in the pixman/foot
+/// convention (RGB already scaled by alpha), so blends stay in that space.
+/// src_argb is a straight opaque fg; alpha is the glyph coverage.
 pub fn blendArgb(dst: u32, src_argb: u32, alpha: u8) u32 {
     const a: u32 = alpha;
     const ia: u32 = 255 - a;
-    const da: u32 = (dst >> 24) & 0xFF; // preserve dst alpha (translucency)
+    const da: u32 = (dst >> 24) & 0xFF;
+    const out_a: u32 = a + da * ia / 255;
     const dr = (dst >> 16) & 0xFF;
     const dg = (dst >> 8) & 0xFF;
     const db = dst & 0xFF;
     const sr = (src_argb >> 16) & 0xFF;
     const sg = (src_argb >> 8) & 0xFF;
     const sb = src_argb & 0xFF;
-    return (da << 24) | ((dr * ia + sr * a) / 255 << 16) | ((dg * ia + sg * a) / 255 << 8) | ((db * ia + sb * a) / 255);
+    return (out_a << 24) | ((dr * ia + sr * a) / 255 << 16) | ((dg * ia + sg * a) / 255 << 8) | ((db * ia + sb * a) / 255);
 }
 
 pub fn fillRect(buf: []u32, stride: u32, height: u32, x: u32, y: u32, w: u32, h: u32, color: u32, dmg: ?*Damage) void {
