@@ -4,6 +4,7 @@
 const std = @import("std");
 const config_mod = @import("../config.zig");
 const cell_mod = @import("cell.zig");
+const reflow_mod = @import("reflow.zig");
 
 pub fn Grid(comptime cfg: config_mod.Config) type {
     const C = cell_mod.Cell(cfg);
@@ -59,26 +60,40 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
             for (self.cells) |*c| c.dirty = true;
         }
 
+        /// Push an arbitrary row into the scrollback ring.
+        pub fn pushScrollbackRow(self: *Self, src: []const C) void {
+            if (cfg.scrollback_cap == 0 or self.sb_rows.len == 0) return;
+            const dst_idx = (self.sb_head + self.sb_len) % cfg.scrollback_cap;
+            var row = self.sb_rows[dst_idx];
+            if (row == null or row.?.len != src.len) {
+                if (row) |r| self.gpa.free(r);
+                row = self.gpa.alloc(C, src.len) catch null;
+                self.sb_rows[dst_idx] = row;
+            }
+            if (row) |r| {
+                @memcpy(r, src);
+                if (self.sb_len < cfg.scrollback_cap) {
+                    self.sb_len += 1;
+                } else {
+                    self.sb_head = (self.sb_head + 1) % cfg.scrollback_cap;
+                }
+            }
+        }
+
+        /// Pop the newest row from the scrollback ring.
+        pub fn popScrollbackRow(self: *Self) ?[]const C {
+            if (cfg.scrollback_cap == 0 or self.sb_len == 0) return null;
+            const last_idx = (self.sb_head + self.sb_len - 1) % cfg.scrollback_cap;
+            self.sb_len -= 1;
+            return self.sb_rows[last_idx];
+        }
+
         /// Push top row into scrollback ring (or drop if disabled).
         /// Scroll the grid up one row. When push is false (alt-screen),
         /// the top row is discarded instead of entering scrollback.
         pub fn scrollUp(self: *Self, push: bool) void {
-            if (push and cfg.scrollback_cap > 0 and self.sb_rows.len > 0) {
-                const dst_idx = (self.sb_head + self.sb_len) % cfg.scrollback_cap;
-                var row = self.sb_rows[dst_idx];
-                if (row == null or row.?.len != self.cols) {
-                    if (row) |r| self.gpa.free(r);
-                    row = self.gpa.alloc(C, self.cols) catch null;
-                    self.sb_rows[dst_idx] = row;
-                }
-                if (row) |r| {
-                    @memcpy(r, self.cells[0..self.cols]);
-                    if (self.sb_len < cfg.scrollback_cap) {
-                        self.sb_len += 1;
-                    } else {
-                        self.sb_head = (self.sb_head + 1) % cfg.scrollback_cap;
-                    }
-                }
+            if (push) {
+                self.pushScrollbackRow(self.cells[0..self.cols]);
             }
             std.mem.copyForwards(C, self.cells[0 .. self.cells.len - self.cols], self.cells[self.cols..]);
             @memset(self.cells[self.cells.len - self.cols ..], .{});
@@ -124,10 +139,9 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
             return &self.cells[self.index(col, @intCast(r - k))];
         }
 
-        /// Resize the grid, preserving the overlapping region top-left.
-        /// Width changes invalidate scrollback (ring stride mismatches);
-        /// height-only changes keep history.
-        pub fn resize(self: *Self, cols: u16, rows: u16) !void {
+        /// Resize the grid, preserving the overlapping region top-left without reflow.
+        /// Scrollback history is retained across width changes.
+        pub fn resizeCrop(self: *Self, cols: u16, rows: u16) !void {
             if (cols == self.cols and rows == self.rows) return;
             const CellT = @TypeOf(self.cells[0]);
             const new_cells = try self.gpa.alloc(CellT, @as(usize, cols) * rows);
@@ -156,18 +170,36 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
                 self.gpa.free(self.alt_cells);
                 self.alt_cells = new_alt;
             }
-            if (cols != self.cols) {
-                // Ring stride changed: drop old scrollback rows and reset ring.
-                for (self.sb_rows) |maybe_row| {
-                    if (maybe_row) |row| self.gpa.free(row);
-                }
-                @memset(self.sb_rows, null);
-                self.clearScrollback();
-            }
             self.cols = cols;
             self.rows = rows;
-            self.view_offset = 0;
+            self.view_offset = @min(self.view_offset, self.sb_len);
             self.markAllDirty();
+        }
+
+        /// Resize with logical-line reflow when on primary screen.
+        pub fn resizeWithReflow(
+            self: *Self,
+            cols: u16,
+            rows: u16,
+            is_alt: bool,
+            cursor_col: *u16,
+            cursor_row: *u16,
+            def_bg: u32,
+        ) !void {
+            if (cols == self.cols and rows == self.rows) return;
+            if (is_alt or !cfg.reflow_on_resize) {
+                try self.resizeCrop(cols, rows);
+                cursor_col.* = @min(cursor_col.*, cols -| 1);
+                cursor_row.* = @min(cursor_row.*, rows -| 1);
+                return;
+            }
+            try reflow_mod.reflowGrid(cfg, self.gpa, self, cols, rows, cursor_col, cursor_row, def_bg);
+        }
+
+        pub fn resize(self: *Self, cols: u16, rows: u16) !void {
+            var dummy_c: u16 = 0;
+            var dummy_r: u16 = 0;
+            try self.resizeWithReflow(cols, rows, false, &dummy_c, &dummy_r, cfg.bg);
         }
     };
 }
@@ -190,19 +222,18 @@ test "minimal grid skips alt-screen and scrollback storage" {
     try std.testing.expectEqual(@as(usize, 0), g.sb_rows.len);
 }
 
-test "resize preserves overlap, drops width-changed scrollback" {
+test "resize preserves scrollback across crop" {
     const G = Grid(.{ .scrollback_cap = 4, .alt_screen = true });
     var g = try G.init(std.testing.allocator, 4, 2);
     defer g.deinit();
     g.at(0, 0).setRune('A');
     g.scrollUp(true);
     try std.testing.expectEqual(@as(usize, 1), g.sb_len);
-    try g.resize(6, 3);
+    try g.resizeCrop(6, 3);
     try std.testing.expectEqual(@as(u16, 6), g.cols);
     try std.testing.expectEqual(@as(u16, 3), g.rows);
-    try std.testing.expectEqual(@as(usize, 0), g.sb_len); // width changed
-    try g.resize(6, 4);
-    try std.testing.expectEqual(@as(usize, 0), g.sb_len);
+    try std.testing.expectEqual(@as(usize, 1), g.sb_len); // preserved!
+    try std.testing.expectEqual(@as(u32, 'A'), g.sb_rows[0].?[0].rune);
 }
 
 test "viewport shows scrollback when scrolled" {

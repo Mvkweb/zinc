@@ -657,6 +657,24 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             cell.dirty = true;
             return true;
         }
+
+        pub fn resize(self: *Self, cols: u16, rows: u16) void {
+            if (cols == self.grid.cols and rows == self.grid.rows) return;
+            self.grid.resizeWithReflow(
+                cols,
+                rows,
+                self.alt_active,
+                &self.cursor_col,
+                &self.cursor_row,
+                self.bg,
+            ) catch {
+                self.grid.resizeCrop(cols, rows) catch {};
+            };
+            self.scroll_top = 0;
+            self.scroll_bot = rows - 1;
+            self.cursor_col = @min(self.cursor_col, cols -| 1);
+            self.cursor_row = @min(self.cursor_row, rows -| 1);
+        }
     };
 }
 

@@ -252,6 +252,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
         running: bool = true,
         needs_render: bool = true,
         frame_pending: bool = false,
+        pending_resize: ?struct { w: i32, h: i32 } = null,
+        resize_settle_ms: i64 = 0,
+        is_resizing: bool = false,
+        pending_cols: u16 = 0,
+        pending_rows: u16 = 0,
 
         pty_pid: i32 = 0,
         pty_fd: i32 = -1,
@@ -444,6 +449,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.xkb_ctx = xkb_context_new(0);
             }
 
+            if (self.pending_resize) |p| {
+                self.pending_resize = null;
+                self.handleResize(p.w, p.h);
+            }
             // Default pixel size from font metrics until configure says otherwise.
             if (self.width == 0) {
                 const pad: i32 = @intCast(cfg.pad_x);
@@ -455,7 +464,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Spawn the shell.
             const term = try gpa.dupeZ(u8, cfg.term_env);
             defer gpa.free(term);
-            const child = pty_mod.spawnShell(cfg.cols, cfg.rows, term) catch return error.PtyFailed;
+            const child = pty_mod.spawnShell(self.ctx.grid.cols, self.ctx.grid.rows, term) catch return error.PtyFailed;
             self.pty_pid = child.pid;
             self.pty_fd = child.fd;
             // Shell query replies (DA/DSR/...) go straight back to the PTY.
@@ -636,10 +645,34 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const bg_all = self.themed(self.ctx.bg);
             software.fillRect(self.pool_pixels, W, H, 0, 0, W, H, bg_all, &dmg);
 
+            const visible_cols = @min(self.ctx.grid.cols, @as(u16, @intCast(@max(0, @divFloor(self.width - px, cw)))));
+            const visible_rows = @min(self.ctx.grid.rows, @as(u16, @intCast(@max(0, @divFloor(self.height - py, ch)))));
+
+            // Pass 1: non-default cell backgrounds (default bg was filled above).
             var row: u16 = 0;
-            while (row < self.ctx.grid.rows) : (row += 1) {
+            while (row < visible_rows) : (row += 1) {
                 var col: u16 = 0;
-                while (col < self.ctx.grid.cols) : (col += 1) {
+                while (col < visible_cols) : (col += 1) {
+                    const cell_ptr = self.ctx.grid.viewCell(col, row) orelse continue;
+                    const cell = cell_ptr.*;
+                    var bg_straight: u32 = 0xFF000000 | (cell.bg & 0xFFFFFF);
+                    if (cell.attr.reverse) {
+                        bg_straight = 0xFF000000 | (cell.fg & 0xFFFFFF);
+                    }
+                    const bg = self.themed(bg_straight);
+                    if (bg != bg_all) {
+                        const x: u32 = @intCast(px + @as(i32, col) * cw);
+                        const y: u32 = @intCast(py + @as(i32, row) * ch);
+                        software.fillRect(self.pool_pixels, W, H, x, y, @intCast(cw), @intCast(ch), bg, null);
+                    }
+                }
+            }
+
+            // Pass 2: glyphs, combining marks, underlines.
+            row = 0;
+            while (row < visible_rows) : (row += 1) {
+                var col: u16 = 0;
+                while (col < visible_cols) : (col += 1) {
                     // Wide-char follower column belongs to the previous cell.
                     if (col > 0) {
                         if (self.ctx.grid.viewCell(col - 1, row)) |prev| {
@@ -648,17 +681,12 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     }
                     const cell_ptr = self.ctx.grid.viewCell(col, row) orelse continue;
                     const cell = cell_ptr.*;
-                    // fg stays straight-opaque for the coverage blend; bg is
-                    // premultiplied for the buffer. Swap before converting so
-                    // reverse video never feeds premult RGB into the blit.
+                    // fg stays straight-opaque for the coverage blend. Swap
+                    // before converting so reverse video uses bg as fg.
                     var fg: u32 = 0xFF000000 | (cell.fg & 0xFFFFFF);
-                    var bg_straight: u32 = 0xFF000000 | (cell.bg & 0xFFFFFF);
                     if (cell.attr.reverse) {
-                        const t = fg;
-                        fg = bg_straight;
-                        bg_straight = t;
+                        fg = 0xFF000000 | (cell.bg & 0xFFFFFF);
                     }
-                    const bg = self.themed(bg_straight);
                     if (cell.attr.dim) {
                         const r = ((fg >> 16) & 0xFF) * 2 / 3;
                         const g = ((fg >> 8) & 0xFF) * 2 / 3;
@@ -667,7 +695,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     }
                     const x: u32 = @intCast(px + @as(i32, col) * cw);
                     const y: u32 = @intCast(py + @as(i32, row) * ch);
-                    software.fillRect(self.pool_pixels, W, H, x, y, @intCast(cw), @intCast(ch), bg, null);
 
                     if (!cell.attr.invisible) {
                         const cp = cellCp(cell.rune);
@@ -778,7 +805,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Block cursor; hollow outline when unfocused; hidden on blink
             // phase, DECSET 25 reset, or while scrolled into history.
             const show_cursor = (!cfg.cursor_blink or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0;
-            if (show_cursor) {
+            if (show_cursor and self.ctx.cursor_col < visible_cols and self.ctx.cursor_row < visible_rows) {
                 const ccx: u32 = @intCast(px + @as(i32, self.ctx.cursor_col) * cw);
                 const ccy: u32 = @intCast(py + @as(i32, self.ctx.cursor_row) * ch);
                 const cur = self.themed(self.ctx.cursor_color);
@@ -805,7 +832,41 @@ pub fn App(comptime cfg: config_mod.Config) type {
         var prof_frames: u32 = 0;
         var prof_last_sec: i64 = 0;
 
+        fn handleResize(self: *Self, w: i32, h: i32) void {
+            if (w <= 0 or h <= 0) return;
+            if (w == self.width and h == self.height) return;
+            self.width = w;
+            self.height = h;
+            const cols: u16 = @intCast(@max(1, @divFloor(w - 2 * @as(i32, @intCast(cfg.pad_x)), self.cell_w)));
+            const rows: u16 = @intCast(@max(1, @divFloor(h - 2 * @as(i32, @intCast(cfg.pad_y)), self.cell_h)));
+
+            if (self.is_resizing or self.resize_settle_ms > 0) {
+                // Interactive drag in progress: delay reflow and SIGWINCH until drag settles (Foot parity).
+                self.pending_cols = cols;
+                self.pending_rows = rows;
+                self.resize_settle_ms = context_mod.nowMs() + 75;
+                self.needs_render = true;
+            } else {
+                // One-shot configure (maximize, initial layout, window manager tile).
+                self.settleResize(cols, rows);
+            }
+        }
+
+        fn settleResize(self: *Self, cols: u16, rows: u16) void {
+            self.resize_settle_ms = 0;
+            if (cols == self.ctx.grid.cols and rows == self.ctx.grid.rows) return;
+            self.ctx.resize(cols, rows);
+            if (self.pty_fd >= 0) {
+                pty_mod.resizePty(self.pty_fd, cols, rows, @intCast(@min(self.width, 32767)), @intCast(@min(self.height, 32767)));
+            }
+            self.needs_render = true;
+        }
+
         fn present(self: *Self) void {
+            if (self.pending_resize) |p| {
+                self.pending_resize = null;
+                self.handleResize(p.w, p.h);
+            }
             self.recreatePool() catch return;
             const is_prof = std.c.getenv("ZINC_PROFILE") != null;
             const t0: i64 = if (is_prof) context_mod.nowMs() else 0;
@@ -821,7 +882,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 }
             }
             c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_ATTACH, self.buffer, @as(i32, 0), @as(i32, 0));
-            if (dmg.empty) {
+            if (dmg.empty or self.resize_settle_ms > 0) {
                 c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_DAMAGE_BUFFER, @as(i32, 0), @as(i32, 0), self.width, self.height);
             } else {
                 c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_DAMAGE_BUFFER, dmg.x, dmg.y, dmg.w, dmg.h);
@@ -861,13 +922,27 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     .{ .fd = self.repeat_fd, .events = linux.POLL.IN, .revents = 0 },
                 };
                 const nfds: usize = if (self.repeat_fd >= 0) 3 else 2;
-                const prc = linux.poll(&fds, nfds, self.ctx.getTimeoutMs());
+                var poll_timeout: i32 = self.ctx.getTimeoutMs();
+                if (self.resize_settle_ms > 0) {
+                    const now = context_mod.nowMs();
+                    if (now >= self.resize_settle_ms) {
+                        poll_timeout = 0;
+                    } else {
+                        const rem: i32 = @intCast(self.resize_settle_ms - now);
+                        poll_timeout = if (poll_timeout < 0) rem else @min(poll_timeout, rem);
+                    }
+                }
+                const prc = linux.poll(&fds, nfds, poll_timeout);
                 if (linux.errno(prc) == .SUCCESS and (fds[0].revents & linux.POLL.IN) != 0) {
                     _ = c.wl_display_read_events(self.display);
                 } else {
                     _ = c.wl_display_cancel_read(self.display);
                 }
                 _ = c.wl_display_dispatch_pending(self.display);
+
+                if (self.resize_settle_ms > 0 and context_mod.nowMs() >= self.resize_settle_ms) {
+                    self.settleResize(self.pending_cols, self.pending_rows);
+                }
 
                 if ((fds[1].revents & linux.POLL.IN) != 0) {
                     var iters: u8 = 0;
@@ -1035,26 +1110,28 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         fn appOnToplevelConfigure(data: ?*anyopaque, tl: ?*P.XdgToplevel, w: i32, h: i32, states: ?*P.Array) callconv(.c) void {
             _ = tl;
-            _ = states;
             const self: *Self = @ptrCast(@alignCast(data));
+            var is_resizing = false;
+            if (states) |st| {
+                if (st.data) |ptr| {
+                    const count = st.size / @sizeOf(u32);
+                    const s_slice: [*]const u32 = @ptrCast(@alignCast(ptr));
+                    for (s_slice[0..count]) |s| {
+                        if (s == 3) { // XDG_TOPLEVEL_STATE_RESIZING
+                            is_resizing = true;
+                            break;
+                        }
+                    }
+                }
+            }
+            const drag_ended = self.is_resizing and !is_resizing;
+            self.is_resizing = is_resizing;
+
             if (w > 0 and h > 0 and (w != self.width or h != self.height)) {
-                self.width = w;
-                self.height = h;
-                // Fit the grid to the window (Win6b): recompute cells from
-                // font metrics, notify the PTY, reset the scroll region.
-                const cols: u16 = @intCast(@max(1, @divFloor(w - 2 * @as(i32, @intCast(cfg.pad_x)), self.cell_w)));
-                const rows: u16 = @intCast(@max(1, @divFloor(h - 2 * @as(i32, @intCast(cfg.pad_y)), self.cell_h)));
-                if (self.pty_fd >= 0) {
-                    pty_mod.resizePty(self.pty_fd, cols, rows, @intCast(@min(w, 32767)), @intCast(@min(h, 32767)));
-                }
-                if (cols != self.ctx.grid.cols or rows != self.ctx.grid.rows) {
-                    self.ctx.grid.resize(cols, rows) catch {};
-                    self.ctx.scroll_top = 0;
-                    self.ctx.scroll_bot = rows - 1;
-                    self.ctx.cursor_col = @min(self.ctx.cursor_col, cols -| 1);
-                    self.ctx.cursor_row = @min(self.ctx.cursor_row, rows -| 1);
-                }
+                self.pending_resize = .{ .w = w, .h = h };
                 self.needs_render = true;
+            } else if (drag_ended and self.resize_settle_ms > 0) {
+                self.settleResize(self.pending_cols, self.pending_rows);
             }
         }
 
