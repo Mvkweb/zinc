@@ -246,7 +246,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 },
                 'G' => self.cursor_col = @min(self.grid.cols - 1, n(params, 0, 1) -| 1),
                 'H', 'f' => {
-                    self.cursor_row = @min(self.grid.rows - 1, n(params, 0, 2) -| 1);
+                    self.cursor_row = @min(self.grid.rows - 1, n(params, 0, 1) -| 1);
                     self.cursor_col = @min(self.grid.cols - 1, n(params, 1, 1) -| 1);
                 },
                 'J' => self.eraseDisplay(n(params, 0, 0)),
@@ -665,4 +665,17 @@ test "context parse + sgr + osc title" {
     try std.testing.expect(ctx.grid.cells[2].attr.bold);
     ctx.parse("\x1b]2;zinc\x07");
     try std.testing.expectEqualStrings("zinc", ctx.title[0..ctx.title_len]);
+}
+
+test "modifyOtherKeys query leaves no underline" {
+    // Exact fish redraw fragment: CSI > 4 ; 1 m must not enable the pen,
+    // or the padding spaces that follow bake a full-width underline row.
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("\x1b[>4;1m\x1b=\x1b[K\x1b[1;30m          \x1b[0m\r\n");
+    try std.testing.expect(!ctx.pen.underline);
+    try std.testing.expect(!ctx.pen.bold);
+    for (ctx.grid.cells) |c| {
+        try std.testing.expect(c.ul_style == .none);
+    }
 }

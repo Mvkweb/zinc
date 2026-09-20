@@ -38,6 +38,10 @@ pub const Parser = struct {
     params: [16]u16 = [_]u16{0} ** 16,
     param_count: u8 = 0,
     priv: bool = false,
+    /// Set by '<', '=', '>' markers: a non-DEC sequence (modifyOtherKeys,
+    /// tertiary DA, SGR mouse, ...) — consumed silently, never dispatched.
+    /// '?' alone keeps DEC semantics (DECSET/RM, kitty-kb queries).
+    csi_alt: bool = false,
     /// Parallel to params: true when the entry followed a ':' (sub-param).
     sub: [16]bool = [_]bool{false} ** 16,
     osc_len: usize = 0,
@@ -49,6 +53,7 @@ pub const Parser = struct {
         self.params = [_]u16{0} ** 16;
         self.param_count = 0;
         self.priv = false;
+        self.csi_alt = false;
         self.sub = [_]bool{false} ** 16;
     }
 
@@ -132,7 +137,18 @@ pub const Parser = struct {
                         self.priv = true;
                         return null;
                     },
+                    '<', '=', '>' => {
+                        // Non-DEC markers (e.g. modifyOtherKeys CSI > 4 ; 1 m,
+                        // SGR mouse CSI < ... M): swallow the sequence so it
+                        // can never masquerade as SGR/DECSET.
+                        self.priv = true;
+                        self.csi_alt = true;
+                        return null;
+                    },
+                    0x20...0x2F => return null, // intermediates: consume
                     0x40...0x7E => {
+                        self.state = .ground;
+                        if (self.csi_alt) return null;
                         const count: u8 = self.param_count + 1;
                         const act = Action{ .csi_dispatch = .{
                             .final = b,
@@ -273,4 +289,43 @@ test "sgr + osc helpers wired" {
     try std.testing.expectEqual(osc.OscOp.title, osc.classify(0));
     var idx: usize = 0;
     try std.testing.expectEqual(@as(u21, 'z'), utf8.decode("z", &idx));
+}
+
+test "non-DEC markers swallowed, DEC still dispatches" {
+    var p = Parser{};
+    // Fish modifyOtherKeys query CSI > 4 ; 1 m: must vanish silently so it
+    // can never masquerade as SGR underline+bold.
+    for ("\x1b[>4;1m") |b| try std.testing.expect(p.feed(b) == null);
+    try std.testing.expectEqual(State.ground, p.state);
+    // SGR mouse form CSI < 0 ; 1 ; 1 M: swallowed too.
+    for ("\x1b[<0;1;1M") |b| try std.testing.expect(p.feed(b) == null);
+    try std.testing.expectEqual(State.ground, p.state);
+    // DEC private still dispatches with priv set (DECSET + kitty-kb).
+    _ = p.feed(0x1B);
+    _ = p.feed('[');
+    _ = p.feed('?');
+    _ = p.feed('2');
+    _ = p.feed('5');
+    const act = p.feed('h').?;
+    switch (act) {
+        .csi_dispatch => |d| {
+            try std.testing.expectEqual(@as(u8, 'h'), d.final);
+            try std.testing.expect(d.priv);
+        },
+        else => return error.Fail,
+    }
+    // Intermediates are consumed without disturbing params.
+    _ = p.feed(0x1B);
+    _ = p.feed('[');
+    _ = p.feed('3');
+    _ = p.feed('1');
+    _ = p.feed('$');
+    const act2 = p.feed('m').?;
+    switch (act2) {
+        .csi_dispatch => |d| {
+            try std.testing.expectEqual(@as(u16, 31), d.params[0]);
+            try std.testing.expect(!d.priv);
+        },
+        else => return error.Fail,
+    }
 }
