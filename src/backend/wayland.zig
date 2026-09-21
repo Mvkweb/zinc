@@ -144,6 +144,7 @@ const context_mod = @import("../context.zig");
 const pty_mod = @import("../pty.zig");
 const input_kb = @import("../input/keyboard.zig");
 const selection_mod = @import("../input/selection.zig");
+const mouse_mod = @import("../input/mouse.zig");
 const hyperlink_mod = @import("../term/hyperlink.zig");
 const software = @import("../render/software.zig");
 const ft_mod = @import("../font/ft.zig");
@@ -240,6 +241,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// app itself isn't tracking the mouse (mouse_mode == .off).
         sel: selection_mod.Selection = .{},
         sel_drag: bool = false,
+        /// Buttons currently held (bit per evdev button) for app drag-motion.
+        mouse_buttons: u8 = 0,
         ptr_inside: bool = false,
         /// Last pointer surface position (wl_fixed 24.8); button events
         /// carry no coordinates, so press handling uses these.
@@ -267,8 +270,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
         cursor_shape_dev: ?*P.CursorShapeDevice = null,
         /// Last pointer enter/button serial (for set_shape).
         ptr_serial: u32 = 0,
-        /// True when the pointer shape is currently shown.
-        cursor_shaped: bool = false,
+        /// Current server cursor shape (0 = unset / needs refresh; see P.cursor_shape.SHAPE_*).
+        cursor_shape: u32 = 0,
 
         xkb_ctx: ?*XkbContext = null,
         xkb_map: ?*XkbKeymap = null,
@@ -1128,7 +1131,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         }
                         tracePty(pty_buf[0..rrc]);
                         self.ctx.answerQueries(pty_buf[0..rrc]);
+                        const prev_mouse_mode = self.ctx.mouse_mode;
                         self.ctx.parse(pty_buf[0..rrc]);
+                        if (self.ctx.mouse_mode != prev_mouse_mode) {
+                            self.refreshCursor();
+                        }
                         self.needs_render = true;
                         if (rrc < pty_buf.len) break;
                     }
@@ -1190,11 +1197,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         fn handleSym(self: *Self, sym: u32, keycode: u32) void {
             if (self.xkb_state == null) return;
-            var mods = input_kb.Mods{};
-            if (xkb_state_mod_name_is_active(self.xkb_state, "Control", XKB_STATE_MODS_EFFECTIVE) > 0) mods.ctrl = true;
-            if (xkb_state_mod_name_is_active(self.xkb_state, "Shift", XKB_STATE_MODS_EFFECTIVE) > 0) mods.shift = true;
-            if (xkb_state_mod_name_is_active(self.xkb_state, "Mod1", XKB_STATE_MODS_EFFECTIVE) > 0) mods.alt = true;
-            if (xkb_state_mod_name_is_active(self.xkb_state, "Mod4", XKB_STATE_MODS_EFFECTIVE) > 0) mods.super = true;
+            const mods = self.currentMods();
 
             // Modifier-only press: hover-underline visibility may change.
             if (sym == K.Control_L or sym == K.Control_R) {
@@ -1566,7 +1569,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     .axis_relative_direction = appOnPointerAxisRelativeDirection,
                 };
                 _ = c.wl_proxy_add_listener(@ptrCast(self.pointer), @ptrCast(&self.pbl), @ptrCast(self));
-                // Shape device for link-hover cursors (no-op when the
+                // Shape device for native cursor shapes (no-op when the
                 // compositor lacks cursor-shape-v1).
                 if (self.cursor_shape_mgr != null and self.cursor_shape_dev == null) {
                     const csd_iface = &P.cursor_shape.device_interface;
@@ -1578,6 +1581,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         @as(?*anyopaque, @ptrCast(self.pointer)),
                         @as(?*anyopaque, null),
                     ));
+                    if (self.ptr_inside) {
+                        self.cursor_shape = 0;
+                        self.refreshCursor();
+                    }
                 }
             }
         }
@@ -1608,12 +1615,25 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.ptr_inside = (surface == self.surface);
             self.ptr_sx = sx;
             self.ptr_sy = sy;
+            if (self.ptr_inside) {
+                self.cursor_shape = 0;
+                self.refreshCursor();
+            }
         }
 
         /// -- hyperlinks (OSC 8 + implicit URLs, Ghostty parity) ----------
         fn ctrlHeld(self: *Self) bool {
-            if (self.xkb_state == null) return false;
-            return xkb_state_mod_name_is_active(self.xkb_state, "Control", XKB_STATE_MODS_EFFECTIVE) > 0;
+            return self.currentMods().ctrl;
+        }
+
+        fn currentMods(self: *Self) input_kb.Mods {
+            var mods = input_kb.Mods{};
+            if (self.xkb_state == null) return mods;
+            if (xkb_state_mod_name_is_active(self.xkb_state, "Control", XKB_STATE_MODS_EFFECTIVE) > 0) mods.ctrl = true;
+            if (xkb_state_mod_name_is_active(self.xkb_state, "Shift", XKB_STATE_MODS_EFFECTIVE) > 0) mods.shift = true;
+            if (xkb_state_mod_name_is_active(self.xkb_state, "Mod1", XKB_STATE_MODS_EFFECTIVE) > 0) mods.alt = true;
+            if (xkb_state_mod_name_is_active(self.xkb_state, "Mod4", XKB_STATE_MODS_EFFECTIVE) > 0) mods.super = true;
+            return mods;
         }
 
         fn clearHover(self: *Self) void {
@@ -1701,22 +1721,43 @@ pub fn App(comptime cfg: config_mod.Config) type {
             pty_mod.openUrl(target);
         }
 
-        /// Sync the server cursor with link-hover state: pointer hand over
-        /// a Ctrl-hovered link, text beam otherwise. No-op without the
-        /// cursor-shape protocol; transition-only so no per-frame traffic.
+        fn currentShape(self: *Self) u32 {
+            const mods = self.currentMods();
+            if (cfg.hyperlinks and self.hover_active and mods.ctrl) {
+                return P.cursor_shape.SHAPE_POINTER;
+            }
+            if (cfg.mouse and self.ctx.mouse_mode != .off and !mods.shift) {
+                return P.cursor_shape.SHAPE_DEFAULT;
+            }
+            return P.cursor_shape.SHAPE_TEXT;
+        }
+
+        /// Sync the server cursor with current terminal state:
+        /// - Pointer hand (SHAPE_POINTER) over a Ctrl-hovered link
+        /// - Standard pointer arrow (SHAPE_DEFAULT) when app captures mouse
+        /// - Text beam (SHAPE_TEXT) for normal shell / Shift-bypass selection
+        /// No-op without cursor-shape protocol; transition-only so no per-frame traffic.
         fn refreshCursor(self: *Self) void {
-            if (!cfg.hyperlinks) return;
             const dev = self.cursor_shape_dev orelse return;
-            if (self.ptr_serial == 0) return;
-            const want_pointer = self.hover_active and self.ctrlHeld();
-            if (want_pointer == self.cursor_shaped) return;
+            if (self.ptr_serial == 0 or !self.ptr_inside) return;
+            const want_shape = self.currentShape();
+            if (want_shape == self.cursor_shape) return;
             c.wl_proxy_marshal(
                 @ptrCast(dev),
                 P.cursor_shape.DEVICE_SET_SHAPE,
                 self.ptr_serial,
-                if (want_pointer) P.cursor_shape.SHAPE_POINTER else P.cursor_shape.SHAPE_TEXT,
+                want_shape,
             );
-            self.cursor_shaped = want_pointer;
+            self.cursor_shape = want_shape;
+        }
+
+        /// Encode one mouse event for the app (DECSET 1000/1002/1003 +
+        /// SGR 1006). `code`: 0/1/2 buttons, 3 release, 64/65 wheel.
+        fn reportMouse(self: *Self, code: u8, pressed: bool, motion: bool, col: u16, row: u16) void {
+            const mods = self.currentMods();
+            var out: [32]u8 = undefined;
+            const seq = mouse_mod.report(code, pressed, motion, mods.shift, mods.alt, mods.ctrl, col, row, self.ctx.mouse_sgr, &out) catch return;
+            self.sendToPty(seq);
         }
 
         fn appOnPointerLeave(data: ?*anyopaque, pointer: ?*P.Pointer, serial: u32, surface: ?*P.Surface) callconv(.c) void {
@@ -1725,6 +1766,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             _ = surface;
             const self: *Self = @ptrCast(@alignCast(data));
             self.ptr_inside = false;
+            self.cursor_shape = 0;
             self.clearHover();
         }
 
@@ -1734,8 +1776,29 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const self: *Self = @ptrCast(@alignCast(data));
             self.ptr_sx = sx;
             self.ptr_sy = sy;
-            if (self.ctx.mouse_mode != .off) {
+            const mods = self.currentMods();
+            // App-owned mouse reports to the PTY; Shift bypasses to local
+            // handling (foot parity: select/copy out of mouse apps).
+            if (self.ctx.mouse_mode != .off and !mods.shift) {
                 self.clearHover();
+                self.refreshCursor();
+                const want = switch (self.ctx.mouse_mode) {
+                    .x10, .button_event => self.mouse_buttons != 0,
+                    .any_event => true,
+                    .off, .sgr => false,
+                };
+                if (want) {
+                    const cc = self.ptrCell(sx, sy);
+                    var code: u8 = 3;
+                    if (self.mouse_buttons & 1 != 0) {
+                        code = 0;
+                    } else if (self.mouse_buttons & 4 != 0) {
+                        code = 1;
+                    } else if (self.mouse_buttons & 2 != 0) {
+                        code = 2;
+                    }
+                    self.reportMouse(code, true, true, cc.col, cc.row);
+                }
                 return;
             }
             if (self.sel_drag) {
@@ -1755,15 +1818,38 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.last_serial = serial;
             self.ptr_serial = serial;
             if (!cfg.mouse) return;
-            // App-owned mouse goes to the PTY (future mouse-reporting work);
-            // selection only runs while tracking is off.
-            if (self.ctx.mouse_mode != .off) return;
+            const mods = self.currentMods();
+            // App-owned mouse reports to the PTY (DECSET 1000/1002/1003);
+            // Shift bypasses to local selection (foot parity).
+            if (self.ctx.mouse_mode != .off and !mods.shift) {
+                const bit: u8 = switch (button) {
+                    0x110 => 1,
+                    0x111 => 2,
+                    0x112 => 4,
+                    else => return,
+                };
+                const code: u8 = switch (button) {
+                    0x110 => 0,
+                    0x112 => 1,
+                    0x111 => 2,
+                    else => return,
+                };
+                const cc = self.ptrCell(self.ptr_sx, self.ptr_sy);
+                if (state == 1) {
+                    self.mouse_buttons |= bit;
+                    self.reportMouse(code, true, false, cc.col, cc.row);
+                } else {
+                    self.mouse_buttons &= ~bit;
+                    self.reportMouse(3, false, false, cc.col, cc.row);
+                }
+                return;
+            }
             switch (button) {
                 0x110 => { // left: Ctrl+click opens links; else drag-select
                     if (!cfg.selection) return;
                     const cc = self.ptrCell(self.ptr_sx, self.ptr_sy);
                     if (state == 1) {
-                        if (self.ctrlHeld()) {
+                        if (mods.ctrl) {
                             if (self.linkUriAt(cc.col, cc.row)) |u| {
                                 defer self.gpa.free(u);
                                 self.openLink(u);
@@ -1792,8 +1878,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
             _ = pointer;
             _ = time;
             const self: *Self = @ptrCast(@alignCast(data));
-            if (!cfg.mouse or self.ctx.mouse_mode != .off or self.ctx.alt_active) return;
+            if (!cfg.mouse) return;
             if (axis != 0) return; // vertical only
+            const mods = self.currentMods();
+            if (self.ctx.mouse_mode != .off and !mods.shift) {
+                // Wheel to the app: 64 up, 65 down (press only). Wayland
+                // vertical value > 0 scrolls content down.
+                const cc = self.ptrCell(self.ptr_sx, self.ptr_sy);
+                self.reportMouse(if (value > 0) 65 else 64, true, false, cc.col, cc.row);
+                return;
+            }
+            if (self.ctx.alt_active) return; // app owns the screen
             self.ctx.grid.scrollView(if (value > 0) -3 else 3);
             self.clearHover(); // content moved under the cursor
             self.needs_render = true;
@@ -2010,12 +2105,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const self: *Self = @ptrCast(@alignCast(data));
             // group is depressed layout; latched/locked layouts track depressed here.
             _ = xkb_state_update_mask(self.xkb_state, dep, lat, lock, group, group, group);
-            // Modifier flip (Ctrl press/release): link underline visibility
-            // and cursor shape may change even with the pointer parked.
-            if (cfg.hyperlinks) {
-                self.needs_render = true;
-                self.refreshCursor();
-            }
+            // Modifier flip (Ctrl for links, Shift for mouse bypass): link underline
+            // visibility and cursor shape may change even with the pointer parked.
+            if (cfg.hyperlinks) self.needs_render = true;
+            self.refreshCursor();
         }
 
         fn appOnRepeatInfo(data: ?*anyopaque, kb: ?*P.Keyboard, rate: i32, delay: i32) callconv(.c) void {
