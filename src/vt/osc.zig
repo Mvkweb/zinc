@@ -14,6 +14,7 @@ pub const OscOp = enum {
     color_bg, // 11
     color_cursor, // 12
     clipboard, // 52
+    semantic_prompt, // 133
 };
 
 pub fn classify(code: u32) OscOp {
@@ -26,6 +27,7 @@ pub fn classify(code: u32) OscOp {
         11 => .color_bg,
         12 => .color_cursor,
         52 => .clipboard,
+        133 => .semantic_prompt,
         else => .unknown,
     };
 }
@@ -82,6 +84,7 @@ test "osc split + classify" {
     try std.testing.expectEqual(OscOp.clipboard, classify(s.code));
     try std.testing.expectEqual(OscOp.title, classify(2));
     try std.testing.expectEqual(OscOp.palette, classify(4));
+    try std.testing.expectEqual(OscOp.semantic_prompt, classify(133));
     try std.testing.expect(splitPayload("nope") == null);
 }
 

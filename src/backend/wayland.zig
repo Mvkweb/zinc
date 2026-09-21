@@ -143,6 +143,8 @@ const config_mod = @import("../config.zig");
 const context_mod = @import("../context.zig");
 const pty_mod = @import("../pty.zig");
 const input_kb = @import("../input/keyboard.zig");
+const selection_mod = @import("../input/selection.zig");
+const hyperlink_mod = @import("../term/hyperlink.zig");
 const software = @import("../render/software.zig");
 const ft_mod = @import("../font/ft.zig");
 const atlas_mod = @import("../font/atlas.zig");
@@ -185,7 +187,10 @@ const K = struct {
     const Page_Down: u32 = 0xff56;
     const End: u32 = 0xff57;
     const Insert: u32 = 0xff63;
+    const ISO_Left_Tab: u32 = 0xfe20;
     const F1: u32 = 0xffbe;
+    const Control_L: u32 = 0xffe3;
+    const Control_R: u32 = 0xffe4;
     const F12: u32 = 0xffc9;
 };
 
@@ -224,6 +229,46 @@ pub fn App(comptime cfg: config_mod.Config) type {
         toplevel: ?*P.XdgToplevel = null,
         seat: ?*P.Seat = null,
         keyboard: ?*P.Keyboard = null,
+        pointer: ?*P.Pointer = null,
+        /// Seat capability bits (1=pointer, 2=keyboard, 4=touch). The pointer
+        /// is only bound when the compositor advertises it.
+        seat_caps: u32 = 0,
+        /// Serial of the latest button/key event; clipboard set_selection
+        /// requires a serial from user input.
+        last_serial: u32 = 0,
+        /// Mouse-drag text selection (screen coords). Active only while the
+        /// app itself isn't tracking the mouse (mouse_mode == .off).
+        sel: selection_mod.Selection = .{},
+        sel_drag: bool = false,
+        ptr_inside: bool = false,
+        /// Last pointer surface position (wl_fixed 24.8); button events
+        /// carry no coordinates, so press handling uses these.
+        ptr_sx: i32 = 0,
+        ptr_sy: i32 = 0,
+        /// Wayland clipboard (copy + paste).
+        ddm: ?*P.DataDeviceManager = null,
+        data_device: ?*P.DataDevice = null,
+        cur_source: ?*P.DataSource = null,
+        cur_offer: ?*P.DataOffer = null,
+        /// Bytes currently offered to other apps (retained for send events).
+        clip_text: ?[]u8 = null,
+        /// Best text mime advertised by the current offer.
+        offer_mime: [128]u8 = undefined,
+        offer_mime_len: usize = 0,
+        /// Ctrl+hover hyperlink state (screen coords, span, owned URI).
+        hover_col: u16 = 0,
+        hover_row: u16 = 0,
+        hover_c0: u16 = 0,
+        hover_c1: u16 = 0,
+        hover_active: bool = false,
+        hover_uri: ?[]u8 = null,
+        /// Server-side cursor shapes (wp_cursor_shape_manager_v1).
+        cursor_shape_mgr: ?*P.CursorShapeManager = null,
+        cursor_shape_dev: ?*P.CursorShapeDevice = null,
+        /// Last pointer enter/button serial (for set_shape).
+        ptr_serial: u32 = 0,
+        /// True when the pointer shape is currently shown.
+        cursor_shaped: bool = false,
 
         xkb_ctx: ?*XkbContext = null,
         xkb_map: ?*XkbKeymap = null,
@@ -245,6 +290,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
         tll: ToplevelListener = undefined,
         fbl: FrameListener = undefined,
         kbl: KeyboardListener = undefined,
+        sll: SeatListener = undefined,
+        pbl: PointerListener = undefined,
+        ddl: DataDeviceListener = undefined,
+        dsl: DataSourceListener = undefined,
+        dol: DataOfferListener = undefined,
 
         width: i32 = 0,
         height: i32 = 0,
@@ -272,10 +322,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
         want_shm_v: u32 = 0,
         want_wm_base_v: u32 = 0,
         want_seat_v: u32 = 0,
+        want_ddm_v: u32 = 0,
         name_compositor: u32 = 0,
         name_shm: u32 = 0,
         name_wm_base: u32 = 0,
         name_seat: u32 = 0,
+        name_ddm: u32 = 0,
+        name_cursor_shape: u32 = 0,
 
         const Self = @This();
 
@@ -374,6 +427,22 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.wbl = WmBaseListener{ .ping = appOnPing };
             _ = c.wl_proxy_add_listener(@ptrCast(wm_base), @ptrCast(&self.wbl), @ptrCast(self));
 
+            // Server cursors (optional; link shape stays untouched when
+            // the compositor doesn't advertise the protocol).
+            if (std.c.getenv("ZINC_DEBUG") != null) std.debug.print("[zinc] cursor-shape: name={}\n", .{self.name_cursor_shape});
+            if (self.name_cursor_shape != 0) {
+                const csm_iface = &P.cursor_shape.manager_interface;
+                self.cursor_shape_mgr = @ptrCast(c.wl_proxy_marshal_constructor(
+                    @ptrCast(reg),
+                    P.core.REGISTRY_BIND,
+                    csm_iface,
+                    self.name_cursor_shape,
+                    csm_iface.name,
+                    P.cursor_shape.version,
+                    @as(?*anyopaque, null),
+                ));
+            }
+
             // Surface + xdg role.
             self.surface = @ptrCast(c.wl_proxy_marshal_constructor(
                 @ptrCast(self.compositor),
@@ -434,6 +503,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     self.want_seat_v,
                     @as(?*anyopaque, null),
                 ));
+                // Capabilities gate the pointer bind below: requesting a
+                // pointer the seat lacks is a fatal protocol error.
+                self.sll = SeatListener{
+                    .capabilities = appOnSeatCaps,
+                    .name = appOnSeatName,
+                };
+                _ = c.wl_proxy_add_listener(@ptrCast(self.seat), @ptrCast(&self.sll), @ptrCast(self));
                 self.keyboard = @ptrCast(c.wl_proxy_marshal_constructor(
                     @ptrCast(self.seat),
                     P.core.SEAT_GET_KEYBOARD,
@@ -452,9 +528,58 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.xkb_ctx = xkb_context_new(0);
             }
 
+            // Clipboard manager (optional: pastes/copies degrade to no-ops).
+            // Seat is unwrapped once so a null seat can never reach the
+            // get_data_device call below (libwayland aborts on null objects).
+            if (cfg.clipboard and self.name_ddm != 0) {
+                const seat = self.seat orelse null;
+                // TEMPORARY root-cause probe: proves which code runs.
+                std.debug.print("[zinc] ddm setup: name_ddm={d} seat_present={} want_v={d}\n", .{ self.name_ddm, seat != null, self.want_ddm_v });
+                if (seat == null) {
+                    // No seat (yet): clipboard stays unavailable this run.
+                } else {
+                    self.ddm = @ptrCast(c.wl_proxy_marshal_constructor(
+                        @ptrCast(reg),
+                        P.core.REGISTRY_BIND,
+                        P.core.data_device_manager,
+                        self.name_ddm,
+                        P.core.data_device_manager.*.name,
+                        self.want_ddm_v,
+                        @as(?*anyopaque, null),
+                    ));
+                    // NOTE: seat is passed twice on purpose. libwayland's
+                    // vararg reader may or may not consume a slot for the
+                    // 'n' (new_id) marker in "no" signatures; duplicating the
+                    // seat is correct under both behaviors (extra trailing
+                    // args are never read), while passing it once fails if
+                    // 'n' consumes. Observed: single-seat form reliably
+                    // reports "null value passed for arg 1" on this system.
+                    self.data_device = @ptrCast(c.wl_proxy_marshal_constructor(
+                        @ptrCast(self.ddm),
+                        P.core.DDM_GET_DATA_DEVICE,
+                        P.core.data_device,
+                        @as(?*anyopaque, @ptrCast(seat)),
+                        @as(?*anyopaque, @ptrCast(seat)),
+                        @as(?*anyopaque, null),
+                    ));
+                    self.ddl = DataDeviceListener{
+                        .data_offer = appOnDeviceOffer,
+                        .enter = appOnDeviceEnter,
+                        .leave = appOnDeviceLeave,
+                        .motion = appOnDeviceMotion,
+                        .drop = appOnDeviceDrop,
+                        .selection = appOnDeviceSelection,
+                    };
+                    _ = c.wl_proxy_add_listener(@ptrCast(self.data_device), @ptrCast(&self.ddl), @ptrCast(self));
+                }
+            }
+
             if (self.pending_resize) |p| {
                 self.pending_resize = null;
                 self.handleResize(p.w, p.h);
+            }
+            if (self.resize_settle_ms > 0) {
+                self.settleResize(self.pending_cols, self.pending_rows);
             }
             // Default pixel size from font metrics until configure says otherwise.
             if (self.width == 0) {
@@ -499,6 +624,24 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (self.pool_fd >= 0) _ = linux.close(self.pool_fd);
             if (self.frame_cb) |f| c.wl_proxy_destroy(@ptrCast(f));
             if (self.keyboard) |k| c.wl_proxy_destroy(@ptrCast(k));
+            if (self.pointer) |p| c.wl_proxy_destroy(@ptrCast(p));
+            if (self.cur_source) |s| {
+                c.wl_proxy_marshal(@ptrCast(s), P.core.SOURCE_DESTROY);
+                c.wl_proxy_destroy(@ptrCast(s));
+            }
+            if (self.cur_offer) |o| {
+                c.wl_proxy_marshal(@ptrCast(o), P.core.OFFER_DESTROY);
+                c.wl_proxy_destroy(@ptrCast(o));
+            }
+            if (self.data_device) |d| {
+                c.wl_proxy_marshal(@ptrCast(d), P.core.DEVICE_RELEASE);
+                c.wl_proxy_destroy(@ptrCast(d));
+            }
+            if (self.ddm) |m| c.wl_proxy_destroy(@ptrCast(m));
+            if (self.cursor_shape_dev) |d| c.wl_proxy_destroy(@ptrCast(d));
+            if (self.cursor_shape_mgr) |m| c.wl_proxy_destroy(@ptrCast(m));
+            if (self.clip_text) |t| self.gpa.free(t);
+            if (self.hover_uri) |u| self.gpa.free(u);
             if (self.seat) |s| c.wl_proxy_destroy(@ptrCast(s));
             if (self.toplevel) |t| c.wl_proxy_destroy(@ptrCast(t));
             if (self.xdg_surface) |x| c.wl_proxy_destroy(@ptrCast(x));
@@ -662,6 +805,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     if (cell.attr.reverse) {
                         bg_straight = 0xFF000000 | (cell.fg & 0xFFFFFF);
                     }
+                    // Selection highlight: two flat theme colors, readable on
+                    // any content (Ghostty-style, not per-cell reverse).
+                    if (cfg.selection and self.sel.contains(col, row)) {
+                        bg_straight = 0xFF000000 | (cfg.selection_bg & 0xFFFFFF);
+                    }
                     const bg = self.themed(bg_straight);
                     if (bg != bg_all) {
                         const x: u32 = @intCast(px + @as(i32, col) * cw);
@@ -674,6 +822,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Pass 2: glyphs, combining marks, underlines.
             row = 0;
             while (row < visible_rows) : (row += 1) {
+                // Ctrl+hover hyperlink span on this row (if any).
+                const link_hover = cfg.hyperlinks and self.hover_active and row == self.hover_row and self.ctrlHeld();
                 var col: u16 = 0;
                 while (col < visible_cols) : (col += 1) {
                     // Wide-char follower column belongs to the previous cell.
@@ -689,6 +839,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     var fg: u32 = 0xFF000000 | (cell.fg & 0xFFFFFF);
                     if (cell.attr.reverse) {
                         fg = 0xFF000000 | (cell.bg & 0xFFFFFF);
+                    }
+                    if (cfg.selection and self.sel.contains(col, row)) {
+                        fg = 0xFF000000 | (cfg.selection_fg & 0xFFFFFF);
                     }
                     if (cell.attr.dim) {
                         const r = ((fg >> 16) & 0xFF) * 2 / 3;
@@ -802,6 +955,22 @@ pub fn App(comptime cfg: config_mod.Config) type {
                                 .none => {},
                             }
                         }
+                        // Ctrl+hover hyperlink underline (Ghostty parity).
+                        if (link_hover and col >= self.hover_c0 and col <= self.hover_c1) {
+                            const uh: u32 = if (self.ft_face.ul_thick_px > 0)
+                                self.ft_face.ul_thick_px
+                            else
+                                @intCast(@max(1, @divFloor(ch, 14)));
+                            const uoff: i32 = if (self.ft_face.ul_thick_px > 0)
+                                -@as(i32, self.ft_face.ul_pos_px)
+                            else
+                                @max(1, @divFloor(ch, 12));
+                            const ytop: i32 = @as(i32, @intCast(y));
+                            const ymax: i32 = ytop + ch - @as(i32, @intCast(uh));
+                            const uy: u32 = @intCast(@max(ytop, @min(ytop + self.ascent + uoff, ymax)));
+                            const cwu: u32 = @intCast(cw);
+                            software.fillRect(self.pool_pixels, W, H, x, uy, cwu, uh, self.themed(cfg.link_color), &dmg);
+                        }
                     }
                 }
             }
@@ -843,16 +1012,16 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const cols: u16 = @intCast(@max(15, @divFloor(w - 2 * @as(i32, @intCast(cfg.pad_x)), self.cell_w)));
             const rows: u16 = @intCast(@max(3, @divFloor(h - 2 * @as(i32, @intCast(cfg.pad_y)), self.cell_h)));
 
-            if (self.is_resizing or self.resize_settle_ms > 0) {
-                // Interactive drag in progress: delay reflow and SIGWINCH until drag settles (Foot parity).
-                self.pending_cols = cols;
-                self.pending_rows = rows;
-                self.resize_settle_ms = context_mod.nowMs() + 75;
-                self.needs_render = true;
-            } else {
-                // One-shot configure (maximize, initial layout, window manager tile).
-                self.settleResize(cols, rows);
-            }
+            if (cols == self.ctx.grid.cols and rows == self.ctx.grid.rows) return;
+
+            self.pending_cols = cols;
+            self.pending_rows = rows;
+            // Debounce all interactive resizes by 100ms (Foot parity: resize-delay-ms = 100).
+            // Compositors like Hyprland and Sway omit XDG_TOPLEVEL_STATE_RESIZING,
+            // so we debounce all size changes while the main loop runs.
+            // Consecutive configure events while dragging push the deadline forward.
+            self.resize_settle_ms = context_mod.nowMs() + 100;
+            self.needs_render = true;
         }
 
         fn settleResize(self: *Self, cols: u16, rows: u16) void {
@@ -1027,6 +1196,25 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (xkb_state_mod_name_is_active(self.xkb_state, "Mod1", XKB_STATE_MODS_EFFECTIVE) > 0) mods.alt = true;
             if (xkb_state_mod_name_is_active(self.xkb_state, "Mod4", XKB_STATE_MODS_EFFECTIVE) > 0) mods.super = true;
 
+            // Modifier-only press: hover-underline visibility may change.
+            if (sym == K.Control_L or sym == K.Control_R) {
+                if (cfg.hyperlinks) self.needs_render = true;
+                return;
+            }
+
+            // Clipboard shortcuts. Must come first: Ctrl+Shift+C/V would
+            // otherwise fall through to the dead Ctrl+letter path below.
+            // (Repeat is gated at arm time in appOnKey, not here.)
+            if (mods.ctrl and mods.shift) {
+                if (sym == 'C' or sym == 'c') {
+                    self.copySelection();
+                    return;
+                }
+                if (sym == 'V' or sym == 'v') {
+                    self.pasteClipboard();
+                    return;
+                }
+            }
             const key: ?input_kb.Key = switch (sym) {
                 K.Return => .enter,
                 K.Tab => .tab,
@@ -1042,6 +1230,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 K.Page_Down => .page_down,
                 K.End => .end,
                 K.Insert => .insert,
+                K.ISO_Left_Tab => .backtab,
                 K.F1...K.F1 + 11 => @enumFromInt(@intFromEnum(input_kb.Key.f1) + (sym - K.F1)),
                 else => null,
             };
@@ -1058,18 +1247,595 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.sendToPty(input_kb.encode(k, mods, false, &out));
                 return;
             }
-            // Ctrl+letter -> control byte.
+            // Ctrl+letter -> control byte (shift folded so Ctrl+Shift+Z
+            // works); Ctrl+Space -> NUL. Alt prefixes ESC so the shell
+            // sees Meta (word jumps, Alt+letter bindings).
             var buf: [8]u8 = undefined;
             const n = xkb_state_key_get_utf8(self.xkb_state, keycode, &buf, buf.len);
             if (n > 0) {
                 const text = buf[0..@intCast(n)];
-                if (mods.ctrl and text.len == 1 and text[0] >= 'a' and text[0] <= 'z') {
-                    const b = text[0] & 0x1F;
-                    self.sendToPty(&[_]u8{b});
+                if (mods.ctrl and text.len == 1) {
+                    var ch = text[0];
+                    if (ch < 0x20) {
+                        // xkb already folded to a control byte (0x1a for
+                        // Ctrl+Z, 0x03 for Ctrl+C, 0x00 for Ctrl+Space):
+                        // forward it, ESC-prefixed under Alt.
+                        if (mods.alt) self.sendToPty("\x1b");
+                        self.sendToPty(&[_]u8{ch});
+                    } else {
+                        if (ch >= 'A' and ch <= 'Z') ch += 32;
+                        if (ch == ' ') {
+                            if (mods.alt) self.sendToPty("\x1b");
+                            self.sendToPty(&[_]u8{0x00});
+                        } else if (ch >= 'a' and ch <= 'z') {
+                            const b = ch & 0x1F;
+                            if (mods.alt) self.sendToPty("\x1b");
+                            self.sendToPty(&[_]u8{b});
+                        }
+                    }
+                } else if (mods.alt) {
+                    self.sendToPty("\x1b");
+                    self.sendToPty(text);
                 } else if (!mods.ctrl) {
                     self.sendToPty(text);
                 }
             }
+        }
+
+        // -- clipboard (wl_data_device_manager) -------------------------------
+
+        fn mimeRank(mime: []const u8) u8 {
+            if (std.mem.eql(u8, mime, "text/plain;charset=utf-8")) return 3;
+            if (std.mem.eql(u8, mime, "text/plain")) return 2;
+            if (std.mem.eql(u8, mime, "UTF8_STRING") or std.mem.eql(u8, mime, "STRING")) return 1;
+            return 0;
+        }
+
+        fn appOnDeviceOffer(data: ?*anyopaque, device: ?*P.DataDevice, id: ?*P.DataOffer) callconv(.c) void {
+            _ = device;
+            const self: *Self = @ptrCast(@alignCast(data));
+            // A new offer supersedes the previous one.
+            if (self.cur_offer) |old| {
+                c.wl_proxy_marshal(@ptrCast(old), P.core.OFFER_DESTROY);
+                c.wl_proxy_destroy(@ptrCast(old));
+            }
+            self.cur_offer = id;
+            self.offer_mime_len = 0;
+            if (id) |offer| {
+                self.dol = DataOfferListener{
+                    .offer = appOnOfferMime,
+                    .source_actions = appOnOfferSourceActions,
+                    .action = appOnOfferAction,
+                };
+                _ = c.wl_proxy_add_listener(@ptrCast(offer), @ptrCast(&self.dol), @ptrCast(self));
+            }
+        }
+
+        fn appOnDeviceEnter(data: ?*anyopaque, device: ?*P.DataDevice, serial: u32, surface: ?*P.Surface, sx: i32, sy: i32, offer: ?*P.DataOffer) callconv(.c) void {
+            _ = data;
+            _ = device;
+            _ = serial;
+            _ = surface;
+            _ = sx;
+            _ = sy;
+            _ = offer;
+        }
+
+        fn appOnDeviceLeave(data: ?*anyopaque, device: ?*P.DataDevice) callconv(.c) void {
+            _ = data;
+            _ = device;
+        }
+
+        fn appOnDeviceMotion(data: ?*anyopaque, device: ?*P.DataDevice, time: u32, sx: i32, sy: i32) callconv(.c) void {
+            _ = data;
+            _ = device;
+            _ = time;
+            _ = sx;
+            _ = sy;
+        }
+
+        fn appOnDeviceDrop(data: ?*anyopaque, device: ?*P.DataDevice) callconv(.c) void {
+            _ = data;
+            _ = device;
+        }
+
+        fn appOnDeviceSelection(data: ?*anyopaque, device: ?*P.DataDevice, id: ?*P.DataOffer) callconv(.c) void {
+            _ = device;
+            const self: *Self = @ptrCast(@alignCast(data));
+            // Null offer: clipboard cleared elsewhere; drop our reference.
+            if (id == null) {
+                if (self.cur_offer) |old| {
+                    c.wl_proxy_marshal(@ptrCast(old), P.core.OFFER_DESTROY);
+                    c.wl_proxy_destroy(@ptrCast(old));
+                }
+                self.cur_offer = null;
+                self.offer_mime_len = 0;
+            }
+        }
+
+        fn appOnOfferMime(data: ?*anyopaque, offer: ?*P.DataOffer, mime: [*:0]const u8) callconv(.c) void {
+            _ = offer;
+            const self: *Self = @ptrCast(@alignCast(data));
+            const m = std.mem.span(mime);
+            var best: u8 = 0;
+            if (self.offer_mime_len > 0 and self.offer_mime_len < self.offer_mime.len) {
+                best = mimeRank(self.offer_mime[0..self.offer_mime_len]);
+            }
+            if (mimeRank(m) > best and m.len + 1 <= self.offer_mime.len) {
+                @memcpy(self.offer_mime[0..m.len], m);
+                self.offer_mime[m.len] = 0; // keep NUL-terminated for receive
+                self.offer_mime_len = m.len;
+            }
+        }
+
+        fn appOnOfferSourceActions(data: ?*anyopaque, offer: ?*P.DataOffer, actions: u32) callconv(.c) void {
+            _ = data;
+            _ = offer;
+            _ = actions;
+        }
+
+        fn appOnOfferAction(data: ?*anyopaque, offer: ?*P.DataOffer, action: u32) callconv(.c) void {
+            _ = data;
+            _ = offer;
+            _ = action;
+        }
+
+        fn appOnSourceTarget(data: ?*anyopaque, source: ?*P.DataSource, mime: ?[*:0]const u8) callconv(.c) void {
+            _ = data;
+            _ = source;
+            _ = mime;
+        }
+
+        fn appOnSourceSend(data: ?*anyopaque, source: ?*P.DataSource, mime: [*:0]const u8, fd: i32) callconv(.c) void {
+            _ = source;
+            _ = mime;
+            const self: *Self = @ptrCast(@alignCast(data));
+            clipDbg("send enter have_text={}\n", .{self.clip_text != null});
+            if (self.clip_text) |text| {
+                var off: usize = 0;
+                while (off < text.len) {
+                    const w = linux.write(fd, text.ptr + off, text.len - off);
+                    if (linux.errno(w) != .SUCCESS or w == 0) break;
+                    off += w;
+                }
+                clipDbg("send wrote {}/{}\n", .{ off, text.len });
+            }
+            _ = linux.close(fd);
+            clipDbg("send done\n", .{});
+        }
+
+        fn appOnSourceCancelled(data: ?*anyopaque, source: ?*P.DataSource) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(data));
+            if (self.cur_source == source) self.cur_source = null;
+            if (source) |src| {
+                c.wl_proxy_marshal(@ptrCast(src), P.core.SOURCE_DESTROY);
+                c.wl_proxy_destroy(@ptrCast(src));
+            }
+            if (self.clip_text) |t| {
+                self.gpa.free(t);
+                self.clip_text = null;
+            }
+        }
+
+        fn clipDbg(comptime fmt: []const u8, args: anytype) void {
+            if (std.c.getenv("ZINC_DEBUG") == null) return;
+            std.debug.print("[zinc clip] " ++ fmt, args);
+        }
+
+        fn keyDbg(comptime fmt: []const u8, args: anytype) void {
+            if (std.c.getenv("ZINC_DEBUG") == null) return;
+            std.debug.print("[zinc key] " ++ fmt, args);
+        }
+
+        /// Copy the active selection to the Wayland clipboard (no-op when
+        /// nothing is selected or no clipboard manager is present).
+        fn copySelection(self: *Self) void {
+            if (!cfg.clipboard) return;
+            if (!self.sel.active) return;
+            const text = (self.sel.extract(self.gpa, &self.ctx.grid) catch return) orelse return;
+            errdefer self.gpa.free(text);
+            if (self.data_device == null or self.ddm == null) {
+                self.gpa.free(text);
+                return;
+            }
+            if (self.cur_source) |old| {
+                c.wl_proxy_marshal(@ptrCast(old), P.core.SOURCE_DESTROY);
+                c.wl_proxy_destroy(@ptrCast(old));
+                self.cur_source = null;
+            }
+            if (self.clip_text) |old| {
+                self.gpa.free(old);
+                self.clip_text = null;
+            }
+            const src: ?*P.DataSource = @ptrCast(c.wl_proxy_marshal_constructor(
+                @ptrCast(self.ddm),
+                P.core.DDM_CREATE_DATA_SOURCE,
+                P.core.data_source,
+                @as(?*anyopaque, null),
+            ));
+            const source = src orelse {
+                self.gpa.free(text);
+                return;
+            };
+            self.dsl = DataSourceListener{
+                .target = appOnSourceTarget,
+                .send = appOnSourceSend,
+                .cancelled = appOnSourceCancelled,
+            };
+            _ = c.wl_proxy_add_listener(@ptrCast(source), @ptrCast(&self.dsl), @ptrCast(self));
+            self.clip_text = text;
+            c.wl_proxy_marshal(@ptrCast(source), P.core.SOURCE_OFFER, @as([*:0]const u8, "text/plain;charset=utf-8"));
+            c.wl_proxy_marshal(@ptrCast(source), P.core.SOURCE_OFFER, @as([*:0]const u8, "text/plain"));
+            c.wl_proxy_marshal(@ptrCast(source), P.core.SOURCE_OFFER, @as([*:0]const u8, "UTF8_STRING"));
+            c.wl_proxy_marshal(
+                @ptrCast(self.data_device),
+                P.core.DEVICE_SET_SELECTION,
+                @as(?*anyopaque, @ptrCast(source)),
+                self.last_serial,
+            );
+            self.cur_source = source;
+        }
+
+        /// Paste the Wayland clipboard into the PTY (bracketed when the app
+        /// asked for it). Reads are bounded; the compositor closes its end.
+        fn pasteClipboard(self: *Self) void {
+            if (!cfg.clipboard) return;
+            const offer = self.cur_offer orelse return;
+            if (self.offer_mime_len == 0 or self.offer_mime_len >= self.offer_mime.len) return;
+            const mime: [*:0]const u8 = @ptrCast(self.offer_mime[0..self.offer_mime_len].ptr);
+            clipDbg("paste enter own_source={} mime={s}\n", .{ self.cur_source != null, self.offer_mime[0..self.offer_mime_len] });
+            var fds: [2]i32 = .{ -1, -1 };
+            if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return;
+            c.wl_proxy_marshal(@ptrCast(offer), P.core.OFFER_RECEIVE, mime, fds[1]);
+            _ = linux.close(fds[1]);
+            _ = c.wl_display_flush(self.display);
+            const cap: usize = 1024 * 1024;
+            const buf = self.gpa.alloc(u8, cap) catch {
+                _ = linux.close(fds[0]);
+                return;
+            };
+            defer self.gpa.free(buf);
+            var len: usize = 0;
+            // Pump loop, not a bare blocking read: when the selection is
+            // our own, the compositor answers RECEIVE with a `send` event
+            // addressed to us, so we must keep reading + dispatching the
+            // display connection while waiting — dispatch_pending alone
+            // never pulls the reply out of the socket buffer. A
+            // wall-clock deadline guarantees a dead source can never hang
+            // the UI forever.
+            const wl_fd = c.wl_display_get_fd(self.display);
+            const deadline = context_mod.nowMs() + 10_000;
+            while (len < buf.len and context_mod.nowMs() < deadline) {
+                while (c.wl_display_prepare_read(self.display) != 0) {
+                    _ = c.wl_display_dispatch_pending(self.display);
+                }
+                _ = c.wl_display_flush(self.display);
+                var pfds = [_]linux.pollfd{
+                    .{ .fd = fds[0], .events = linux.POLL.IN, .revents = 0 },
+                    .{ .fd = wl_fd, .events = linux.POLL.IN, .revents = 0 },
+                };
+                const pr = linux.poll(&pfds, 2, 250);
+                if (linux.errno(pr) == .SUCCESS and (pfds[1].revents & linux.POLL.IN) != 0) {
+                    _ = c.wl_display_read_events(self.display);
+                } else {
+                    _ = c.wl_display_cancel_read(self.display);
+                }
+                _ = c.wl_display_dispatch_pending(self.display);
+                if ((pfds[0].revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR)) == 0) continue;
+                const r = linux.read(fds[0], buf.ptr + len, buf.len - len);
+                if (linux.errno(r) != .SUCCESS or r == 0) break;
+                len += r;
+            }
+            _ = linux.close(fds[0]);
+            clipDbg("paste done len={}\n", .{len});
+            if (len == 0) return;
+            const data = buf[0..len];
+            if (self.ctx.bracketed_paste) {
+                self.sendToPty("\x1b[200~");
+                self.sendToPty(data);
+                self.sendToPty("\x1b[201~");
+            } else {
+                self.sendToPty(data);
+            }
+        }
+
+        fn appOnSeatCaps(data: ?*anyopaque, seat: ?*P.Seat, caps: u32) callconv(.c) void {
+            _ = seat;
+            const self: *Self = @ptrCast(@alignCast(data));
+            self.seat_caps = caps;
+            // Pointer capability bit. Bound lazily: requesting a pointer the
+            // seat lacks is a fatal protocol error.
+            if (cfg.mouse and (caps & 1) != 0 and self.pointer == null and self.seat != null) {
+                self.pointer = @ptrCast(c.wl_proxy_marshal_constructor(
+                    @ptrCast(self.seat),
+                    P.core.SEAT_GET_POINTER,
+                    P.core.pointer,
+                    @as(?*anyopaque, null),
+                ));
+                self.pbl = PointerListener{
+                    .enter = appOnPointerEnter,
+                    .leave = appOnPointerLeave,
+                    .motion = appOnPointerMotion,
+                    .button = appOnPointerButton,
+                    .axis = appOnPointerAxis,
+                    .frame = appOnPointerFrame,
+                    .axis_source = appOnPointerAxisSource,
+                    .axis_stop = appOnPointerAxisStop,
+                    .axis_discrete = appOnPointerAxisDiscrete,
+                    .axis_value120 = appOnPointerAxisValue120,
+                    .axis_relative_direction = appOnPointerAxisRelativeDirection,
+                };
+                _ = c.wl_proxy_add_listener(@ptrCast(self.pointer), @ptrCast(&self.pbl), @ptrCast(self));
+                // Shape device for link-hover cursors (no-op when the
+                // compositor lacks cursor-shape-v1).
+                if (self.cursor_shape_mgr != null and self.cursor_shape_dev == null) {
+                    const csd_iface = &P.cursor_shape.device_interface;
+                    self.cursor_shape_dev = @ptrCast(c.wl_proxy_marshal_constructor(
+                        @ptrCast(self.cursor_shape_mgr),
+                        P.cursor_shape.MANAGER_GET_POINTER,
+                        csd_iface,
+                        @as(?*anyopaque, @ptrCast(self.pointer)),
+                        @as(?*anyopaque, @ptrCast(self.pointer)),
+                        @as(?*anyopaque, null),
+                    ));
+                }
+            }
+        }
+
+        fn appOnSeatName(data: ?*anyopaque, seat: ?*P.Seat, name: [*:0]const u8) callconv(.c) void {
+            _ = data;
+            _ = seat;
+            _ = name;
+        }
+
+        /// wl_fixed 24.8 surface pixels -> clamped grid cell.
+        fn ptrCell(self: *Self, sx: i32, sy: i32) struct { col: u16, row: u16 } {
+            const px: i64 = @divFloor(@as(i64, sx), 256) - @as(i64, cfg.pad_x);
+            const py: i64 = @divFloor(@as(i64, sy), 256) - @as(i64, cfg.pad_y);
+            const cols = self.ctx.grid.cols;
+            const rows = self.ctx.grid.rows;
+            if (self.cell_w <= 0 or self.cell_h <= 0 or cols == 0 or rows == 0) return .{ .col = 0, .row = 0 };
+            const col = std.math.clamp(@divFloor(px, @as(i64, self.cell_w)), 0, @as(i64, cols) - 1);
+            const row = std.math.clamp(@divFloor(py, @as(i64, self.cell_h)), 0, @as(i64, rows) - 1);
+            return .{ .col = @intCast(col), .row = @intCast(row) };
+        }
+
+        fn appOnPointerEnter(data: ?*anyopaque, pointer: ?*P.Pointer, serial: u32, surface: ?*P.Surface, sx: i32, sy: i32) callconv(.c) void {
+            _ = pointer;
+            const self: *Self = @ptrCast(@alignCast(data));
+            self.last_serial = serial;
+            self.ptr_serial = serial;
+            self.ptr_inside = (surface == self.surface);
+            self.ptr_sx = sx;
+            self.ptr_sy = sy;
+        }
+
+        /// -- hyperlinks (OSC 8 + implicit URLs, Ghostty parity) ----------
+        fn ctrlHeld(self: *Self) bool {
+            if (self.xkb_state == null) return false;
+            return xkb_state_mod_name_is_active(self.xkb_state, "Control", XKB_STATE_MODS_EFFECTIVE) > 0;
+        }
+
+        fn clearHover(self: *Self) void {
+            if (self.hover_uri) |u| {
+                self.gpa.free(u);
+                self.hover_uri = null;
+            }
+            if (self.hover_active) {
+                self.hover_active = false;
+                self.needs_render = true;
+            }
+            self.refreshCursor();
+        }
+
+        /// Cell span of the link under (col, row): explicit OSC 8 same-id
+        /// run first, implicit URL detection second.
+        fn linkSpanAt(self: *Self, col: u16, row: u16) ?hyperlink_mod.Span {
+            if (!cfg.hyperlinks) return null;
+            if (self.ctx.grid.viewCell(col, row)) |cell| {
+                if (cell.has_link and self.ctx.linkUri(cell.link_idx) != null) {
+                    const id = cell.link_idx;
+                    const cols = self.ctx.grid.cols;
+                    var c0 = col;
+                    while (c0 > 0) {
+                        const p = self.ctx.grid.viewCell(c0 - 1, row) orelse break;
+                        if (!p.has_link or p.link_idx != id) break;
+                        c0 -= 1;
+                    }
+                    var c1 = col;
+                    while (c1 + 1 < cols) {
+                        const n = self.ctx.grid.viewCell(c1 + 1, row) orelse break;
+                        if (!n.has_link or n.link_idx != id) break;
+                        c1 += 1;
+                    }
+                    return .{ .c0 = c0, .c1 = c1 };
+                }
+            }
+            return hyperlink_mod.spanAt(&self.ctx.grid, row, col);
+        }
+
+        /// Owned URI under (col, row), or null. Caller frees.
+        fn linkUriAt(self: *Self, col: u16, row: u16) ?[]u8 {
+            if (!cfg.hyperlinks) return null;
+            if (self.ctx.grid.viewCell(col, row)) |cell| {
+                if (cell.has_link) {
+                    if (self.ctx.linkUri(cell.link_idx)) |u| {
+                        return self.gpa.dupe(u8, u) catch null;
+                    }
+                }
+            }
+            return hyperlink_mod.uriAt(self.gpa, &self.ctx.grid, row, col);
+        }
+
+        fn updateHover(self: *Self, col: u16, row: u16) void {
+            if (!cfg.hyperlinks or self.ctx.mouse_mode != .off or self.ctx.alt_active or self.sel_drag) {
+                self.clearHover();
+                return;
+            }
+            if (self.hover_active and self.hover_row == row and col >= self.hover_c0 and col <= self.hover_c1) return;
+            const span = self.linkSpanAt(col, row) orelse {
+                self.clearHover();
+                return;
+            };
+            const uri = self.linkUriAt(col, row) orelse {
+                self.clearHover();
+                return;
+            };
+            if (self.hover_uri) |u| self.gpa.free(u);
+            self.hover_uri = uri;
+            self.hover_col = col;
+            self.hover_row = row;
+            self.hover_c0 = span.c0;
+            self.hover_c1 = span.c1;
+            self.hover_active = true;
+            self.needs_render = true;
+            self.refreshCursor();
+        }
+
+        /// Open an allowlisted URL via xdg-open (no shell involved).
+        fn openLink(self: *Self, uri: []const u8) void {
+            _ = self;
+            if (!hyperlink_mod.schemeAllowed(uri)) return;
+            var ob: [2100]u8 = undefined;
+            const target = hyperlink_mod.openTarget(uri, &ob) orelse return;
+            pty_mod.openUrl(target);
+        }
+
+        /// Sync the server cursor with link-hover state: pointer hand over
+        /// a Ctrl-hovered link, text beam otherwise. No-op without the
+        /// cursor-shape protocol; transition-only so no per-frame traffic.
+        fn refreshCursor(self: *Self) void {
+            if (!cfg.hyperlinks) return;
+            const dev = self.cursor_shape_dev orelse return;
+            if (self.ptr_serial == 0) return;
+            const want_pointer = self.hover_active and self.ctrlHeld();
+            if (want_pointer == self.cursor_shaped) return;
+            c.wl_proxy_marshal(
+                @ptrCast(dev),
+                P.cursor_shape.DEVICE_SET_SHAPE,
+                self.ptr_serial,
+                if (want_pointer) P.cursor_shape.SHAPE_POINTER else P.cursor_shape.SHAPE_TEXT,
+            );
+            self.cursor_shaped = want_pointer;
+        }
+
+        fn appOnPointerLeave(data: ?*anyopaque, pointer: ?*P.Pointer, serial: u32, surface: ?*P.Surface) callconv(.c) void {
+            _ = pointer;
+            _ = serial;
+            _ = surface;
+            const self: *Self = @ptrCast(@alignCast(data));
+            self.ptr_inside = false;
+            self.clearHover();
+        }
+
+        fn appOnPointerMotion(data: ?*anyopaque, pointer: ?*P.Pointer, time: u32, sx: i32, sy: i32) callconv(.c) void {
+            _ = pointer;
+            _ = time;
+            const self: *Self = @ptrCast(@alignCast(data));
+            self.ptr_sx = sx;
+            self.ptr_sy = sy;
+            if (self.ctx.mouse_mode != .off) {
+                self.clearHover();
+                return;
+            }
+            if (self.sel_drag) {
+                const cc = self.ptrCell(sx, sy);
+                self.sel.update(cc.col, cc.row);
+                self.needs_render = true;
+                return;
+            }
+            const cc = self.ptrCell(sx, sy);
+            self.updateHover(cc.col, cc.row);
+        }
+
+        fn appOnPointerButton(data: ?*anyopaque, pointer: ?*P.Pointer, serial: u32, time: u32, button: u32, state: u32) callconv(.c) void {
+            _ = pointer;
+            _ = time;
+            const self: *Self = @ptrCast(@alignCast(data));
+            self.last_serial = serial;
+            self.ptr_serial = serial;
+            if (!cfg.mouse) return;
+            // App-owned mouse goes to the PTY (future mouse-reporting work);
+            // selection only runs while tracking is off.
+            if (self.ctx.mouse_mode != .off) return;
+            switch (button) {
+                0x110 => { // left: Ctrl+click opens links; else drag-select
+                    if (!cfg.selection) return;
+                    const cc = self.ptrCell(self.ptr_sx, self.ptr_sy);
+                    if (state == 1) {
+                        if (self.ctrlHeld()) {
+                            if (self.linkUriAt(cc.col, cc.row)) |u| {
+                                defer self.gpa.free(u);
+                                self.openLink(u);
+                                return;
+                            }
+                        }
+                        self.sel.begin(cc.col, cc.row);
+                        self.sel_drag = true;
+                        self.needs_render = true;
+                    } else {
+                        self.sel_drag = false;
+                        if (self.sel.anchor_col == self.sel.focus_col and self.sel.anchor_row == self.sel.focus_row) {
+                            self.sel.clear();
+                        }
+                        self.needs_render = true;
+                    }
+                },
+                0x112 => { // middle: paste clipboard
+                    if (state == 1) self.pasteClipboard();
+                },
+                else => {},
+            }
+        }
+
+        fn appOnPointerAxis(data: ?*anyopaque, pointer: ?*P.Pointer, time: u32, axis: u32, value: i32) callconv(.c) void {
+            _ = pointer;
+            _ = time;
+            const self: *Self = @ptrCast(@alignCast(data));
+            if (!cfg.mouse or self.ctx.mouse_mode != .off or self.ctx.alt_active) return;
+            if (axis != 0) return; // vertical only
+            self.ctx.grid.scrollView(if (value > 0) -3 else 3);
+            self.clearHover(); // content moved under the cursor
+            self.needs_render = true;
+        }
+
+        fn appOnPointerFrame(data: ?*anyopaque, pointer: ?*P.Pointer) callconv(.c) void {
+            _ = data;
+            _ = pointer;
+        }
+
+        fn appOnPointerAxisSource(data: ?*anyopaque, pointer: ?*P.Pointer, axis_source: u32) callconv(.c) void {
+            _ = data;
+            _ = pointer;
+            _ = axis_source;
+        }
+
+        fn appOnPointerAxisStop(data: ?*anyopaque, pointer: ?*P.Pointer, time: u32, axis: u32) callconv(.c) void {
+            _ = data;
+            _ = pointer;
+            _ = time;
+            _ = axis;
+        }
+
+        fn appOnPointerAxisDiscrete(data: ?*anyopaque, pointer: ?*P.Pointer, axis: u32, discrete: i32) callconv(.c) void {
+            _ = data;
+            _ = pointer;
+            _ = axis;
+            _ = discrete;
+        }
+
+        fn appOnPointerAxisValue120(data: ?*anyopaque, pointer: ?*P.Pointer, axis: u32, value120: i32) callconv(.c) void {
+            _ = data;
+            _ = pointer;
+            _ = axis;
+            _ = value120;
+        }
+
+        fn appOnPointerAxisRelativeDirection(data: ?*anyopaque, pointer: ?*P.Pointer, axis: u32, direction: u32) callconv(.c) void {
+            _ = data;
+            _ = pointer;
+            _ = axis;
+            _ = direction;
         }
 
         // -- protocol event handlers (nested: full access to Self) ---------
@@ -1090,6 +1856,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
             } else if (std.mem.eql(u8, iname, "wl_seat")) {
                 self.name_seat = name;
                 self.want_seat_v = version;
+            } else if (std.mem.eql(u8, iname, "wl_data_device_manager")) {
+                self.name_ddm = name;
+                self.want_ddm_v = @min(version, 3);
+            } else if (std.mem.eql(u8, iname, "wp_cursor_shape_manager_v1")) {
+                self.name_cursor_shape = name;
             }
         }
 
@@ -1207,9 +1978,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         fn appOnKey(data: ?*anyopaque, kb: ?*P.Keyboard, serial: u32, time: u32, key: u32, key_state: u32) callconv(.c) void {
             _ = kb;
-            _ = serial;
             _ = time;
             const self: *Self = @ptrCast(@alignCast(data));
+            self.last_serial = serial;
             if (self.xkb_state == null) return;
             const keycode = key + 8; // evdev offset
             if (key_state == 0) {
@@ -1222,7 +1993,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const sym = xkb_state_key_get_one_sym(self.xkb_state, keycode);
             self.handleSym(sym, keycode);
             // Arm repeat for non-modifier keys (modifiers live >= 0xFFE0).
-            if (sym < 0xFFE0 and self.repeat_delay > 0 and self.repeat_fd >= 0) {
+            // Clipboard chords never repeat (would re-fire copy/paste).
+            const c_held = xkb_state_mod_name_is_active(self.xkb_state, "Control", XKB_STATE_MODS_EFFECTIVE) > 0;
+            const s_held = xkb_state_mod_name_is_active(self.xkb_state, "Shift", XKB_STATE_MODS_EFFECTIVE) > 0;
+            if (sym < 0xFFE0 and !(c_held and s_held) and self.repeat_delay > 0 and self.repeat_fd >= 0) {
                 self.repeat_sym = sym;
                 self.repeat_keycode = keycode;
                 self.repeat_armed = true;
@@ -1236,6 +2010,12 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const self: *Self = @ptrCast(@alignCast(data));
             // group is depressed layout; latched/locked layouts track depressed here.
             _ = xkb_state_update_mask(self.xkb_state, dep, lat, lock, group, group, group);
+            // Modifier flip (Ctrl press/release): link underline visibility
+            // and cursor shape may change even with the pointer parked.
+            if (cfg.hyperlinks) {
+                self.needs_render = true;
+                self.refreshCursor();
+            }
         }
 
         fn appOnRepeatInfo(data: ?*anyopaque, kb: ?*P.Keyboard, rate: i32, delay: i32) callconv(.c) void {
@@ -1282,6 +2062,49 @@ const KeyboardListener = extern struct {
     key: ?*const fn (?*anyopaque, ?*P.Keyboard, u32, u32, u32, u32) callconv(.c) void,
     modifiers: ?*const fn (?*anyopaque, ?*P.Keyboard, u32, u32, u32, u32, u32) callconv(.c) void,
     repeat_info: ?*const fn (?*anyopaque, ?*P.Keyboard, i32, i32) callconv(.c) void,
+};
+
+const SeatListener = extern struct {
+    capabilities: ?*const fn (?*anyopaque, ?*P.Seat, u32) callconv(.c) void,
+    name: ?*const fn (?*anyopaque, ?*P.Seat, [*:0]const u8) callconv(.c) void,
+};
+
+/// Full wl_pointer event set (v1 enter/leave/motion/button/axis through v8
+/// axis_relative_direction). Slots must exist for the bound version so
+/// libwayland never indexes past the array; unused ones stay no-ops.
+const PointerListener = extern struct {
+    enter: ?*const fn (?*anyopaque, ?*P.Pointer, u32, ?*P.Surface, i32, i32) callconv(.c) void,
+    leave: ?*const fn (?*anyopaque, ?*P.Pointer, u32, ?*P.Surface) callconv(.c) void,
+    motion: ?*const fn (?*anyopaque, ?*P.Pointer, u32, i32, i32) callconv(.c) void,
+    button: ?*const fn (?*anyopaque, ?*P.Pointer, u32, u32, u32, u32) callconv(.c) void,
+    axis: ?*const fn (?*anyopaque, ?*P.Pointer, u32, u32, i32) callconv(.c) void,
+    frame: ?*const fn (?*anyopaque, ?*P.Pointer) callconv(.c) void,
+    axis_source: ?*const fn (?*anyopaque, ?*P.Pointer, u32) callconv(.c) void,
+    axis_stop: ?*const fn (?*anyopaque, ?*P.Pointer, u32, u32) callconv(.c) void,
+    axis_discrete: ?*const fn (?*anyopaque, ?*P.Pointer, u32, i32) callconv(.c) void,
+    axis_value120: ?*const fn (?*anyopaque, ?*P.Pointer, u32, i32) callconv(.c) void,
+    axis_relative_direction: ?*const fn (?*anyopaque, ?*P.Pointer, u32, u32) callconv(.c) void,
+};
+
+const DataDeviceListener = extern struct {
+    data_offer: ?*const fn (?*anyopaque, ?*P.DataDevice, ?*P.DataOffer) callconv(.c) void,
+    enter: ?*const fn (?*anyopaque, ?*P.DataDevice, u32, ?*P.Surface, i32, i32, ?*P.DataOffer) callconv(.c) void,
+    leave: ?*const fn (?*anyopaque, ?*P.DataDevice) callconv(.c) void,
+    motion: ?*const fn (?*anyopaque, ?*P.DataDevice, u32, i32, i32) callconv(.c) void,
+    drop: ?*const fn (?*anyopaque, ?*P.DataDevice) callconv(.c) void,
+    selection: ?*const fn (?*anyopaque, ?*P.DataDevice, ?*P.DataOffer) callconv(.c) void,
+};
+
+const DataOfferListener = extern struct {
+    offer: ?*const fn (?*anyopaque, ?*P.DataOffer, [*:0]const u8) callconv(.c) void,
+    source_actions: ?*const fn (?*anyopaque, ?*P.DataOffer, u32) callconv(.c) void,
+    action: ?*const fn (?*anyopaque, ?*P.DataOffer, u32) callconv(.c) void,
+};
+
+const DataSourceListener = extern struct {
+    target: ?*const fn (?*anyopaque, ?*P.DataSource, ?[*:0]const u8) callconv(.c) void,
+    send: ?*const fn (?*anyopaque, ?*P.DataSource, [*:0]const u8, i32) callconv(.c) void,
+    cancelled: ?*const fn (?*anyopaque, ?*P.DataSource) callconv(.c) void,
 };
 test "shm buffer resize" {
     var b = ShmBuffer{};

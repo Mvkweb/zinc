@@ -15,6 +15,10 @@ extern const wl_buffer_interface: c.wl_interface;
 extern const wl_callback_interface: c.wl_interface;
 extern const wl_seat_interface: c.wl_interface;
 extern const wl_keyboard_interface: c.wl_interface;
+extern const wl_pointer_interface: c.wl_interface;
+extern const wl_data_device_manager_interface: c.wl_interface;
+extern const wl_data_device_interface: c.wl_interface;
+extern const wl_data_source_interface: c.wl_interface;
 
 pub const core = struct {
     pub const registry: *const c.wl_interface = &wl_registry_interface;
@@ -26,6 +30,10 @@ pub const core = struct {
     pub const callback: *const c.wl_interface = &wl_callback_interface;
     pub const seat: *const c.wl_interface = &wl_seat_interface;
     pub const keyboard: *const c.wl_interface = &wl_keyboard_interface;
+    pub const pointer: *const c.wl_interface = &wl_pointer_interface;
+    pub const data_device_manager: *const c.wl_interface = &wl_data_device_manager_interface;
+    pub const data_device: *const c.wl_interface = &wl_data_device_interface;
+    pub const data_source: *const c.wl_interface = &wl_data_source_interface;
 
     // Core request opcodes (stable ABI).
     pub const DISPLAY_SYNC: u32 = 0;
@@ -40,6 +48,21 @@ pub const core = struct {
     pub const SURFACE_COMMIT: u32 = 6;
     pub const SURFACE_DAMAGE_BUFFER: u32 = 9;
     pub const SEAT_GET_KEYBOARD: u32 = 1;
+    pub const SEAT_GET_POINTER: u32 = 0;
+
+    // wl_data_device_manager (stable ABI; we bind v3 max).
+    // NOTE: document order, not alphabetical — create comes first.
+    pub const DDM_CREATE_DATA_SOURCE: u32 = 0;
+    pub const DDM_GET_DATA_DEVICE: u32 = 1;
+    // wl_data_device.
+    pub const DEVICE_SET_SELECTION: u32 = 1;
+    pub const DEVICE_RELEASE: u32 = 2;
+    // wl_data_source.
+    pub const SOURCE_OFFER: u32 = 0;
+    pub const SOURCE_DESTROY: u32 = 1;
+    // wl_data_offer.
+    pub const OFFER_RECEIVE: u32 = 1;
+    pub const OFFER_DESTROY: u32 = 2;
 
     pub const SHM_FORMAT_ARGB8888: u32 = 0;
     pub const SHM_FORMAT_XRGB8888: u32 = 1;
@@ -54,9 +77,16 @@ pub const Buffer = opaque {};
 pub const Callback = opaque {};
 pub const Seat = opaque {};
 pub const Keyboard = opaque {};
+pub const Pointer = opaque {};
+pub const DataDeviceManager = opaque {};
+pub const DataDevice = opaque {};
+pub const DataSource = opaque {};
+pub const DataOffer = opaque {};
 pub const WmBase = opaque {};
 pub const XdgSurface = opaque {};
 pub const XdgToplevel = opaque {};
+pub const CursorShapeManager = opaque {};
+pub const CursorShapeDevice = opaque {};
 
 /// wl_array mirror (wayland-util). Only size/data are read.
 pub const Array = extern struct {
@@ -186,7 +216,56 @@ pub const xdg_toplevel = struct {
 pub fn linkAll() void {
     xdg_surface.link(&xdg_toplevel.interface);
     wm_base.link(core.surface);
+    cursor_shape.link(core.pointer);
 }
+
+// ---------------------------------------------------------------------------
+// wp_cursor_shape_manager_v1 (cursor-shape-v1, version 1; server-side
+// cursors without theme images).
+// manager requests: destroy=0, get_pointer=1 ("no"), get_tablet_tool_v2=2
+// device requests: destroy=0, set_shape=1 ("uu")
+// ---------------------------------------------------------------------------
+
+pub const cursor_shape = struct {
+    pub const version: c_int = 1;
+    pub const MANAGER_GET_POINTER: u32 = 1;
+    pub const DEVICE_SET_SHAPE: u32 = 1;
+    pub const SHAPE_DEFAULT: u32 = 1;
+    pub const SHAPE_POINTER: u32 = 4;
+    pub const SHAPE_TEXT: u32 = 9;
+
+    var types_get_pointer = [_]?*const c.wl_interface{ null, null };
+    var manager_methods = [_]c.wl_message{
+        .{ .name = "destroy", .signature = "", .types = null },
+        .{ .name = "get_pointer", .signature = "no", .types = &types_get_pointer },
+        .{ .name = "get_tablet_tool_v2", .signature = "no", .types = null },
+    };
+    pub var manager_interface: c.wl_interface = .{
+        .name = "wp_cursor_shape_manager_v1",
+        .version = version,
+        .method_count = 3,
+        .methods = &manager_methods,
+        .event_count = 0,
+        .events = null,
+    };
+    var device_methods = [_]c.wl_message{
+        .{ .name = "destroy", .signature = "", .types = null },
+        .{ .name = "set_shape", .signature = "uu", .types = null },
+    };
+    pub var device_interface: c.wl_interface = .{
+        .name = "wp_cursor_shape_device_v1",
+        .version = version,
+        .method_count = 2,
+        .methods = &device_methods,
+        .event_count = 0,
+        .events = null,
+    };
+
+    pub fn link(pointer_iface: *const c.wl_interface) void {
+        types_get_pointer[0] = @ptrCast(&device_interface);
+        types_get_pointer[1] = pointer_iface;
+    }
+};
 
 const std = @import("std");
 
@@ -230,4 +309,15 @@ test "xdg tables sane + linked" {
     try std.testing.expectEqual(@as(u32, 2), wm_base.GET_XDG_SURFACE);
     try std.testing.expectEqual(@as(u32, 1), xdg_surface.GET_TOPLEVEL);
     try std.testing.expectEqual(@as(u32, 4), xdg_surface.ACK_CONFIGURE);
+    // Cursor-shape tables (cursor-shape-v1): names, counts, linkage.
+    try expectName(&cursor_shape.manager_interface, "wp_cursor_shape_manager_v1");
+    try expectName(&cursor_shape.device_interface, "wp_cursor_shape_device_v1");
+    try std.testing.expectEqual(@as(c_int, 3), cursor_shape.manager_interface.method_count);
+    try std.testing.expectEqual(@as(c_int, 2), cursor_shape.device_interface.method_count);
+    try std.testing.expect(cursor_shape.types_get_pointer[0] != null);
+    try std.testing.expect(cursor_shape.types_get_pointer[1] != null);
+    try expectName(cursor_shape.types_get_pointer[0].?, "wp_cursor_shape_device_v1");
+    try expectName(cursor_shape.types_get_pointer[1].?, "wl_pointer");
+    try std.testing.expectEqual(@as(u32, 1), cursor_shape.MANAGER_GET_POINTER);
+    try std.testing.expectEqual(@as(u32, 1), cursor_shape.DEVICE_SET_SHAPE);
 }

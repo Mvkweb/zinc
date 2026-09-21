@@ -28,3 +28,8 @@ To check compilation and run tests without installing:
 ```bash
 zig build check
 ```
+
+## Known issues
+
+- Hard resizes can strand one stray character. Content restores fine.
+  Cause unknown, see `src/term/reflow.zig`.

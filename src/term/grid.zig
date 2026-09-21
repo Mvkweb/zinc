@@ -56,6 +56,11 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
             return &self.cells[self.index(col, row)];
         }
 
+        pub fn rowSlice(self: *Self, row: u16) []C {
+            const start = @as(usize, row) * self.cols;
+            return self.cells[start .. start + self.cols];
+        }
+
         pub fn markAllDirty(self: *Self) void {
             for (self.cells) |*c| c.dirty = true;
         }

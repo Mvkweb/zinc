@@ -78,6 +78,14 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         alt_saved_col: u16 = 0,
         alt_saved_row: u16 = 0,
         alt_saved_wrap: bool = false,
+        prompt_start_row: ?u16 = null,
+        in_prompt: bool = false,
+        /// OSC 8 hyperlink table: owned URIs, cell link_idx = slot + 1
+        /// (0 = none). Lookups bounds-check, so a table reset can never
+        /// dangle a live cell.
+        links: std.ArrayList([]u8),
+        /// Currently open OSC 8 link (0 = none).
+        cur_link: u16 = 0,
         q_overlap: [16]u8 = undefined,
         q_overlap_len: usize = 0,
 
@@ -93,6 +101,8 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             errdefer kitty_b64.deinit(gpa);
             var dcs_buf = try std.ArrayList(u8).initCapacity(gpa, cfg.osc_init_cap);
             errdefer dcs_buf.deinit(gpa);
+            var links = try std.ArrayList([]u8).initCapacity(gpa, cfg.hyperlinks_init_cap);
+            errdefer links.deinit(gpa);
             var images = try pool_mod.Pool.init(
                 gpa,
                 cfg.img_pool_init_cap,
@@ -114,6 +124,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 .osc_buf = osc_buf,
                 .kitty_b64 = kitty_b64,
                 .dcs_buf = dcs_buf,
+                .links = links,
                 .images = images,
                 .scratch = scratch_mod.Scratch.init(scratch_backing),
                 .scratch_backing = scratch_backing,
@@ -131,6 +142,8 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             self.osc_buf.deinit(self.gpa);
             self.kitty_b64.deinit(self.gpa);
             self.dcs_buf.deinit(self.gpa);
+            for (self.links.items) |u| self.gpa.free(u);
+            self.links.deinit(self.gpa);
             self.images.deinit();
             std.heap.page_allocator.free(self.scratch_backing);
         }
@@ -384,6 +397,34 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             if (self.focus_tracking) self.emit(if (focused) "\x1b[I" else "\x1b[O]");
         }
 
+        /// Intern a URI, returning its 1-based link id (0 = none).
+        /// Dedupes by string; on overflow the table resets (live cells
+        /// bounds-check to none via linkUri).
+        fn setLink(self: *Self, uri: []const u8) u16 {
+            for (self.links.items, 0..) |u, i| {
+                if (std.mem.eql(u8, u, uri)) return @intCast(i + 1);
+            }
+            if (self.links.items.len >= cfg.hyperlinks_max_cap or self.links.items.len == 65535) {
+                for (self.links.items) |u| self.gpa.free(u);
+                self.links.clearRetainingCapacity();
+            }
+            const owned = self.gpa.dupe(u8, uri) catch return 0;
+            errdefer self.gpa.free(owned);
+            self.links.append(self.gpa, owned) catch {
+                self.gpa.free(owned);
+                return 0;
+            };
+            return @intCast(self.links.items.len);
+        }
+
+        /// URI for a 1-based link id, or null when empty/out of range.
+        pub fn linkUri(self: *const Self, idx: u16) ?[]const u8 {
+            if (idx == 0) return null;
+            const i: usize = idx - 1;
+            if (i >= self.links.items.len) return null;
+            return self.links.items[i];
+        }
+
         fn dispatchOsc(self: *Self) void {
             const parts = osc_mod.splitPayload(self.osc_buf.items) orelse return;
             switch (osc_mod.classify(parts.code)) {
@@ -436,6 +477,37 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     if (!std.mem.eql(u8, parts.payload, "?")) {
                         if (osc_mod.parseColorSpec(parts.payload)) |c| {
                             self.cursor_color = c;
+                        }
+                    }
+                },
+                .hyperlink => {
+                    // OSC 8 ; params ; URI — empty URI closes the link.
+                    const semi = std.mem.indexOfScalar(u8, parts.payload, ';');
+                    const uri = if (semi) |s| parts.payload[@min(s + 1, parts.payload.len)..] else parts.payload;
+                    if (uri.len == 0 or !cfg.hyperlinks) {
+                        self.cur_link = 0;
+                    } else {
+                        self.cur_link = self.setLink(uri);
+                    }
+                },
+                .semantic_prompt => {
+                    if (parts.payload.len > 0) {
+                        switch (parts.payload[0]) {
+                            'A' => {
+                                self.prompt_start_row = self.cursor_row;
+                                self.in_prompt = true;
+                            },
+                            'B' => {
+                                self.in_prompt = true;
+                            },
+                            'C' => {
+                                self.in_prompt = false;
+                                self.prompt_start_row = null;
+                            },
+                            'D' => {
+                                self.in_prompt = false;
+                            },
+                            else => {},
                         }
                     }
                 },
@@ -568,6 +640,13 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 .dim = self.pen.dim,
                 .invisible = self.pen.invisible,
             };
+            if (cfg.hyperlinks and self.cur_link != 0) {
+                cell.has_link = true;
+                cell.link_idx = self.cur_link;
+            } else {
+                cell.has_link = false;
+                cell.link_idx = 0;
+            }
             cell.dirty = true;
             if (self.cursor_col + 1 < self.grid.cols) {
                 self.cursor_col += 1;
@@ -605,6 +684,13 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         }
 
         fn scrollRegionUp(self: *Self) void {
+            if (self.prompt_start_row) |*psr| {
+                if (psr.* > 0) {
+                    psr.* -= 1;
+                } else {
+                    self.prompt_start_row = null;
+                }
+            }
             if (self.scroll_top == 0 and self.scroll_bot == self.grid.rows - 1) {
                 self.grid.scrollUp(!self.alt_active);
                 self.cursor_row = self.scroll_bot;
@@ -655,6 +741,8 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 2, 3 => {
                     @memset(self.grid.cells, blank);
                     if (mode == 3 and cfg.scrollback_clear_on_ed3) self.grid.clearScrollback();
+                    self.in_prompt = false;
+                    self.prompt_start_row = null;
                 },
                 else => {},
             }
@@ -682,6 +770,9 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             self.cursor_row = 0;
             self.pending_wrap = false;
             self.saved_wrap = false;
+            self.in_prompt = false;
+            self.prompt_start_row = null;
+            self.cur_link = 0;
             self.scroll_top = 0;
             self.scroll_bot = self.grid.rows - 1;
         }
@@ -713,6 +804,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             // A pending wrap references the old width; drop the flag and let
             // reflow track the settled last-column cell instead.
             self.pending_wrap = false;
+
             self.grid.resizeWithReflow(
                 cols,
                 rows,

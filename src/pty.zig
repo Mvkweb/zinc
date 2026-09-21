@@ -12,6 +12,7 @@ extern fn ptsname(fd: c_int) ?[*:0]u8;
 extern fn getenv(name: [*:0]const u8) ?[*:0]u8;
 extern fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern fn execvpe(file: [*:0]const u8, argv: [*:null]const ?[*:0]const u8, envp: [*:null]const ?[*:0]const u8) c_int;
+extern fn waitpid(pid: c_int, status: ?*c_int, options: c_int) c_int;
 extern var environ: [*:null]?[*:0]u8;
 
 pub const Winsize = extern struct {
@@ -105,6 +106,7 @@ fn childMain(master: i32, slave_path: [*:0]u8, cols: u16, rows: u16, term_env: ?
         _ = setenv("TERM", t, 1);
         if (!std.mem.eql(u8, std.mem.span(t), "dumb")) {
             _ = setenv("COLORTERM", "truecolor", 1);
+            _ = setenv("TERM_PROGRAM", "zinc", 1);
         }
     }
 
@@ -116,6 +118,32 @@ fn childMain(master: i32, slave_path: [*:0]u8, cols: u16, rows: u16, term_env: ?
     const argv2: [*:null]const ?[*:0]const u8 = &.{ fallback, null };
     _ = execvpe(fallback, argv2, environ);
     linux.exit(127);
+}
+
+/// Open a URL in the browser via xdg-open (detached double-fork; the
+/// intermediate is reaped synchronously so no zombies accumulate).
+/// Only called with scheme-allowlisted URLs; no shell involved.
+pub fn openUrl(url: []const u8) void {
+    if (url.len == 0 or url.len > 2048) return;
+    var zurl: [2049]u8 = undefined;
+    @memcpy(zurl[0..url.len], url);
+    zurl[url.len] = 0;
+    const pid_rc = linux.fork();
+    if (linux.errno(pid_rc) != .SUCCESS) return;
+    const pid: c_int = @intCast(pid_rc);
+    if (pid == 0) {
+        _ = linux.setsid();
+        const g_rc = linux.fork();
+        if (linux.errno(g_rc) != .SUCCESS) linux.exit(1);
+        if (g_rc == 0) {
+            const prog: [*:0]const u8 = "xdg-open";
+            const argv: [*:null]const ?[*:0]const u8 = &.{ prog, zurl[0..url.len :0], null };
+            _ = execvpe(prog, argv, environ);
+            linux.exit(127);
+        }
+        linux.exit(0);
+    }
+    _ = waitpid(pid, null, 0);
 }
 
 /// Resize the PTY (keeps kernel + shell in sync with grid).

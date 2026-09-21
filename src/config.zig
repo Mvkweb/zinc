@@ -35,6 +35,11 @@ pub const Config = struct {
     bg: u32 = 0x0B0F11,
     fg: u32 = 0xDCDCCC,
     cursor_color: u32 = 0xDCDCCC,
+    // Selection: two flat colors (Ghostty-style), readable on any content.
+    selection_bg: u32 = 0xDCDCCC,
+    selection_fg: u32 = 0x0B0F11,
+    /// Ctrl+hover hyperlink underline.
+    link_color: u32 = 0x8CD0D3,
     /// Background opacity (0x00 transparent .. 0xFF opaque). Below 0xFF the
     /// compositor blends/blurs the window (needs an ARGB-capable compositor).
     bg_opacity: u8 = 0xC7, // ≈0.78, foot.ini match

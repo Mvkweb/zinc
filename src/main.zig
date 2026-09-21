@@ -350,6 +350,7 @@ test {
     _ = @import("term/grid.zig");
     _ = @import("term/scrollback.zig");
     _ = @import("term/reflow.zig");
+    _ = @import("term/hyperlink.zig");
     _ = @import("vt/parser.zig");
     _ = @import("vt/csi.zig");
     _ = @import("vt/sgr.zig");

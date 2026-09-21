@@ -199,6 +199,49 @@ pub fn reflowGrid(
                     }
                 }
 
+                // Prompt-zone right-decoration trim: on the cursor line and
+                // the two lines above it, drop right-aligned text sitting
+                // behind a wide blank gap (Starship $fill/$git_metrics, fish
+                // rprompt). The shell repaints those for the new width on
+                // SIGWINCH; stale margins would wrap the prompt onto extra
+                // rows and strand orphan lines (diagonal staircase cascade).
+                // Box rows (leading U+2502) are exempt: fastfetch/neofetch
+                // value columns look identical to decorations but repaint
+                // never — trimming them deletes real content.
+                const r0: u32 = if (ir.cells.len > 0) ir.cells[0].rune else ' ';
+                const cursor_input_row = sb_count + @as(usize, cursor_row.*);
+                const ir_idx = line_start + line_row_idx;
+                const is_prompt_zone = (ir_idx + 2 >= cursor_input_row and ir_idx <= cursor_input_row);
+                if (!ir.wrapped and is_prompt_zone and last_non_blank > 0 and r0 != 0x2502) {
+                    const min_col_for_gap = if (ir.is_cursor) @as(usize, cursor_col.*) else 0;
+                    if (last_non_blank > min_col_for_gap) {
+                        var scan = last_non_blank;
+                        var run_blanks: usize = 0;
+                        var found_gap = false;
+                        var gap_start: usize = last_non_blank;
+                        while (scan > min_col_for_gap) {
+                            scan -= 1;
+                            if (isCellBlank(cfg, ir.cells[scan], def_bg)) {
+                                run_blanks += 1;
+                                if (run_blanks >= 4) {
+                                    found_gap = true;
+                                    gap_start = scan;
+                                }
+                            } else {
+                                if (found_gap) break;
+                                run_blanks = 0;
+                            }
+                        }
+                        if (found_gap) {
+                            if (ir.is_cursor) {
+                                last_non_blank = @min(last_non_blank, @max(@as(usize, cursor_col.*) + 1, gap_start));
+                            } else if (gap_start > 0) {
+                                last_non_blank = gap_start;
+                            }
+                        }
+                    }
+                }
+
                 var take_len = @max(last_non_blank, if (ir.is_cursor) @as(usize, cursor_col.*) + 1 else 0);
                 take_len = @min(take_len, ir.cells.len);
                 if (take_len > 0) {
@@ -301,16 +344,13 @@ pub fn reflowGrid(
     const cursor_line = tracked_cursor_row orelse (if (total_lines > 0) total_lines - 1 else 0);
     const cursor_col_val = @min(tracked_cursor_col, new_cols - 1);
 
-    // 3. Viewport & Scrollback Extraction (sfte parity)
-    const was_at_bottom = cursor_row.* >= old_rows -| 1;
-    const r: usize = if (was_at_bottom)
-        @min(@as(usize, cursor_line), @as(usize, new_rows -| 1))
-    else
-        @min(@as(usize, cursor_row.*), @as(usize, new_rows -| 1));
-
-    var screen_top: i64 = @as(i64, @intCast(cursor_line)) - @as(i64, @intCast(r));
-    if (screen_top < 0) screen_top = 0;
-    const st: usize = @intCast(screen_top);
+    // 3. Viewport framing: the screen always shows a contiguous slice of the
+    // rewrapped sequence. Short content sits at the top (st=0) with blanks
+    // below and scrollback fully drains; overflowing content keeps its tail
+    // (cursor included) on screen and returns the head to scrollback.
+    // Origin is deliberately ignored: preserving the old sb/screen split is
+    // what stranded rewrapped rows in scrollback on widen-back.
+    const st: usize = if (total_lines > new_rows) total_lines - new_rows else 0;
 
     // Free all old rows in scrollback ring
     if (comptime cfg.scrollback_cap > 0) {
@@ -374,7 +414,7 @@ pub fn reflowGrid(
         grid.alt_cells = new_alt;
     }
 
-    cursor_row.* = @intCast(cursor_line - st);
+    cursor_row.* = @intCast(std.math.clamp(@as(i64, @intCast(cursor_line)) - @as(i64, @intCast(st)), 0, new_rows - 1));
     cursor_col.* = cursor_col_val;
     grid.cols = new_cols;
     grid.rows = new_rows;
@@ -493,23 +533,20 @@ test "horizontal reflow does not pull unrelated scrollback rows" {
     // Rows 2..9 are completely blank
 
     // Narrowing width from 20 to 15: new_rows is still 10!
-    // Each 20-char line wraps to 2 rows at width 15 (3x2 = 6 rows in scrollback).
-    // Screen lines (Hi + prompt) stay on screen.
+    // The unified pass rewraps the whole sequence (3x20 scrollback lines
+    // become 6x15) and frames it on screen while it fits: nothing strands
+    // in scrollback when there is room.
     try reflowGrid(cfg, std.testing.allocator, &g, 15, 10, &cur_col, &cur_row, cfg.bg);
     try std.testing.expectEqual(@as(u16, 15), g.cols);
     try std.testing.expectEqual(@as(u16, 10), g.rows);
-    try std.testing.expectEqual(@as(usize, 6), g.sb_len);
-    var si: usize = 0;
-    while (si < g.sb_len) : (si += 1) {
-        const phys = (g.sb_head + si) % 8;
-        const row = g.sb_rows[phys] orelse return error.Fail;
-        try std.testing.expectEqual(@as(usize, 15), row.len);
-    }
-    try std.testing.expectEqual(@as(u32, 'S'), (g.sb_rows[g.sb_head] orelse return error.Fail)[0].rune);
-    try std.testing.expectEqual(@as(u32, 'H'), g.at(0, 0).rune);
-    try std.testing.expectEqual(@as(u32, 'i'), g.at(1, 0).rune);
+    try std.testing.expectEqual(@as(usize, 0), g.sb_len); // drained: all fits
+    // 6 rewrapped S rows, then Hi, then the prompt line.
+    try std.testing.expectEqual(@as(u32, 'S'), g.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'S'), g.at(0, 4).rune);
+    try std.testing.expectEqual(@as(u32, 'H'), g.at(0, 6).rune);
+    try std.testing.expectEqual(@as(u32, 'i'), g.at(1, 6).rune);
     try std.testing.expectEqual(@as(u16, 0), cur_col);
-    try std.testing.expectEqual(@as(u16, 1), cur_row); // Prompt stays at row 1!
+    try std.testing.expectEqual(@as(u16, 7), cur_row); // prompt rode its line
 }
 
 test "box with default background and interior space gaps restores byte-identical" {
