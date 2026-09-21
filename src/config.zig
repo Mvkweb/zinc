@@ -30,6 +30,9 @@ pub const Config = struct {
     truecolor: bool = true,
     pad_x: u32 = 25,
     pad_y: u32 = 25,
+    /// Padding when in alt-screen (TUI apps like opencode/nvim/btop: edge-to-edge).
+    alt_pad_x: u32 = 0,
+    alt_pad_y: u32 = 0,
 
     // Theme (dark bg, soft white fg; ANSI palette matches foot defaults).
     bg: u32 = 0x0B0F11,

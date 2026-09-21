@@ -147,6 +147,7 @@ const selection_mod = @import("../input/selection.zig");
 const mouse_mod = @import("../input/mouse.zig");
 const hyperlink_mod = @import("../term/hyperlink.zig");
 const software = @import("../render/software.zig");
+const box_drawing = @import("../render/box_drawing.zig");
 const ft_mod = @import("../font/ft.zig");
 const atlas_mod = @import("../font/atlas.zig");
 const utf8_mod = @import("../util/utf8.zig");
@@ -783,12 +784,28 @@ pub fn App(comptime cfg: config_mod.Config) type {
             return baked;
         }
 
+        fn cellOffsets(self: *Self) struct { x: i32, y: i32 } {
+            const pad_x: i32 = if (self.ctx.alt_active) @intCast(cfg.alt_pad_x) else @intCast(cfg.pad_x);
+            const pad_y: i32 = if (self.ctx.alt_active) @intCast(cfg.alt_pad_y) else @intCast(cfg.pad_y);
+            const cw: i32 = self.cell_w;
+            const ch: i32 = self.cell_h;
+            const cols: i32 = @as(i32, self.ctx.grid.cols);
+            const rows: i32 = @as(i32, self.ctx.grid.rows);
+            const rem_x = @max(0, self.width - 2 * pad_x - cols * cw);
+            const rem_y = @max(0, self.height - 2 * pad_y - rows * ch);
+            return .{
+                .x = pad_x + @divFloor(rem_x, 2),
+                .y = pad_y + @divFloor(rem_y, 2),
+            };
+        }
+
         fn renderCells(self: *Self) software.Damage {
             var dmg = software.Damage{};
             const W: u32 = @intCast(self.width);
             const H: u32 = @intCast(self.height);
-            const px: i32 = @intCast(cfg.pad_x);
-            const py: i32 = @intCast(cfg.pad_y);
+            const offsets = self.cellOffsets();
+            const px: i32 = offsets.x;
+            const py: i32 = offsets.y;
             const cw = self.cell_w;
             const ch = self.cell_h;
             const bg_all = self.themed(self.ctx.bg);
@@ -858,37 +875,23 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     if (!cell.attr.invisible) {
                         const cp = cellCp(cell.rune);
                         if (cp != ' ' and cp != 0) {
-                            const style: ft_mod.Style = if (cell.attr.bold and cell.attr.italic)
-                                .bold_italic
-                            else if (cell.attr.bold)
-                                .bold
-                            else if (cell.attr.italic)
-                                .italic
-                            else
-                                .regular;
-                            if (self.glyphFor(cp, style)) |g| {
-                                const gdmg = software.blitGlyph(
-                                    self.pool_pixels,
-                                    W,
-                                    H,
-                                    self.atlas.pixels,
-                                    self.atlas.size,
-                                    g.x,
-                                    g.y,
-                                    g.w,
-                                    g.h,
-                                    g.xoff,
-                                    g.yoff,
-                                    @intCast(x),
-                                    @as(i32, @intCast(y)) + self.ascent,
-                                    fg,
-                                );
-                                dmgMerge(&dmg, gdmg);
+                            var drawn_box = false;
+                            // Unicode Block Elements (0x2580..0x259F: █, ▀, ▄, shades, quadrants):
+                            // Render procedurally with 100% cell coverage so adjacent cells connect
+                            // with zero gaps (fixes OpenCode logo, shade blocks, and progress bars).
+                            if (box_drawing.isBlockElement(cp)) {
+                                drawn_box = box_drawing.draw(self.pool_pixels, W, H, x, y, cw, ch, cp, fg, &dmg);
                             }
-                            var ci: u8 = 0;
-                            while (ci < cell.combining_count) : (ci += 1) {
-                                const ccp = cellCp(cell.combining[ci]);
-                                if (self.glyphFor(ccp, style)) |g| {
+                            if (!drawn_box) {
+                                const style: ft_mod.Style = if (cell.attr.bold and cell.attr.italic)
+                                    .bold_italic
+                                else if (cell.attr.bold)
+                                    .bold
+                                else if (cell.attr.italic)
+                                    .italic
+                                else
+                                    .regular;
+                                if (self.glyphFor(cp, style)) |g| {
                                     const gdmg = software.blitGlyph(
                                         self.pool_pixels,
                                         W,
@@ -906,6 +909,31 @@ pub fn App(comptime cfg: config_mod.Config) type {
                                         fg,
                                     );
                                     dmgMerge(&dmg, gdmg);
+                                } else if (box_drawing.isBoxDrawingOrBlock(cp)) {
+                                    _ = box_drawing.draw(self.pool_pixels, W, H, x, y, cw, ch, cp, fg, &dmg);
+                                }
+                                var ci: u8 = 0;
+                                while (ci < cell.combining_count) : (ci += 1) {
+                                    const ccp = cellCp(cell.combining[ci]);
+                                    if (self.glyphFor(ccp, style)) |g| {
+                                        const gdmg = software.blitGlyph(
+                                            self.pool_pixels,
+                                            W,
+                                            H,
+                                            self.atlas.pixels,
+                                            self.atlas.size,
+                                            g.x,
+                                            g.y,
+                                            g.w,
+                                            g.h,
+                                            g.xoff,
+                                            g.yoff,
+                                            @intCast(x),
+                                            @as(i32, @intCast(y)) + self.ascent,
+                                            fg,
+                                        );
+                                        dmgMerge(&dmg, gdmg);
+                                    }
                                 }
                             }
                         }
@@ -1012,8 +1040,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (w == self.width and h == self.height) return;
             self.width = w;
             self.height = h;
-            const cols: u16 = @intCast(@max(15, @divFloor(w - 2 * @as(i32, @intCast(cfg.pad_x)), self.cell_w)));
-            const rows: u16 = @intCast(@max(3, @divFloor(h - 2 * @as(i32, @intCast(cfg.pad_y)), self.cell_h)));
+            const pad_x = if (self.ctx.alt_active) cfg.alt_pad_x else cfg.pad_x;
+            const pad_y = if (self.ctx.alt_active) cfg.alt_pad_y else cfg.pad_y;
+            const cols: u16 = @intCast(@max(15, @divFloor(w - 2 * @as(i32, @intCast(pad_x)), self.cell_w)));
+            const rows: u16 = @intCast(@max(3, @divFloor(h - 2 * @as(i32, @intCast(pad_y)), self.cell_h)));
 
             if (cols == self.ctx.grid.cols and rows == self.ctx.grid.rows) return;
 
@@ -1033,6 +1063,20 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.ctx.resize(cols, rows);
             if (self.pty_fd >= 0) {
                 pty_mod.resizePty(self.pty_fd, cols, rows, @intCast(@min(self.width, 32767)), @intCast(@min(self.height, 32767)));
+            }
+            self.needs_render = true;
+        }
+
+        fn handleAltChange(self: *Self) void {
+            const pad_x = if (self.ctx.alt_active) cfg.alt_pad_x else cfg.pad_x;
+            const pad_y = if (self.ctx.alt_active) cfg.alt_pad_y else cfg.pad_y;
+            const cols: u16 = @intCast(@max(15, @divFloor(self.width - 2 * @as(i32, @intCast(pad_x)), self.cell_w)));
+            const rows: u16 = @intCast(@max(3, @divFloor(self.height - 2 * @as(i32, @intCast(pad_y)), self.cell_h)));
+            if (cols != self.ctx.grid.cols or rows != self.ctx.grid.rows) {
+                self.ctx.resize(cols, rows);
+                if (self.pty_fd >= 0) {
+                    pty_mod.resizePty(self.pty_fd, cols, rows, @intCast(@min(self.width, 32767)), @intCast(@min(self.height, 32767)));
+                }
             }
             self.needs_render = true;
         }
@@ -1132,9 +1176,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         tracePty(pty_buf[0..rrc]);
                         self.ctx.answerQueries(pty_buf[0..rrc]);
                         const prev_mouse_mode = self.ctx.mouse_mode;
+                        const prev_alt = self.ctx.alt_active;
                         self.ctx.parse(pty_buf[0..rrc]);
                         if (self.ctx.mouse_mode != prev_mouse_mode) {
                             self.refreshCursor();
+                        }
+                        if (self.ctx.alt_active != prev_alt) {
+                            self.handleAltChange();
                         }
                         self.needs_render = true;
                         if (rrc < pty_buf.len) break;
@@ -1597,8 +1645,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         /// wl_fixed 24.8 surface pixels -> clamped grid cell.
         fn ptrCell(self: *Self, sx: i32, sy: i32) struct { col: u16, row: u16 } {
-            const px: i64 = @divFloor(@as(i64, sx), 256) - @as(i64, cfg.pad_x);
-            const py: i64 = @divFloor(@as(i64, sy), 256) - @as(i64, cfg.pad_y);
+            const offsets = self.cellOffsets();
+            const px: i64 = @divFloor(@as(i64, sx), 256) - @as(i64, offsets.x);
+            const py: i64 = @divFloor(@as(i64, sy), 256) - @as(i64, offsets.y);
             const cols = self.ctx.grid.cols;
             const rows = self.ctx.grid.rows;
             if (self.cell_w <= 0 or self.cell_h <= 0 or cols == 0 or rows == 0) return .{ .col = 0, .row = 0 };

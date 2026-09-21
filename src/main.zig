@@ -364,6 +364,7 @@ test {
     _ = @import("font/shaper.zig");
     _ = @import("font/boxes.zig");
     _ = @import("render/software.zig");
+    _ = @import("render/box_drawing.zig");
     _ = @import("backend/wayland.zig");
     _ = @import("backend/wl_proto.zig");
     _ = @import("pty.zig");
