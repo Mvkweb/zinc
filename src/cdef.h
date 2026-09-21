@@ -7,4 +7,6 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include <freetype/ftsynth.h>
-#include <wayland-client-core.h>
+
+// Fontconfig for font discovery and ranking.
+#include <fontconfig/fontconfig.h>

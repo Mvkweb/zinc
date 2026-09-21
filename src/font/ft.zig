@@ -121,6 +121,171 @@ const GENERIC_HOME_SUFFIXES = [_][]const u8{
     "/.fonts/JetBrainsMono-Regular.ttf",
 };
 
+/// Fontconfig C API wrapper for font discovery, variant resolution, and fallback sorting.
+pub const fc = struct {
+    var initialized: bool = false;
+
+    pub fn ensureInit() bool {
+        if (initialized) return true;
+        if (c.FcInit() != c.FcFalse) {
+            initialized = true;
+            return true;
+        }
+        return false;
+    }
+
+    pub const MatchResult = struct {
+        path: []const u8,
+        index: c_int,
+    };
+
+    fn containsCaseInsensitive(haystack: []const u8, needle: []const u8) bool {
+        if (needle.len == 0) return true;
+        if (haystack.len < needle.len) return false;
+        var i: usize = 0;
+        while (i + needle.len <= haystack.len) : (i += 1) {
+            var ok = true;
+            for (0..needle.len) |k| {
+                if (std.ascii.toLower(haystack[i + k]) != std.ascii.toLower(needle[k])) {
+                    ok = false;
+                    break;
+                }
+            }
+            if (ok) return true;
+        }
+        return false;
+    }
+
+    /// Query Fontconfig for the best font matching family + optional weight / slant / spacing.
+    /// Writes the resolved file path into out_buf.
+    pub fn match(
+        family: []const u8,
+        weight: ?c_int,
+        slant: ?c_int,
+        monospace: bool,
+        out_buf: *[1024]u8,
+    ) ?MatchResult {
+        if (!ensureInit()) return null;
+        const pat = c.FcPatternCreate() orelse return null;
+        defer c.FcPatternDestroy(pat);
+
+        var fam_z: [256:0]u8 = undefined;
+        if (family.len + 1 > fam_z.len) return null;
+        @memcpy(fam_z[0..family.len], family);
+        fam_z[family.len] = 0;
+
+        _ = c.FcPatternAddString(pat, c.FC_FAMILY, @as([*c]const u8, @ptrCast(&fam_z)));
+        if (monospace) {
+            _ = c.FcPatternAddInteger(pat, c.FC_SPACING, c.FC_MONO);
+        }
+        _ = c.FcPatternAddBool(pat, c.FC_SCALABLE, c.FcTrue);
+        if (weight) |w| {
+            _ = c.FcPatternAddInteger(pat, c.FC_WEIGHT, w);
+        }
+        if (slant) |s| {
+            _ = c.FcPatternAddInteger(pat, c.FC_SLANT, s);
+        }
+
+        _ = c.FcConfigSubstitute(null, pat, c.FcMatchPattern);
+        c.FcDefaultSubstitute(pat);
+
+        var result: c.FcResult = undefined;
+        const matched = c.FcFontMatch(null, pat, &result) orelse return null;
+        defer c.FcPatternDestroy(matched);
+
+        var file_ptr: [*c]c.FcChar8 = null;
+        if (c.FcPatternGetString(matched, c.FC_FILE, 0, &file_ptr) != c.FcResultMatch or file_ptr == null) {
+            return null;
+        }
+        // For specific family queries (not generic "monospace"), verify that fontconfig
+        // didn't substitute an unrelated fallback font (e.g. Noto Sans for missing Nerd font).
+        if (!std.mem.eql(u8, family, "monospace")) {
+            var fam_ptr: [*c]c.FcChar8 = null;
+            if (c.FcPatternGetString(matched, c.FC_FAMILY, 0, &fam_ptr) == c.FcResultMatch and fam_ptr != null) {
+                const mfam = std.mem.span(@as([*:0]const u8, @ptrCast(fam_ptr)));
+                if (!containsCaseInsensitive(mfam, family) and !containsCaseInsensitive(family, mfam)) {
+                    return null;
+                }
+            } else {
+                return null;
+            }
+        }
+        var font_index: c_int = 0;
+        _ = c.FcPatternGetInteger(matched, c.FC_INDEX, 0, &font_index);
+
+        const span = std.mem.span(@as([*:0]const u8, @ptrCast(file_ptr)));
+        if (span.len > out_buf.len) return null;
+        @memcpy(out_buf[0..span.len], span);
+        return .{
+            .path = out_buf[0..span.len],
+            .index = font_index,
+        };
+    }
+
+    /// Sort and collect fallback font paths for a pattern using FcFontSort.
+    /// Filters out primary_path to avoid duplicate faces.
+    pub fn sortFallbacks(
+        family: []const u8,
+        primary_path: []const u8,
+        out_paths: *[4][512]u8,
+        out_lens: *[4]usize,
+    ) usize {
+        if (!ensureInit()) return 0;
+        const pat = c.FcPatternCreate() orelse return 0;
+        defer c.FcPatternDestroy(pat);
+
+        var fam_z: [256:0]u8 = undefined;
+        if (family.len + 1 <= fam_z.len) {
+            @memcpy(fam_z[0..family.len], family);
+            fam_z[family.len] = 0;
+            _ = c.FcPatternAddString(pat, c.FC_FAMILY, @as([*c]const u8, @ptrCast(&fam_z)));
+        }
+        _ = c.FcPatternAddBool(pat, c.FC_SCALABLE, c.FcTrue);
+        _ = c.FcConfigSubstitute(null, pat, c.FcMatchPattern);
+        c.FcDefaultSubstitute(pat);
+
+        var result: c.FcResult = undefined;
+        const fs = c.FcFontSort(null, pat, c.FcTrue, null, &result) orelse return 0;
+        defer c.FcFontSetDestroy(fs);
+
+        var count: usize = 0;
+        var i: usize = 0;
+        const n_fonts: usize = @intCast(@max(0, fs.*.nfont));
+        while (i < n_fonts and count < 4) : (i += 1) {
+            const font_pat = fs.*.fonts[i] orelse continue;
+            var file_ptr: [*c]c.FcChar8 = null;
+            if (c.FcPatternGetString(font_pat, c.FC_FILE, 0, &file_ptr) != c.FcResultMatch or file_ptr == null) continue;
+            const path = std.mem.span(@as([*:0]const u8, @ptrCast(file_ptr)));
+            if (std.mem.eql(u8, path, primary_path)) continue;
+            // Ensure not already added
+            var dup = false;
+            for (0..count) |k| {
+                if (std.mem.eql(u8, path, out_paths[k][0..out_lens[k]])) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (dup) continue;
+            if (path.len > out_paths[count].len) continue;
+            @memcpy(out_paths[count][0..path.len], path);
+            out_lens[count] = path.len;
+            count += 1;
+        }
+        return count;
+    }
+
+    /// Tear down Fontconfig and release its internal XML config and font caches from RAM.
+    pub fn deinit() void {
+        if (initialized) {
+            c.FcFini();
+            initialized = false;
+            _ = malloc_trim(0);
+        }
+    }
+};
+
+extern "c" fn malloc_trim(pad: usize) c_int;
+
 /// Candidate load order: ZINC_FONT env > config path > well-known monos.
 /// Each entry is tried via FT_New_Face until one loads; nothing is probed
 /// through the filesystem API.
@@ -142,6 +307,8 @@ pub const Face = struct {
     ul_pos_px: i8 = 0, // negative: below baseline
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, px: u16, config_path: []const u8, nerd_path: []const u8) Error!Face {
+        defer fc.deinit();
+
         var lib: c.FT_Library = undefined;
         if (c.FT_Init_FreeType(&lib) != 0) return error.InitFailed;
         errdefer _ = c.FT_Done_FreeType(lib);
@@ -153,7 +320,14 @@ pub const Face = struct {
             _ = tryPrimary(lib, px, std.mem.span(p), &primary, &ppath_buf, &ppath_len);
         }
         if (primary == null and config_path.len > 0) {
-            _ = tryPrimary(lib, px, config_path, &primary, &ppath_buf, &ppath_len);
+            if (std.mem.indexOfScalar(u8, config_path, '/') != null or hasFontExt(config_path)) {
+                _ = tryPrimary(lib, px, config_path, &primary, &ppath_buf, &ppath_len);
+            } else {
+                var fc_buf: [1024]u8 = undefined;
+                if (fc.match(config_path, null, null, false, &fc_buf)) |m| {
+                    _ = tryPrimary(lib, px, m.path, &primary, &ppath_buf, &ppath_len);
+                }
+            }
         }
         // Check user $HOME Nerd Fonts first (custom installs):
         if (primary == null) {
@@ -177,13 +351,20 @@ pub const Face = struct {
                 }
             }
         }
-        // Check system Nerd Fonts:
+        // Check system Nerd Fonts (preserves rich terminal icon sets):
         if (primary == null) {
             for (PRIMARY_NERD_CANDIDATES) |cand| {
                 if (tryPrimary(lib, px, cand, &primary, &ppath_buf, &ppath_len)) break;
             }
         }
-        // Generic monospace fallbacks only if no Nerd Font found:
+        // Query fontconfig for system/rice default monospace font:
+        if (primary == null) {
+            var fc_buf: [1024]u8 = undefined;
+            if (fc.match("monospace", null, null, true, &fc_buf)) |m| {
+                _ = tryPrimary(lib, px, m.path, &primary, &ppath_buf, &ppath_len);
+            }
+        }
+        // Generic monospace fallbacks only if no Nerd Font found and fontconfig missed:
         if (primary == null) {
             for (GENERIC_CANDIDATES) |cand| {
                 if (tryPrimary(lib, px, cand, &primary, &ppath_buf, &ppath_len)) break;
@@ -214,8 +395,8 @@ pub const Face = struct {
         // Fallbacks: dedicated Nerd symbols, Unicode symbols (DejaVuMono for ↯, math),
         // and extended symbols (NotoSansSymbols2).
         self.fallbacks[0] = loadNerd(lib, gpa, io, px, nerd_path, ppath);
-        self.fallbacks[1] = loadFallback(lib, px, &UNICODE_FALLBACK_CANDIDATES, ppath);
-        self.fallbacks[2] = loadFallback(lib, px, &SYMBOLS_FALLBACK_CANDIDATES, ppath);
+        self.fallbacks[1] = loadFallback(lib, px, &UNICODE_FALLBACK_CANDIDATES, ppath, 0);
+        self.fallbacks[2] = loadFallback(lib, px, &SYMBOLS_FALLBACK_CANDIDATES, ppath, 1);
         return self;
     }
 
@@ -329,7 +510,7 @@ pub const Face = struct {
         return face;
     }
 
-    /// Nerd fallback: explicit override > well-known paths > $HOME fonts.
+    /// Nerd fallback: explicit override > well-known paths > fontconfig > $HOME fonts.
     fn loadNerd(lib: c.FT_Library, gpa: std.mem.Allocator, io: std.Io, px: u16, nerd_path: []const u8, primary_path: []const u8) ?c.FT_Face {
         if (std.c.getenv("ZINC_FONT_NERD")) |p| {
             if (loadRaw(lib, px, std.mem.span(p), false)) |f| {
@@ -342,6 +523,10 @@ pub const Face = struct {
                 std.debug.print("[zinc] font fallback (nerd): {s}\n", .{nerd_path});
                 return f;
             }
+        }
+        // Primary font already contains patched icons; avoid redundant fallback probes or Fontconfig init.
+        if (contains(primary_path, "Nerd") or contains(primary_path, "nerd") or contains(primary_path, "NF")) {
+            return null;
         }
         for (NERD_CANDIDATES) |cand| {
             if (std.mem.eql(u8, cand, primary_path)) continue;
@@ -375,15 +560,35 @@ pub const Face = struct {
                 }
             }
         }
+        // Try fontconfig if candidate paths and $HOME didn't find it:
+        var fc_buf: [1024]u8 = undefined;
+        if (fc.match("Symbols Nerd Font", null, null, false, &fc_buf)) |m| {
+            if (!std.mem.eql(u8, m.path, primary_path)) {
+                if (loadRaw(lib, px, m.path, false)) |f| {
+                    std.debug.print("[zinc] font fallback (nerd fc): {s}\n", .{m.path});
+                    return f;
+                }
+            }
+        }
         return null;
     }
 
-    /// Load the first matching fallback font from a candidate list.
-    fn loadFallback(lib: c.FT_Library, px: u16, candidates: []const []const u8, primary_path: []const u8) ?c.FT_Face {
+    /// Load the first matching fallback font from a candidate list, then fontconfig.
+    fn loadFallback(lib: c.FT_Library, px: u16, candidates: []const []const u8, primary_path: []const u8, slot: usize) ?c.FT_Face {
         for (candidates) |cand| {
             if (std.mem.eql(u8, cand, primary_path)) continue;
             if (loadRaw(lib, px, cand, false)) |f| {
                 std.debug.print("[zinc] font fallback: {s}\n", .{cand});
+                return f;
+            }
+        }
+        var fc_paths: [4][512]u8 = undefined;
+        var fc_lens: [4]usize = .{ 0, 0, 0, 0 };
+        const n = fc.sortFallbacks("monospace", primary_path, &fc_paths, &fc_lens);
+        if (slot < n and fc_lens[slot] > 0) {
+            const p = fc_paths[slot][0..fc_lens[slot]];
+            if (loadRaw(lib, px, p, false)) |f| {
+                std.debug.print("[zinc] font fallback (fc): {s}\n", .{p});
                 return f;
             }
         }
@@ -676,4 +881,20 @@ test "underline metrics scale" {
     try std.testing.expectEqual(@as(i8, -3), m.pos);
     const missing = Face.ulMetrics(0, 0, 13, 800);
     try std.testing.expectEqual(@as(u8, 0), missing.thick);
+}
+
+test "fontconfig init and match" {
+    defer fc.deinit();
+    var buf: [1024]u8 = undefined;
+    if (fc.match("monospace", null, null, true, &buf)) |m| {
+        try std.testing.expect(m.path.len > 0);
+    }
+}
+
+test "fontconfig sort fallbacks" {
+    defer fc.deinit();
+    var paths: [4][512]u8 = undefined;
+    var lens: [4]usize = .{ 0, 0, 0, 0 };
+    const n = fc.sortFallbacks("monospace", "", &paths, &lens);
+    _ = n;
 }

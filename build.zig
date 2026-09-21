@@ -37,6 +37,7 @@ pub fn build(b: *std.Build) void {
     root_module.linkSystemLibrary("wayland-client", .{});
     root_module.linkSystemLibrary("xkbcommon", .{});
     root_module.linkSystemLibrary("freetype2", .{ .preferred_link_mode = .dynamic });
+    root_module.linkSystemLibrary("fontconfig", .{ .preferred_link_mode = .dynamic });
     root_module.linkSystemLibrary("rt", .{});
     root_module.linkSystemLibrary("m", .{});
     root_module.linkSystemLibrary("util", .{});
@@ -66,6 +67,7 @@ pub fn build(b: *std.Build) void {
     test_module.linkSystemLibrary("wayland-client", .{});
     test_module.linkSystemLibrary("xkbcommon", .{});
     test_module.linkSystemLibrary("freetype2", .{ .preferred_link_mode = .dynamic });
+    test_module.linkSystemLibrary("fontconfig", .{ .preferred_link_mode = .dynamic });
     const unit_tests = b.addTest(.{
         .root_module = test_module,
     });
