@@ -16,6 +16,8 @@ pub const Error = error{
     SizeFailed,
     RenderFailed,
     AtlasFull,
+    InvalidMetrics,
+    InvalidSize,
 };
 
 pub const Style = enum(u2) {
@@ -674,45 +676,68 @@ pub const Face = struct {
         return out[0..best_len];
     }
 
-    fn tryFace(lib: c.FT_Library, px: u16, path: []const u8) ?Face {
-        const face = loadRaw(lib, px, path, true) orelse return null;
-        errdefer _ = c.FT_Done_Face(face);
-
-        const m = face.*.size.*.metrics;
+    /// Recalculate cell metrics and underline dimensions from the primary face.
+    fn updateMetrics(self: *Face) Error!void {
+        const m = self.face.*.size.*.metrics;
         const adv: i64 = m.max_advance >> 6;
         const asc: i64 = m.ascender >> 6;
         const desc: i64 = m.descender >> 6; // negative
         const h = asc - desc;
-        if (h <= 0 or h > 256) return null;
+        if (h <= 0 or h > 256) return error.InvalidMetrics;
 
         // Measure standard character cell width from 'M' or '0',
         // falling back to max_advance. This avoids non-mono nerd fonts
         // doubling the cell width because of 2-cell icons.
         var cw: i64 = 0;
-        const midx = c.FT_Get_Char_Index(face, 'M');
-        if (midx != 0 and c.FT_Load_Glyph(face, midx, 0) == 0) {
-            cw = face.*.glyph.*.advance.x >> 6;
+        const midx = c.FT_Get_Char_Index(self.face, 'M');
+        if (midx != 0 and c.FT_Load_Glyph(self.face, midx, 0) == 0) {
+            cw = self.face.*.glyph.*.advance.x >> 6;
         }
         if (cw <= 0) {
-            const zidx = c.FT_Get_Char_Index(face, '0');
-            if (zidx != 0 and c.FT_Load_Glyph(face, zidx, 0) == 0) {
-                cw = face.*.glyph.*.advance.x >> 6;
+            const zidx = c.FT_Get_Char_Index(self.face, '0');
+            if (zidx != 0 and c.FT_Load_Glyph(self.face, zidx, 0) == 0) {
+                cw = self.face.*.glyph.*.advance.x >> 6;
             }
         }
         if (cw <= 0) cw = adv;
-        if (cw <= 0 or cw > 256) return null;
+        if (cw <= 0 or cw > 256) return error.InvalidMetrics;
 
-        const ulm = ulMetrics(face.*.underline_thickness, face.*.underline_position, asc, face.*.ascender);
-        return .{
+        const ulm = ulMetrics(self.face.*.underline_thickness, self.face.*.underline_position, asc, self.face.*.ascender);
+        self.cell_w = @intCast(cw);
+        self.cell_h = @intCast(h);
+        self.ascent = @intCast(asc);
+        self.descent = @intCast(desc);
+        self.ul_thick_px = ulm.thick;
+        self.ul_pos_px = ulm.pos;
+    }
+
+    /// Dynamically change the raster pixel size of the face, style variants, and fallbacks.
+    pub fn setPixelSize(self: *Face, px: u16) Error!void {
+        if (px == 0) return error.InvalidSize;
+        if (c.FT_Set_Pixel_Sizes(self.face, 0, @intCast(px)) != 0) return error.SizeFailed;
+        if (self.bold) |f| _ = c.FT_Set_Pixel_Sizes(f, 0, @intCast(px));
+        if (self.italic) |f| _ = c.FT_Set_Pixel_Sizes(f, 0, @intCast(px));
+        if (self.bold_italic) |f| _ = c.FT_Set_Pixel_Sizes(f, 0, @intCast(px));
+        for (self.fallbacks) |fb| {
+            if (fb) |f| _ = c.FT_Set_Pixel_Sizes(f, 0, @intCast(px));
+        }
+        try self.updateMetrics();
+    }
+
+    fn tryFace(lib: c.FT_Library, px: u16, path: []const u8) ?Face {
+        const face = loadRaw(lib, px, path, true) orelse return null;
+        errdefer _ = c.FT_Done_Face(face);
+
+        var self = Face{
             .lib = lib,
             .face = face,
-            .cell_w = @intCast(cw),
-            .cell_h = @intCast(h),
-            .ascent = @intCast(asc),
-            .descent = @intCast(desc),
-            .ul_thick_px = ulm.thick,
-            .ul_pos_px = ulm.pos,
+            .cell_w = 0,
+            .cell_h = 0,
+            .ascent = 0,
+            .descent = 0,
         };
+        self.updateMetrics() catch return null;
+        return self;
     }
 
     pub fn deinit(self: *Face) void {
@@ -897,4 +922,31 @@ test "fontconfig sort fallbacks" {
     var lens: [4]usize = .{ 0, 0, 0, 0 };
     const n = fc.sortFallbacks("monospace", "", &paths, &lens);
     _ = n;
+}
+
+test "Face setPixelSize scaling" {
+    defer fc.deinit();
+    var buf: [1024]u8 = undefined;
+    const m = fc.match("monospace", null, null, true, &buf) orelse return;
+
+    var lib: c.FT_Library = undefined;
+    if (c.FT_Init_FreeType(&lib) != 0) return;
+    defer _ = c.FT_Done_FreeType(lib);
+
+    var face = Face.tryFace(lib, 16, m.path) orelse return;
+    defer _ = c.FT_Done_Face(face.face);
+
+    const initial_h = face.cell_h;
+    const initial_w = face.cell_w;
+    try std.testing.expect(initial_h > 0);
+    try std.testing.expect(initial_w > 0);
+
+    // Scale up
+    try face.setPixelSize(24);
+    try std.testing.expect(face.cell_h > initial_h);
+    try std.testing.expect(face.cell_w >= initial_w);
+
+    // Scale down
+    try face.setPixelSize(12);
+    try std.testing.expect(face.cell_h < initial_h);
 }

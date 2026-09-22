@@ -220,6 +220,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
         cell_w: i32,
         cell_h: i32,
         ascent: i32,
+        font_size_pt: f32 = cfg.font_default_size,
 
         display: ?*c.wl_display = null,
         registry: ?*WlRegistry = null,
@@ -242,6 +243,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// app itself isn't tracking the mouse (mouse_mode == .off).
         sel: selection_mod.Selection = .{},
         sel_drag: bool = false,
+        last_click_time: u32 = 0,
+        last_click_col: u16 = 0,
+        last_click_row: u16 = 0,
+        click_count: u8 = 0,
         /// Buttons currently held (bit per evdev button) for app drag-motion.
         mouse_buttons: u8 = 0,
         ptr_inside: bool = false,
@@ -371,6 +376,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .cell_w = ft_face.cell_w,
                 .cell_h = ft_face.cell_h,
                 .ascent = ft_face.ascent,
+                .font_size_pt = cfg.font_default_size,
             };
             errdefer {
                 self.deinit();
@@ -799,6 +805,12 @@ pub fn App(comptime cfg: config_mod.Config) type {
             };
         }
 
+        fn isCellSelected(self: *const Self, col: u16, row: u16) bool {
+            if (!cfg.selection) return false;
+            if (!cfg.selection_single_cell and self.sel.isSingleCell()) return false;
+            return self.sel.contains(col, row);
+        }
+
         fn renderCells(self: *Self) software.Damage {
             var dmg = software.Damage{};
             const W: u32 = @intCast(self.width);
@@ -827,7 +839,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     }
                     // Selection highlight: two flat theme colors, readable on
                     // any content (Ghostty-style, not per-cell reverse).
-                    if (cfg.selection and self.sel.contains(col, row)) {
+                    if (self.isCellSelected(col, row)) {
                         bg_straight = 0xFF000000 | (cfg.selection_bg & 0xFFFFFF);
                     }
                     const bg = self.themed(bg_straight);
@@ -860,7 +872,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     if (cell.attr.reverse) {
                         fg = 0xFF000000 | (cell.bg & 0xFFFFFF);
                     }
-                    if (cfg.selection and self.sel.contains(col, row)) {
+                    if (self.isCellSelected(col, row)) {
                         fg = 0xFF000000 | (cfg.selection_fg & 0xFFFFFF);
                     }
                     if (cell.attr.dim) {
@@ -1081,6 +1093,49 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.needs_render = true;
         }
 
+        fn zoomIn(self: *Self) void {
+            if (!cfg.font_zoom) return;
+            self.setFontSize(self.font_size_pt + 1.0);
+        }
+
+        fn zoomOut(self: *Self) void {
+            if (!cfg.font_zoom) return;
+            self.setFontSize(self.font_size_pt - 1.0);
+        }
+
+        fn zoomReset(self: *Self) void {
+            if (!cfg.font_zoom) return;
+            self.setFontSize(cfg.font_default_size);
+        }
+
+        fn setFontSize(self: *Self, new_pt: f32) void {
+            if (self.width <= 0 or self.height <= 0) return;
+            const clamped_pt = @max(cfg.font_min_size, @min(cfg.font_max_size, new_pt));
+            const px: u16 = @intFromFloat(@max(4.0, @min(256.0, @round(clamped_pt * cfg.font_dpi / 72.0))));
+            self.ft_face.setPixelSize(px) catch return;
+
+            self.font_size_pt = clamped_pt;
+            self.cell_w = self.ft_face.cell_w;
+            self.cell_h = self.ft_face.cell_h;
+            self.ascent = self.ft_face.ascent;
+
+            self.atlas.clear();
+            self.glyphs.clearRetainingCapacity();
+
+            const pad_x = if (self.ctx.alt_active) cfg.alt_pad_x else cfg.pad_x;
+            const pad_y = if (self.ctx.alt_active) cfg.alt_pad_y else cfg.pad_y;
+            const cols: u16 = @intCast(@max(15, @divFloor(self.width - 2 * @as(i32, @intCast(pad_x)), self.cell_w)));
+            const rows: u16 = @intCast(@max(3, @divFloor(self.height - 2 * @as(i32, @intCast(pad_y)), self.cell_h)));
+
+            self.ctx.resize(cols, rows);
+            if (self.pty_fd >= 0) {
+                pty_mod.resizePty(self.pty_fd, cols, rows, @intCast(@min(self.width, 32767)), @intCast(@min(self.height, 32767)));
+            }
+            self.ctx.grid.markAllDirty();
+            self.clearHover();
+            self.needs_render = true;
+        }
+
         fn present(self: *Self) void {
             if (self.pending_resize) |p| {
                 self.pending_resize = null;
@@ -1263,6 +1318,22 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 }
                 if (sym == 'V' or sym == 'v') {
                     self.pasteClipboard();
+                    return;
+                }
+            }
+
+            // Font zoom shortcuts: Ctrl + '+'/'='/'KP_Add', Ctrl + '-'/'KP_Subtract', Ctrl + '0'/'KP_0'.
+            if (cfg.font_zoom and mods.ctrl and !mods.alt) {
+                if (sym == '+' or sym == '=' or sym == 0xffab) {
+                    self.zoomIn();
+                    return;
+                }
+                if (sym == '-' or sym == 0xffaf) {
+                    self.zoomOut();
+                    return;
+                }
+                if (sym == '0' or sym == 0xffb0) {
+                    self.zoomReset();
                     return;
                 }
             }
@@ -1483,6 +1554,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
         fn copySelection(self: *Self) void {
             if (!cfg.clipboard) return;
             if (!self.sel.active) return;
+            if (!cfg.selection_single_cell and self.sel.isSingleCell()) return;
             const text = (self.sel.extract(self.gpa, &self.ctx.grid) catch return) orelse return;
             errdefer self.gpa.free(text);
             if (self.data_device == null or self.ddm == null) {
@@ -1852,7 +1924,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             if (self.sel_drag) {
                 const cc = self.ptrCell(sx, sy);
-                self.sel.update(cc.col, cc.row);
+                switch (self.sel.mode) {
+                    .cell => self.sel.update(cc.col, cc.row),
+                    .word => self.sel.updateWordDrag(&self.ctx.grid, cc.col, cc.row),
+                    .line => self.sel.updateLineDrag(&self.ctx.grid, cc.row),
+                }
                 self.needs_render = true;
                 return;
             }
@@ -1862,7 +1938,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         fn appOnPointerButton(data: ?*anyopaque, pointer: ?*P.Pointer, serial: u32, time: u32, button: u32, state: u32) callconv(.c) void {
             _ = pointer;
-            _ = time;
             const self: *Self = @ptrCast(@alignCast(data));
             self.last_serial = serial;
             self.ptr_serial = serial;
@@ -1894,7 +1969,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 return;
             }
             switch (button) {
-                0x110 => { // left: Ctrl+click opens links; else drag-select
+                0x110 => { // left: Ctrl+click opens links; else multi-click / drag-select
                     if (!cfg.selection) return;
                     const cc = self.ptrCell(self.ptr_sx, self.ptr_sy);
                     if (state == 1) {
@@ -1905,12 +1980,40 @@ pub fn App(comptime cfg: config_mod.Config) type {
                                 return;
                             }
                         }
-                        self.sel.begin(cc.col, cc.row);
+
+                        // Multi-click detection (double-click word, triple-click line)
+                        const DOUBLE_CLICK_TIME_MS: u32 = 400;
+                        const is_multi_click = (time >= self.last_click_time) and
+                            (time - self.last_click_time <= DOUBLE_CLICK_TIME_MS) and
+                            (cc.col == self.last_click_col and cc.row == self.last_click_row);
+
+                        if (is_multi_click) {
+                            self.click_count = if (self.click_count >= 3) 1 else self.click_count + 1;
+                        } else {
+                            self.click_count = 1;
+                        }
+                        self.last_click_time = time;
+                        self.last_click_col = cc.col;
+                        self.last_click_row = cc.row;
+
+                        switch (self.click_count) {
+                            2 => {
+                                const span = selection_mod.findWordSpan(&self.ctx.grid, cc.col, cc.row);
+                                self.sel.beginWord(span);
+                            },
+                            3 => {
+                                const span = selection_mod.findLineSpan(&self.ctx.grid, cc.row);
+                                self.sel.beginLine(span);
+                            },
+                            else => {
+                                self.sel.begin(cc.col, cc.row);
+                            },
+                        }
                         self.sel_drag = true;
                         self.needs_render = true;
                     } else {
                         self.sel_drag = false;
-                        if (self.sel.anchor_col == self.sel.focus_col and self.sel.anchor_row == self.sel.focus_row) {
+                        if (self.sel.mode == .cell and self.sel.anchor_col == self.sel.focus_col and self.sel.anchor_row == self.sel.focus_row) {
                             self.sel.clear();
                         }
                         self.needs_render = true;
@@ -1930,6 +2033,15 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (!cfg.mouse) return;
             if (axis != 0) return; // vertical only
             const mods = self.currentMods();
+            // Ctrl+Wheel zoom: up (<0) zooms in, down (>0) zooms out.
+            if (cfg.font_zoom and mods.ctrl and !mods.alt) {
+                if (value < 0) {
+                    self.zoomIn();
+                } else if (value > 0) {
+                    self.zoomOut();
+                }
+                return;
+            }
             if (self.ctx.mouse_mode != .off and !mods.shift) {
                 // Wheel to the app: 64 up, 65 down (press only). Wayland
                 // vertical value > 0 scrolls content down.
@@ -2140,7 +2252,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Clipboard chords never repeat (would re-fire copy/paste).
             const c_held = xkb_state_mod_name_is_active(self.xkb_state, "Control", XKB_STATE_MODS_EFFECTIVE) > 0;
             const s_held = xkb_state_mod_name_is_active(self.xkb_state, "Shift", XKB_STATE_MODS_EFFECTIVE) > 0;
-            if (sym < 0xFFE0 and !(c_held and s_held) and self.repeat_delay > 0 and self.repeat_fd >= 0) {
+            const is_clip_chord = (c_held and s_held) and (sym == 'C' or sym == 'c' or sym == 'V' or sym == 'v');
+            if (sym < 0xFFE0 and !is_clip_chord and self.repeat_delay > 0 and self.repeat_fd >= 0) {
                 self.repeat_sym = sym;
                 self.repeat_keycode = keycode;
                 self.repeat_armed = true;

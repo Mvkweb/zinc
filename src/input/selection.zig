@@ -3,15 +3,182 @@
 const std = @import("std");
 const utf8_mod = @import("../util/utf8.zig");
 
+pub const Mode = enum {
+    cell,
+    word,
+    line,
+};
+
+pub const CharClass = enum(u2) {
+    space = 0,
+    word = 1,
+    delim = 2,
+};
+
+pub fn charClass(cp: u32) CharClass {
+    if (cp == ' ' or cp == '\t' or cp == 0) return .space;
+    if (cp < 128) {
+        return switch (@as(u8, @intCast(cp))) {
+            ' ', '\t', 0 => .space,
+            '"', '\'', '`', '(', ')', '[', ']', '{', '}', '<', '>', ',', ';', ':', '=', '|', '\\' => .delim,
+            else => .word,
+        };
+    }
+    if (cp == 0x3000) return .space; // ideographic space
+    if (cp >= 0x2500 and cp <= 0x257F) return .delim; // box drawing characters
+    return .word;
+}
+
+pub const Span = struct {
+    start_col: u16,
+    start_row: u16,
+    end_col: u16,
+    end_row: u16,
+};
+
+pub fn findWordSpan(grid: anytype, col: u16, row: u16) Span {
+    const rows = grid.rows;
+    const cols = grid.cols;
+    if (rows == 0 or cols == 0 or row >= rows or col >= cols) {
+        return .{ .start_col = col, .start_row = row, .end_col = col, .end_row = row };
+    }
+
+    const start_cell = grid.viewCell(col, row) orelse return .{ .start_col = col, .start_row = row, .end_col = col, .end_row = row };
+    const target_class = charClass(start_cell.rune);
+
+    var sc = col;
+    var sr = row;
+
+    // Scan backwards
+    while (true) {
+        if (sc > 0) {
+            const prev_cell = grid.viewCell(sc - 1, sr) orelse break;
+            if (charClass(prev_cell.rune) != target_class) break;
+            sc -= 1;
+        } else if (sr > 0) {
+            // Check if previous row wrapped into this row
+            const prev_row_last = grid.viewCell(cols - 1, sr - 1) orelse break;
+            if (!prev_row_last.wrapped) break;
+            if (charClass(prev_row_last.rune) != target_class) break;
+            sr -= 1;
+            sc = cols - 1;
+        } else {
+            break;
+        }
+    }
+
+    var ec = col;
+    var er = row;
+
+    // Scan forwards
+    while (true) {
+        if (ec + 1 < cols) {
+            const next_cell = grid.viewCell(ec + 1, er) orelse break;
+            if (charClass(next_cell.rune) != target_class) break;
+            ec += 1;
+        } else if (er + 1 < rows) {
+            // Check if this row wrapped into the next row
+            const curr_row_last = grid.viewCell(cols - 1, er) orelse break;
+            if (!curr_row_last.wrapped) break;
+            const next_row_first = grid.viewCell(0, er + 1) orelse break;
+            if (charClass(next_row_first.rune) != target_class) break;
+            er += 1;
+            ec = 0;
+        } else {
+            break;
+        }
+    }
+
+    return .{ .start_col = sc, .start_row = sr, .end_col = ec, .end_row = er };
+}
+
+pub fn findLineSpan(grid: anytype, row: u16) Span {
+    const rows = grid.rows;
+    const cols = grid.cols;
+    if (rows == 0 or cols == 0 or row >= rows) {
+        return .{ .start_col = 0, .start_row = row, .end_col = 0, .end_row = row };
+    }
+
+    // Find the start of the logical line (scan backwards across wrapped rows)
+    var sr = row;
+    while (sr > 0) {
+        const prev_last = grid.viewCell(cols - 1, sr - 1) orelse break;
+        if (!prev_last.wrapped) break;
+        sr -= 1;
+    }
+
+    // Find the end of the logical line (scan forwards across wrapped rows)
+    var er = row;
+    while (er + 1 < rows) {
+        const curr_last = grid.viewCell(cols - 1, er) orelse break;
+        if (!curr_last.wrapped) break;
+        er += 1;
+    }
+
+    return .{
+        .start_col = 0,
+        .start_row = sr,
+        .end_col = cols - 1,
+        .end_row = er,
+    };
+}
+
 pub const Selection = struct {
     active: bool = false,
+    mode: Mode = .cell,
     anchor_col: u16 = 0,
     anchor_row: u16 = 0,
     focus_col: u16 = 0,
     focus_row: u16 = 0,
 
+    init_start_col: u16 = 0,
+    init_start_row: u16 = 0,
+    init_end_col: u16 = 0,
+    init_end_row: u16 = 0,
+
     pub fn begin(self: *Selection, col: u16, row: u16) void {
-        self.* = .{ .active = true, .anchor_col = col, .anchor_row = row, .focus_col = col, .focus_row = row };
+        self.* = .{
+            .active = true,
+            .mode = .cell,
+            .anchor_col = col,
+            .anchor_row = row,
+            .focus_col = col,
+            .focus_row = row,
+            .init_start_col = col,
+            .init_start_row = row,
+            .init_end_col = col,
+            .init_end_row = row,
+        };
+    }
+
+    pub fn beginWord(self: *Selection, span: Span) void {
+        self.* = .{
+            .active = true,
+            .mode = .word,
+            .anchor_col = span.start_col,
+            .anchor_row = span.start_row,
+            .focus_col = span.end_col,
+            .focus_row = span.end_row,
+            .init_start_col = span.start_col,
+            .init_start_row = span.start_row,
+            .init_end_col = span.end_col,
+            .init_end_row = span.end_row,
+        };
+    }
+
+    pub fn beginLine(self: *Selection, span: Span) void {
+        self.* = .{
+            .active = true,
+            .mode = .line,
+            .anchor_col = span.start_col,
+            .anchor_row = span.start_row,
+            .focus_col = span.end_col,
+            .focus_row = span.end_row,
+            .init_start_col = span.start_col,
+            .init_start_row = span.start_row,
+            .init_end_col = span.end_col,
+            .init_end_row = span.end_row,
+        };
     }
 
     pub fn update(self: *Selection, col: u16, row: u16) void {
@@ -19,8 +186,49 @@ pub const Selection = struct {
         self.focus_row = row;
     }
 
+    pub fn updateWordDrag(self: *Selection, grid: anytype, col: u16, row: u16) void {
+        const span = findWordSpan(grid, col, row);
+        if (span.end_row > self.init_end_row or (span.end_row == self.init_end_row and span.end_col >= self.init_end_col)) {
+            self.anchor_col = self.init_start_col;
+            self.anchor_row = self.init_start_row;
+            self.focus_col = span.end_col;
+            self.focus_row = span.end_row;
+        } else if (span.start_row < self.init_start_row or (span.start_row == self.init_start_row and span.start_col <= self.init_start_col)) {
+            self.anchor_col = self.init_end_col;
+            self.anchor_row = self.init_end_row;
+            self.focus_col = span.start_col;
+            self.focus_row = span.start_row;
+        } else {
+            self.anchor_col = self.init_start_col;
+            self.anchor_row = self.init_start_row;
+            self.focus_col = self.init_end_col;
+            self.focus_row = self.init_end_row;
+        }
+    }
+
+    pub fn updateLineDrag(self: *Selection, grid: anytype, row: u16) void {
+        const span = findLineSpan(grid, row);
+        if (span.end_row >= self.init_end_row) {
+            self.anchor_col = self.init_start_col;
+            self.anchor_row = self.init_start_row;
+            self.focus_col = span.end_col;
+            self.focus_row = span.end_row;
+        } else {
+            self.anchor_col = self.init_end_col;
+            self.anchor_row = self.init_end_row;
+            self.focus_col = span.start_col;
+            self.focus_row = span.start_row;
+        }
+    }
+
     pub fn clear(self: *Selection) void {
         self.active = false;
+        self.mode = .cell;
+    }
+
+    /// True when this selection is an un-dragged single cell in cell mode.
+    pub fn isSingleCell(self: *const Selection) bool {
+        return self.mode == .cell and self.anchor_col == self.focus_col and self.anchor_row == self.focus_row;
     }
 
     /// Normalized row range (caller maps through scrollback offset).
@@ -178,4 +386,154 @@ test "selection extract joins wrapped rows" {
     const got = try s.extract(std.testing.allocator, &g) orelse return error.Fail;
     defer std.testing.allocator.free(got);
     try std.testing.expectEqualStrings("abcdef", got);
+}
+
+test "charClass categorization" {
+    try std.testing.expectEqual(CharClass.space, charClass(' '));
+    try std.testing.expectEqual(CharClass.space, charClass('\t'));
+    try std.testing.expectEqual(CharClass.space, charClass(0));
+    try std.testing.expectEqual(CharClass.space, charClass(0x3000));
+
+    try std.testing.expectEqual(CharClass.delim, charClass('"'));
+    try std.testing.expectEqual(CharClass.delim, charClass('('));
+    try std.testing.expectEqual(CharClass.delim, charClass(')'));
+    try std.testing.expectEqual(CharClass.delim, charClass(';'));
+    try std.testing.expectEqual(CharClass.delim, charClass(':'));
+    try std.testing.expectEqual(CharClass.delim, charClass(0x2500)); // box line
+
+    try std.testing.expectEqual(CharClass.word, charClass('a'));
+    try std.testing.expectEqual(CharClass.word, charClass('Z'));
+    try std.testing.expectEqual(CharClass.word, charClass('0'));
+    try std.testing.expectEqual(CharClass.word, charClass('_'));
+    try std.testing.expectEqual(CharClass.word, charClass('-'));
+    try std.testing.expectEqual(CharClass.word, charClass('/'));
+    try std.testing.expectEqual(CharClass.word, charClass('.'));
+}
+
+test "word span and multi-click word selection" {
+    const grid_mod = @import("../term/grid.zig");
+    const G = grid_mod.Grid(.{});
+    var g = try G.init(std.testing.allocator, 25, 4);
+    defer g.deinit();
+
+    // Row 0: "echo /path/to/file.zig (ok)"
+    const text0 = "echo /path/to/file.zig (ok)";
+    for (text0, 0..) |ch, i| g.at(@intCast(i), 0).setRune(ch);
+
+    // Double-click on 'p' of "/path/to/file.zig" (col 5)
+    const span_path = findWordSpan(&g, 5, 0);
+    try std.testing.expectEqual(@as(u16, 5), span_path.start_col);
+    try std.testing.expectEqual(@as(u16, 21), span_path.end_col);
+    try std.testing.expectEqual(@as(u16, 0), span_path.start_row);
+    try std.testing.expectEqual(@as(u16, 0), span_path.end_row);
+
+    var s = Selection{};
+    s.beginWord(span_path);
+    const extracted_path = try s.extract(std.testing.allocator, &g) orelse return error.Fail;
+    defer std.testing.allocator.free(extracted_path);
+    try std.testing.expectEqualStrings("/path/to/file.zig", extracted_path);
+
+    // Double-click on 'echo' (col 1)
+    const span_echo = findWordSpan(&g, 1, 0);
+    try std.testing.expectEqual(@as(u16, 0), span_echo.start_col);
+    try std.testing.expectEqual(@as(u16, 3), span_echo.end_col);
+
+    // Double-click on '(' (col 23) -> delimiter span
+    const span_delim = findWordSpan(&g, 23, 0);
+    try std.testing.expectEqual(@as(u16, 23), span_delim.start_col);
+    try std.testing.expectEqual(@as(u16, 23), span_delim.end_col);
+}
+
+test "word span across wrapped lines" {
+    const grid_mod = @import("../term/grid.zig");
+    const G = grid_mod.Grid(.{});
+    var g = try G.init(std.testing.allocator, 5, 3);
+    defer g.deinit();
+
+    // Row 0: "https" (wrapped)
+    // Row 1: "://ex"
+    for ("https", 0..) |ch, i| g.at(@intCast(i), 0).setRune(ch);
+    g.at(4, 0).wrapped = true;
+    for ("://ex", 0..) |ch, i| g.at(@intCast(i), 1).setRune(ch);
+
+    // Clicking on 'e' (col 3, row 1)
+    const span = findWordSpan(&g, 3, 1);
+    try std.testing.expectEqual(@as(u16, 0), span.start_col);
+    try std.testing.expectEqual(@as(u16, 0), span.start_row);
+    try std.testing.expectEqual(@as(u16, 4), span.end_col);
+    try std.testing.expectEqual(@as(u16, 1), span.end_row);
+
+    var s = Selection{};
+    s.beginWord(span);
+    const extracted = try s.extract(std.testing.allocator, &g) orelse return error.Fail;
+    defer std.testing.allocator.free(extracted);
+    try std.testing.expectEqualStrings("https://ex", extracted);
+}
+
+test "line span across wrapped lines" {
+    const grid_mod = @import("../term/grid.zig");
+    const G = grid_mod.Grid(.{});
+    var g = try G.init(std.testing.allocator, 5, 3);
+    defer g.deinit();
+
+    for ("line1", 0..) |ch, i| g.at(@intCast(i), 0).setRune(ch);
+    g.at(4, 0).wrapped = true;
+    for ("line2", 0..) |ch, i| g.at(@intCast(i), 1).setRune(ch);
+    for ("line3", 0..) |ch, i| g.at(@intCast(i), 2).setRune(ch);
+
+    // Triple click on row 1 (continuation row)
+    const span = findLineSpan(&g, 1);
+    try std.testing.expectEqual(@as(u16, 0), span.start_col);
+    try std.testing.expectEqual(@as(u16, 0), span.start_row);
+    try std.testing.expectEqual(@as(u16, 4), span.end_col);
+    try std.testing.expectEqual(@as(u16, 1), span.end_row);
+
+    var s = Selection{};
+    s.beginLine(span);
+    const extracted = try s.extract(std.testing.allocator, &g) orelse return error.Fail;
+    defer std.testing.allocator.free(extracted);
+    try std.testing.expectEqualStrings("line1line2", extracted);
+}
+
+test "word drag extension" {
+    const grid_mod = @import("../term/grid.zig");
+    const G = grid_mod.Grid(.{});
+    var g = try G.init(std.testing.allocator, 20, 2);
+    defer g.deinit();
+
+    for ("alpha beta gamma", 0..) |ch, i| g.at(@intCast(i), 0).setRune(ch);
+
+    // Double-click "beta" (cols 6..9)
+    const span_beta = findWordSpan(&g, 7, 0);
+    var s = Selection{};
+    s.beginWord(span_beta);
+
+    // Drag forward to "gamma" (col 12)
+    s.updateWordDrag(&g, 12, 0);
+    const ext_forward = try s.extract(std.testing.allocator, &g) orelse return error.Fail;
+    defer std.testing.allocator.free(ext_forward);
+    try std.testing.expectEqualStrings("beta gamma", ext_forward);
+
+    // Drag backward to "alpha" (col 2)
+    s.updateWordDrag(&g, 2, 0);
+    const ext_backward = try s.extract(std.testing.allocator, &g) orelse return error.Fail;
+    defer std.testing.allocator.free(ext_backward);
+    try std.testing.expectEqualStrings("alpha beta", ext_backward);
+}
+
+test "isSingleCell detection" {
+    var s = Selection{};
+    s.begin(3, 4);
+    try std.testing.expect(s.isSingleCell());
+
+    s.update(4, 4);
+    try std.testing.expect(!s.isSingleCell());
+
+    s.update(3, 4);
+    try std.testing.expect(s.isSingleCell());
+
+    const span = Span{ .start_col = 3, .start_row = 4, .end_col = 3, .end_row = 4 };
+    s.beginWord(span);
+    // Word mode is not considered single cell (it was an explicit word selection)
+    try std.testing.expect(!s.isSingleCell());
 }

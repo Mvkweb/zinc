@@ -103,6 +103,8 @@ pub const Config = struct {
     // Input / clipboard / OSC.
     mouse: bool = true,
     selection: bool = true,
+    /// If false (default), single click does not display a 1-cell highlight until dragged.
+    selection_single_cell: bool = false,
     kitty_keyboard: bool = true,
     hyperlinks: bool = true,
     hyperlinks_init_cap: u16 = 16,
