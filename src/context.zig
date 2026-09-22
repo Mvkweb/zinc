@@ -5,6 +5,7 @@
 const std = @import("std");
 const config_mod = @import("config.zig");
 const grid_mod = @import("term/grid.zig");
+const cell_mod = @import("term/cell.zig");
 const parser_mod = @import("vt/parser.zig");
 const sgr_mod = @import("vt/sgr.zig");
 const osc_mod = @import("vt/osc.zig");
@@ -477,6 +478,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     if (!std.mem.eql(u8, parts.payload, "?")) {
                         if (osc_mod.parseColorSpec(parts.payload)) |c| {
                             self.cursor_color = c;
+                            self.grid.markAllDirty();
                         }
                     }
                 },
@@ -615,13 +617,13 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
             const cell = self.grid.at(self.cursor_col, self.cursor_row);
             cell.setRune(cp);
-            const fg = self.resolveColor(self.pen.fg, self.fg);
+            const fg = self.resolveColor(self.pen.fg);
             cell.fg = fg;
-            cell.bg = self.resolveColor(self.pen.bg, self.bg);
+            cell.bg = self.resolveColor(self.pen.bg);
             // Underline color defaults to the text color (sfte parity).
             cell.ul_color = switch (self.pen.ul.kind) {
                 .default => fg,
-                else => self.resolveColor(self.pen.ul, fg),
+                else => self.resolveColor(self.pen.ul),
             };
             cell.ul_style = if (!self.pen.underline) .none else switch (self.pen.ul_style) {
                 2 => .double,
@@ -656,11 +658,12 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
         }
 
-        fn resolveColor(self: *const Self, c: sgr_mod.Color, def: u32) u32 {
+        fn resolveColor(self: *const Self, c: sgr_mod.Color) u32 {
+            _ = self;
             return switch (c.kind) {
-                .default => def,
-                .indexed => self.palette[c.indexed],
-                .rgb => c.rgb,
+                .default => cell_mod.COLOR_DEFAULT,
+                .indexed => cell_mod.COLOR_INDEXED | @as(u32, c.indexed),
+                .rgb => c.rgb & 0xFFFFFF,
             };
         }
 
@@ -704,14 +707,14 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
             const last = @as(usize, self.scroll_bot) * self.grid.cols;
             const CellT = @TypeOf(self.grid.cells[0]);
-            const blank = CellT{ .fg = self.fg, .bg = self.bg, .ul_color = self.fg };
+            const blank = CellT{};
             @memset(self.grid.cells[last..][0..self.grid.cols], blank);
         }
 
         fn reverseIndex(self: *Self) void {
             self.pending_wrap = false;
             const CellT = @TypeOf(self.grid.cells[0]);
-            const blank = CellT{ .fg = self.fg, .bg = self.bg, .ul_color = self.fg };
+            const blank = CellT{};
             if (self.cursor_row == self.scroll_top) {
                 // scroll region down
                 var r = self.scroll_bot;
@@ -728,7 +731,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
 
         fn eraseDisplay(self: *Self, mode: u16) void {
             const CellT = @TypeOf(self.grid.cells[0]);
-            const blank = CellT{ .fg = self.fg, .bg = self.bg, .ul_color = self.fg };
+            const blank = CellT{};
             switch (mode) {
                 0 => { // cursor -> end
                     const start = self.grid.index(self.cursor_col, self.cursor_row);
@@ -751,7 +754,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
 
         fn eraseLine(self: *Self, mode: u16) void {
             const CellT = @TypeOf(self.grid.cells[0]);
-            const blank = CellT{ .fg = self.fg, .bg = self.bg, .ul_color = self.fg };
+            const blank = CellT{};
             const row_off = @as(usize, self.cursor_row) * self.grid.cols;
             switch (mode) {
                 0 => @memset(self.grid.cells[row_off + self.cursor_col ..][0 .. self.grid.cols - self.cursor_col], blank),
@@ -763,7 +766,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
 
         fn reset(self: *Self) void {
             const CellT = @TypeOf(self.grid.cells[0]);
-            const blank = CellT{ .fg = self.fg, .bg = self.bg, .ul_color = self.fg };
+            const blank = CellT{};
             @memset(self.grid.cells, blank);
             self.pen = .{};
             self.cursor_col = 0;
@@ -811,7 +814,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 self.alt_active,
                 &self.cursor_col,
                 &self.cursor_row,
-                self.bg,
+                cell_mod.COLOR_DEFAULT,
             ) catch {
                 self.grid.resizeCrop(cols, rows) catch {};
             };
@@ -932,9 +935,20 @@ test "osc 4 and osc 10/11/12 dynamic palette" {
 
     // Fastfetch-style print using 38;5;16 / 17 / 18
     ctx.parse("\x1b[38;5;16mA\x1b[38;5;17mB\x1b[38;5;18mC");
-    try std.testing.expectEqual(@as(u32, 0xa1cde1), ctx.grid.cells[0].fg);
-    try std.testing.expectEqual(@as(u32, 0xb4cad5), ctx.grid.cells[1].fg);
-    try std.testing.expectEqual(@as(u32, 0xd4dfff), ctx.grid.cells[2].fg);
+    try std.testing.expect(cell_mod.isIndexedColor(ctx.grid.cells[0].fg));
+    try std.testing.expectEqual(@as(u8, 16), cell_mod.colorIndex(ctx.grid.cells[0].fg));
+    try std.testing.expectEqual(@as(u32, 0xa1cde1), ctx.palette[cell_mod.colorIndex(ctx.grid.cells[0].fg)]);
+    try std.testing.expectEqual(@as(u8, 17), cell_mod.colorIndex(ctx.grid.cells[1].fg));
+    try std.testing.expectEqual(@as(u8, 18), cell_mod.colorIndex(ctx.grid.cells[2].fg));
+
+    // Dynamic palette update: changing OSC 4 updates the palette and cell dynamically reflects it!
+    ctx.parse("\x1b]4;16;rgb:ff/00/aa\x1b\\");
+    try std.testing.expectEqual(@as(u32, 0xff00aa), ctx.palette[cell_mod.colorIndex(ctx.grid.cells[0].fg)]);
+
+    // Unstyled print stores COLOR_DEFAULT sentinel so it dynamically tracks theme
+    ctx.parse("\x1b[0mD");
+    try std.testing.expect(cell_mod.isDefaultColor(ctx.grid.cells[3].fg));
+    try std.testing.expect(cell_mod.isDefaultColor(ctx.grid.cells[3].bg));
 }
 
 test "pending wrap keeps cursor in bounds at 1 col" {

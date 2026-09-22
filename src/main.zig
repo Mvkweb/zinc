@@ -345,6 +345,8 @@ fn dumpTranscript(io: std.Io, data: []const u8) void {
 test {
     // Pull every module's unit tests into `zig build test`.
     _ = @import("config.zig");
+    _ = @import("config/parser.zig");
+    _ = @import("config/loader.zig");
     _ = @import("context.zig");
     _ = @import("term/cell.zig");
     _ = @import("term/grid.zig");

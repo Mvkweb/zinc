@@ -140,12 +140,14 @@ pub fn probe(gpa: std.mem.Allocator, io: std.Io) !void {
 // ---------------------------------------------------------------------------
 
 const config_mod = @import("../config.zig");
+const config_loader = @import("../config/loader.zig");
 const context_mod = @import("../context.zig");
 const pty_mod = @import("../pty.zig");
 const input_kb = @import("../input/keyboard.zig");
 const selection_mod = @import("../input/selection.zig");
 const mouse_mod = @import("../input/mouse.zig");
 const hyperlink_mod = @import("../term/hyperlink.zig");
+const cell_mod = @import("../term/cell.zig");
 const software = @import("../render/software.zig");
 const box_drawing = @import("../render/box_drawing.zig");
 const ft_mod = @import("../font/ft.zig");
@@ -221,6 +223,20 @@ pub fn App(comptime cfg: config_mod.Config) type {
         cell_h: i32,
         ascent: i32,
         font_size_pt: f32 = cfg.font_default_size,
+
+        runtime_cfg: config_loader.RuntimeConfig = .{},
+        pad_x: u32 = cfg.pad_x,
+        pad_y: u32 = cfg.pad_y,
+        alt_pad_x: u32 = cfg.alt_pad_x,
+        alt_pad_y: u32 = cfg.alt_pad_y,
+        bg_opacity: u8 = cfg.bg_opacity,
+        selection_bg: u32 = cfg.selection_bg,
+        selection_fg: u32 = cfg.selection_fg,
+        link_color: u32 = cfg.link_color,
+        cursor_style: config_mod.CursorStyle = cfg.cursor_style,
+        cursor_blink: bool = cfg.cursor_blink,
+        cursor_thick_px: f32 = cfg.cursor_thick_px,
+        selection_single_cell: bool = cfg.selection_single_cell,
 
         display: ?*c.wl_display = null,
         registry: ?*WlRegistry = null,
@@ -341,6 +357,14 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         const Self = @This();
 
+        fn currentPadX(self: *const Self) u32 {
+            return if (self.ctx.alt_active) self.alt_pad_x else self.pad_x;
+        }
+
+        fn currentPadY(self: *const Self) u32 {
+            return if (self.ctx.alt_active) self.alt_pad_y else self.pad_y;
+        }
+
         // -- lifecycle ------------------------------------------------------
 
         pub fn open(gpa: std.mem.Allocator, io: std.Io) (AppError || std.mem.Allocator.Error)!*Self {
@@ -352,11 +376,21 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // would move the struct and strand every registration.
             const self = try gpa.create(Self);
 
+            var runtime_cfg = config_loader.loadOrCreate(gpa);
+            errdefer runtime_cfg.deinit(gpa);
+
+            const font_size_pt = runtime_cfg.font_size orelse cfg.font_default_size;
+            const font_path = runtime_cfg.font_family orelse cfg.font_path;
+            const px: u16 = @intFromFloat(@max(4.0, @min(256.0, @round(font_size_pt * cfg.font_dpi / 72.0))));
+
             // Font first: cell metrics size the default window.
             // Manual unwind until self exists (then errdefer self.deinit()).
             var ctx = try context_mod.Context(cfg).init(gpa);
-            const px: u16 = cfg.fontPx();
-            var ft_face = ft_mod.Face.init(gpa, io, px, cfg.font_path, cfg.nerd_font_path) catch {
+            if (runtime_cfg.bg) |color| ctx.bg = color;
+            if (runtime_cfg.fg) |color| ctx.fg = color;
+            if (runtime_cfg.cursor_color) |color| ctx.cursor_color = color;
+
+            var ft_face = ft_mod.Face.init(gpa, io, px, font_path, cfg.nerd_font_path) catch {
                 ctx.deinit();
                 return error.FontFailed;
             };
@@ -376,7 +410,20 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .cell_w = ft_face.cell_w,
                 .cell_h = ft_face.cell_h,
                 .ascent = ft_face.ascent,
-                .font_size_pt = cfg.font_default_size,
+                .font_size_pt = font_size_pt,
+                .runtime_cfg = runtime_cfg,
+                .pad_x = runtime_cfg.pad_x orelse cfg.pad_x,
+                .pad_y = runtime_cfg.pad_y orelse cfg.pad_y,
+                .alt_pad_x = runtime_cfg.alt_pad_x orelse cfg.alt_pad_x,
+                .alt_pad_y = runtime_cfg.alt_pad_y orelse cfg.alt_pad_y,
+                .bg_opacity = runtime_cfg.bg_opacity orelse cfg.bg_opacity,
+                .selection_bg = runtime_cfg.selection_bg orelse cfg.selection_bg,
+                .selection_fg = runtime_cfg.selection_fg orelse cfg.selection_fg,
+                .link_color = runtime_cfg.link_color orelse cfg.link_color,
+                .cursor_style = runtime_cfg.cursor_style orelse cfg.cursor_style,
+                .cursor_blink = runtime_cfg.cursor_blink orelse cfg.cursor_blink,
+                .cursor_thick_px = runtime_cfg.cursor_thick_px orelse cfg.cursor_thick_px,
+                .selection_single_cell = runtime_cfg.selection_single_cell orelse cfg.selection_single_cell,
             };
             errdefer {
                 self.deinit();
@@ -490,8 +537,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
             c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.SET_TITLE, @as([*:0]const u8, "zinc"));
             c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.SET_APP_ID, @as([*:0]const u8, "zinc"));
-            const min_w = @as(i32, 15) * self.cell_w + 2 * @as(i32, @intCast(cfg.pad_x));
-            const min_h = @as(i32, 3) * self.cell_h + 2 * @as(i32, @intCast(cfg.pad_y));
+            const min_w = @as(i32, 15) * self.cell_w + 2 * @as(i32, @intCast(self.currentPadX()));
+            const min_h = @as(i32, 3) * self.cell_h + 2 * @as(i32, @intCast(self.currentPadY()));
             c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.SET_MIN_SIZE, min_w, min_h);
             c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_COMMIT);
 
@@ -593,9 +640,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             // Default pixel size from font metrics until configure says otherwise.
             if (self.width == 0) {
-                const pad: i32 = @intCast(cfg.pad_x);
+                const pad: i32 = @intCast(self.currentPadX());
                 self.width = @as(i32, cfg.cols) * self.cell_w + 2 * pad;
-                self.height = @as(i32, cfg.rows) * self.cell_h + 2 * @as(i32, @intCast(cfg.pad_y));
+                self.height = @as(i32, cfg.rows) * self.cell_h + 2 * @as(i32, @intCast(self.currentPadY()));
             }
             try self.recreatePool();
 
@@ -663,6 +710,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.glyphs.deinit();
             self.atlas.deinit(self.gpa);
             self.ft_face.deinit();
+            self.runtime_cfg.deinit(self.gpa);
             if (self.display) |d| _ = c.wl_display_disconnect(d);
             self.ctx.deinit();
         }
@@ -760,8 +808,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// Apply alpha: only the default bg gets translucency (foot alpha-mode=matching).
         /// Stored premultiplied (foot/pixman ARGB8888 convention): RGB is
         /// scaled by alpha so the compositor doesn't over-contribute light.
-        fn themed(self: *Self, color: u32) u32 {
-            const a: u32 = if ((color & 0xFFFFFF) == (self.ctx.bg & 0xFFFFFF)) cfg.bg_opacity else 0xFF;
+        fn themed(self: *Self, color: u32, is_default_bg: bool) u32 {
+            const a: u32 = if (is_default_bg) self.bg_opacity else 0xFF;
             const r = ((color >> 16) & 0xFF) * a / 255;
             const g = ((color >> 8) & 0xFF) * a / 255;
             const b = (color & 0xFF) * a / 255;
@@ -791,8 +839,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
         }
 
         fn cellOffsets(self: *Self) struct { x: i32, y: i32 } {
-            const pad_x: i32 = if (self.ctx.alt_active) @intCast(cfg.alt_pad_x) else @intCast(cfg.pad_x);
-            const pad_y: i32 = if (self.ctx.alt_active) @intCast(cfg.alt_pad_y) else @intCast(cfg.pad_y);
+            const pad_x: i32 = @intCast(self.currentPadX());
+            const pad_y: i32 = @intCast(self.currentPadY());
             const cw: i32 = self.cell_w;
             const ch: i32 = self.cell_h;
             const cols: i32 = @as(i32, self.ctx.grid.cols);
@@ -807,8 +855,20 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         fn isCellSelected(self: *const Self, col: u16, row: u16) bool {
             if (!cfg.selection) return false;
-            if (!cfg.selection_single_cell and self.sel.isSingleCell()) return false;
+            if (!self.selection_single_cell and self.sel.isSingleCell()) return false;
             return self.sel.contains(col, row);
+        }
+
+        fn resolveFg(self: *const Self, raw: u32) u32 {
+            if (cell_mod.isDefaultColor(raw)) return self.ctx.fg;
+            if (cell_mod.isIndexedColor(raw)) return self.ctx.palette[cell_mod.colorIndex(raw)];
+            return raw & 0xFFFFFF;
+        }
+
+        fn resolveBg(self: *const Self, raw: u32) u32 {
+            if (cell_mod.isDefaultColor(raw)) return self.ctx.bg;
+            if (cell_mod.isIndexedColor(raw)) return self.ctx.palette[cell_mod.colorIndex(raw)];
+            return raw & 0xFFFFFF;
         }
 
         fn renderCells(self: *Self) software.Damage {
@@ -820,7 +880,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const py: i32 = offsets.y;
             const cw = self.cell_w;
             const ch = self.cell_h;
-            const bg_all = self.themed(self.ctx.bg);
+            const bg_all = self.themed(self.ctx.bg, true);
             software.fillRect(self.pool_pixels, W, H, 0, 0, W, H, bg_all, &dmg);
 
             const visible_cols = @min(self.ctx.grid.cols, @as(u16, @intCast(@max(0, @divFloor(self.width - px, cw)))));
@@ -833,21 +893,26 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 while (col < visible_cols) : (col += 1) {
                     const cell_ptr = self.ctx.grid.viewCell(col, row) orelse continue;
                     const cell = cell_ptr.*;
-                    var bg_straight: u32 = 0xFF000000 | (cell.bg & 0xFFFFFF);
-                    if (cell.attr.reverse) {
-                        bg_straight = 0xFF000000 | (cell.fg & 0xFFFFFF);
+                    const is_selected = self.isCellSelected(col, row);
+                    const is_reversed = cell.attr.reverse;
+                    const is_def_bg = cell_mod.isDefaultColor(cell.bg);
+
+                    // Skip drawing if default background (already filled by bg_all).
+                    if (is_def_bg and !is_reversed and !is_selected) continue;
+
+                    var bg_straight: u32 = undefined;
+                    if (is_selected) {
+                        bg_straight = self.selection_bg & 0xFFFFFF;
+                    } else if (is_reversed) {
+                        bg_straight = self.resolveFg(cell.fg) & 0xFFFFFF;
+                    } else {
+                        bg_straight = self.resolveBg(cell.bg) & 0xFFFFFF;
                     }
-                    // Selection highlight: two flat theme colors, readable on
-                    // any content (Ghostty-style, not per-cell reverse).
-                    if (self.isCellSelected(col, row)) {
-                        bg_straight = 0xFF000000 | (cfg.selection_bg & 0xFFFFFF);
-                    }
-                    const bg = self.themed(bg_straight);
-                    if (bg != bg_all) {
-                        const x: u32 = @intCast(px + @as(i32, col) * cw);
-                        const y: u32 = @intCast(py + @as(i32, row) * ch);
-                        software.fillRect(self.pool_pixels, W, H, x, y, @intCast(cw), @intCast(ch), bg, null);
-                    }
+
+                    const bg = self.themed(bg_straight, false);
+                    const x: u32 = @intCast(px + @as(i32, col) * cw);
+                    const y: u32 = @intCast(py + @as(i32, row) * ch);
+                    software.fillRect(self.pool_pixels, W, H, x, y, @intCast(cw), @intCast(ch), bg, null);
                 }
             }
 
@@ -868,13 +933,15 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     const cell = cell_ptr.*;
                     // fg stays straight-opaque for the coverage blend. Swap
                     // before converting so reverse video uses bg as fg.
-                    var fg: u32 = 0xFF000000 | (cell.fg & 0xFFFFFF);
-                    if (cell.attr.reverse) {
-                        fg = 0xFF000000 | (cell.bg & 0xFFFFFF);
-                    }
+                    var fg_raw: u32 = undefined;
                     if (self.isCellSelected(col, row)) {
-                        fg = 0xFF000000 | (cfg.selection_fg & 0xFFFFFF);
+                        fg_raw = self.selection_fg & 0xFFFFFF;
+                    } else if (cell.attr.reverse) {
+                        fg_raw = self.resolveBg(cell.bg) & 0xFFFFFF;
+                    } else {
+                        fg_raw = self.resolveFg(cell.fg) & 0xFFFFFF;
                     }
+                    var fg: u32 = 0xFF000000 | (fg_raw & 0xFFFFFF);
                     if (cell.attr.dim) {
                         const r = ((fg >> 16) & 0xFF) * 2 / 3;
                         const g = ((fg >> 8) & 0xFF) * 2 / 3;
@@ -952,7 +1019,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         // Underlines: single/double bars, triangle-wave
                         // curly, dotted and dashed variants.
                         if (cell.ul_style != .none) {
-                            const ucol = self.themed(cell.ul_color);
+                            const ucol_raw = if (cell_mod.isDefaultColor(cell.ul_color))
+                                self.resolveFg(cell.fg)
+                            else if (cell_mod.isIndexedColor(cell.ul_color))
+                                self.ctx.palette[cell_mod.colorIndex(cell.ul_color)]
+                            else
+                                cell.ul_color;
+                            const ucol = 0xFF000000 | (ucol_raw & 0xFFFFFF);
                             // Foot parity: font underline metrics when present,
                             // estimates otherwise. Clamped inside the cell.
                             const uh: u32 = if (self.ft_face.ul_thick_px > 0)
@@ -1012,23 +1085,23 @@ pub fn App(comptime cfg: config_mod.Config) type {
                             const ymax: i32 = ytop + ch - @as(i32, @intCast(uh));
                             const uy: u32 = @intCast(@max(ytop, @min(ytop + self.ascent + uoff, ymax)));
                             const cwu: u32 = @intCast(cw);
-                            software.fillRect(self.pool_pixels, W, H, x, uy, cwu, uh, self.themed(cfg.link_color), &dmg);
+                            software.fillRect(self.pool_pixels, W, H, x, uy, cwu, uh, self.themed(self.link_color, false), &dmg);
                         }
                     }
                 }
             }
             // Block cursor; hollow outline when unfocused; hidden on blink
             // phase, DECSET 25 reset, or while scrolled into history.
-            const show_cursor = (!cfg.cursor_blink or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0;
+            const show_cursor = (!self.cursor_blink or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0;
             if (show_cursor and self.ctx.cursor_col < visible_cols and self.ctx.cursor_row < visible_rows) {
                 const ccx: u32 = @intCast(px + @as(i32, self.ctx.cursor_col) * cw);
                 const ccy: u32 = @intCast(py + @as(i32, self.ctx.cursor_row) * ch);
-                const cur = self.themed(self.ctx.cursor_color);
+                const cur = self.themed(self.ctx.cursor_color, false);
                 const cwu: u32 = @intCast(cw);
                 const chu: u32 = @intCast(ch);
-                const t: u32 = @intCast(@max(1, @as(i32, @intFromFloat(@ceil(cfg.cursor_thick_px)))));
+                const t: u32 = @intCast(@max(1, @as(i32, @intFromFloat(@ceil(self.cursor_thick_px)))));
                 if (self.ctx.focused) {
-                    switch (cfg.cursor_style) {
+                    switch (self.cursor_style) {
                         .block => software.fillRect(self.pool_pixels, W, H, ccx, ccy, cwu, chu, cur, &dmg),
                         .bar => software.fillRect(self.pool_pixels, W, H, ccx, ccy, @min(t, cwu), chu, cur, &dmg),
                         .underline => software.fillRect(self.pool_pixels, W, H, ccx, ccy + chu - t, cwu, t, cur, &dmg),
@@ -1052,8 +1125,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (w == self.width and h == self.height) return;
             self.width = w;
             self.height = h;
-            const pad_x = if (self.ctx.alt_active) cfg.alt_pad_x else cfg.pad_x;
-            const pad_y = if (self.ctx.alt_active) cfg.alt_pad_y else cfg.pad_y;
+            const pad_x = self.currentPadX();
+            const pad_y = self.currentPadY();
             const cols: u16 = @intCast(@max(15, @divFloor(w - 2 * @as(i32, @intCast(pad_x)), self.cell_w)));
             const rows: u16 = @intCast(@max(3, @divFloor(h - 2 * @as(i32, @intCast(pad_y)), self.cell_h)));
 
@@ -1080,8 +1153,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
         }
 
         fn handleAltChange(self: *Self) void {
-            const pad_x = if (self.ctx.alt_active) cfg.alt_pad_x else cfg.pad_x;
-            const pad_y = if (self.ctx.alt_active) cfg.alt_pad_y else cfg.pad_y;
+            if (cfg.selection and self.sel.active) {
+                self.sel.clear();
+            }
+            const pad_x = self.currentPadX();
+            const pad_y = self.currentPadY();
             const cols: u16 = @intCast(@max(15, @divFloor(self.width - 2 * @as(i32, @intCast(pad_x)), self.cell_w)));
             const rows: u16 = @intCast(@max(3, @divFloor(self.height - 2 * @as(i32, @intCast(pad_y)), self.cell_h)));
             if (cols != self.ctx.grid.cols or rows != self.ctx.grid.rows) {
@@ -1105,7 +1181,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         fn zoomReset(self: *Self) void {
             if (!cfg.font_zoom) return;
-            self.setFontSize(cfg.font_default_size);
+            const default_pt = self.runtime_cfg.font_size orelse cfg.font_default_size;
+            self.setFontSize(default_pt);
         }
 
         fn setFontSize(self: *Self, new_pt: f32) void {
@@ -1122,8 +1199,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.atlas.clear();
             self.glyphs.clearRetainingCapacity();
 
-            const pad_x = if (self.ctx.alt_active) cfg.alt_pad_x else cfg.pad_x;
-            const pad_y = if (self.ctx.alt_active) cfg.alt_pad_y else cfg.pad_y;
+            const pad_x = self.currentPadX();
+            const pad_y = self.currentPadY();
             const cols: u16 = @intCast(@max(15, @divFloor(self.width - 2 * @as(i32, @intCast(pad_x)), self.cell_w)));
             const rows: u16 = @intCast(@max(3, @divFloor(self.height - 2 * @as(i32, @intCast(pad_y)), self.cell_h)));
 
@@ -1234,6 +1311,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         const prev_alt = self.ctx.alt_active;
                         self.ctx.parse(pty_buf[0..rrc]);
                         if (self.ctx.mouse_mode != prev_mouse_mode) {
+                            if (self.ctx.mouse_mode != .off and cfg.selection and self.sel.active) {
+                                self.sel.clear();
+                            }
                             self.refreshCursor();
                         }
                         if (self.ctx.alt_active != prev_alt) {
@@ -1554,7 +1634,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
         fn copySelection(self: *Self) void {
             if (!cfg.clipboard) return;
             if (!self.sel.active) return;
-            if (!cfg.selection_single_cell and self.sel.isSingleCell()) return;
+            if (!self.selection_single_cell and self.sel.isSingleCell()) return;
             const text = (self.sel.extract(self.gpa, &self.ctx.grid) catch return) orelse return;
             errdefer self.gpa.free(text);
             if (self.data_device == null or self.ddm == null) {
@@ -2247,11 +2327,19 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Compositor repeats ignored: our timerfd is the single source.
             if (key_state != 1) return;
             const sym = xkb_state_key_get_one_sym(self.xkb_state, keycode);
+
+            // Dismiss active text selection on any typing key except Ctrl+Shift+C (copy).
+            const c_held = xkb_state_mod_name_is_active(self.xkb_state, "Control", XKB_STATE_MODS_EFFECTIVE) > 0;
+            const s_held = xkb_state_mod_name_is_active(self.xkb_state, "Shift", XKB_STATE_MODS_EFFECTIVE) > 0;
+            const is_copy_chord = (c_held and s_held) and (sym == 'C' or sym == 'c');
+            if (cfg.selection and self.sel.active and sym < 0xFFE0 and !is_copy_chord) {
+                self.sel.clear();
+                self.needs_render = true;
+            }
+
             self.handleSym(sym, keycode);
             // Arm repeat for non-modifier keys (modifiers live >= 0xFFE0).
             // Clipboard chords never repeat (would re-fire copy/paste).
-            const c_held = xkb_state_mod_name_is_active(self.xkb_state, "Control", XKB_STATE_MODS_EFFECTIVE) > 0;
-            const s_held = xkb_state_mod_name_is_active(self.xkb_state, "Shift", XKB_STATE_MODS_EFFECTIVE) > 0;
             const is_clip_chord = (c_held and s_held) and (sym == 'C' or sym == 'c' or sym == 'V' or sym == 'v');
             if (sym < 0xFFE0 and !is_clip_chord and self.repeat_delay > 0 and self.repeat_fd >= 0) {
                 self.repeat_sym = sym;

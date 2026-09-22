@@ -20,7 +20,11 @@ fn cellCp(rune: anytype) u21 {
 fn isCellBlank(comptime cfg: config_mod.Config, cell: cell_mod.Cell(cfg), def_bg: u32) bool {
     if (cell.rune != ' ' and cell.rune != 0) return false;
     if (cell.combining_count > 0) return false;
-    if ((cell.bg & 0xFFFFFF) != (def_bg & 0xFFFFFF)) return false;
+    const is_def = cell_mod.isDefaultColor(cell.bg) or
+        cell_mod.isDefaultColor(def_bg) or
+        ((cell.bg & 0xFFFFFF) == (def_bg & 0xFFFFFF)) or
+        ((cell.bg & 0xFFFFFF) == (cfg.bg & 0xFFFFFF));
+    if (!is_def) return false;
     if (cell.attr.reverse or cell.attr.underline or cell.attr.strikethrough) return false;
     if (cell.ul_style != .none) return false;
     return true;
@@ -159,6 +163,10 @@ pub fn reflowGrid(
 
     var tracked_cursor_row: ?usize = null;
     var tracked_cursor_col: u16 = 0;
+    const filler_bg = if (cell_mod.isDefaultColor(def_bg) or (def_bg & 0xFFFFFF) == (cfg.bg & 0xFFFFFF))
+        cell_mod.COLOR_DEFAULT
+    else
+        def_bg;
 
     var row_idx: usize = 0;
     while (row_idx < total_input) {
@@ -259,7 +267,7 @@ pub fn reflowGrid(
         var col: u16 = 0;
         var cur_row: ?[]C = try gpa.alloc(C, new_cols);
         errdefer if (cur_row) |r| gpa.free(r);
-        @memset(cur_row.?, .{ .bg = def_bg });
+        @memset(cur_row.?, .{ .bg = filler_bg });
 
         if (line_cells.items.len == 0) {
             if (cursor_offset_in_line != null) {
@@ -281,10 +289,10 @@ pub fn reflowGrid(
                 const cell = line_cells.items[i];
                 const is_wide = utf8_mod.isWide(cellCp(cell.rune));
                 if (is_wide and col == new_cols - 1) {
-                    cur_row.?[col] = .{ .bg = def_bg, .wrapped = true };
+                    cur_row.?[col] = .{ .bg = filler_bg, .wrapped = true };
                     try out_rows.append(gpa, cur_row.?);
                     cur_row = try gpa.alloc(C, new_cols);
-                    @memset(cur_row.?, .{ .bg = def_bg });
+                    @memset(cur_row.?, .{ .bg = filler_bg });
                     col = 0;
                     if (cursor_offset_in_line) |coff| {
                         if (i == coff) {
@@ -303,7 +311,7 @@ pub fn reflowGrid(
                         cur_row.?[new_cols - 1].wrapped = true;
                         try out_rows.append(gpa, cur_row.?);
                         cur_row = try gpa.alloc(C, new_cols);
-                        @memset(cur_row.?, .{ .bg = def_bg });
+                        @memset(cur_row.?, .{ .bg = filler_bg });
                         col = 0;
                     } else {
                         cur_row.?[new_cols - 1].wrapped = false;
@@ -328,7 +336,7 @@ pub fn reflowGrid(
 
             if (col > 0) {
                 while (col < new_cols) : (col += 1) {
-                    cur_row.?[col] = .{ .bg = def_bg };
+                    cur_row.?[col] = .{ .bg = filler_bg };
                 }
                 cur_row.?[new_cols - 1].wrapped = false;
                 try out_rows.append(gpa, cur_row.?);
@@ -380,7 +388,7 @@ pub fn reflowGrid(
     // Live screen gets rows st .. min(st + new_rows, total_lines)
     const copy_lines = @min(total_lines - st, @as(usize, new_rows));
     const new_cells = try gpa.alloc(C, @as(usize, new_cols) * new_rows);
-    @memset(new_cells, .{ .bg = def_bg });
+    @memset(new_cells, .{ .bg = filler_bg });
 
     for (0..copy_lines) |line_i| {
         const src_r = out_rows.items[st + line_i];
@@ -400,7 +408,7 @@ pub fn reflowGrid(
     // Alt-screen crop
     if (cfg.alt_screen and grid.alt_cells.len > 0) {
         const new_alt = try grid.gpa.alloc(C, @as(usize, new_cols) * new_rows);
-        @memset(new_alt, .{ .bg = def_bg });
+        @memset(new_alt, .{ .bg = filler_bg });
         const copy_c = @min(new_cols, old_cols);
         const copy_r = @min(new_rows, old_rows);
         var ar: u16 = 0;
