@@ -9,6 +9,7 @@ const c = @import("c");
 extern "c" fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
 extern "c" fn fwrite(ptr: [*]const u8, size: usize, nmemb: usize, stream: *anyopaque) usize;
 extern "c" fn fclose(stream: *anyopaque) c_int;
+extern "c" fn malloc_trim(pad: usize) c_int;
 const wl_proto = @import("wl_proto.zig");
 
 pub const BackendError = error{
@@ -332,6 +333,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
         is_resizing: bool = false,
         pending_cols: u16 = 0,
         pending_rows: u16 = 0,
+        last_activity_ms: i64 = 0,
+        idle_trimmed: bool = false,
+        cursor_only_render: bool = false,
+        /// Adaptive atlas: grown 512 -> 1024 once on first AtlasFull.
+        atlas_grown: bool = false,
+        /// Blink deep-sleep state (transition-only debug log).
+        deep_sleep: bool = false,
 
         pty_pid: i32 = 0,
         pty_fd: i32 = -1,
@@ -658,6 +666,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Key-repeat timer (soft-fail: no repeat, but a working terminal).
             const tfd = linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true });
             if (linux.errno(tfd) == .SUCCESS) self.repeat_fd = @intCast(tfd);
+            self.last_activity_ms = context_mod.nowMs();
+            _ = malloc_trim(0);
 
             return self;
         }
@@ -828,12 +838,37 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (self.glyphs.get(key)) |b| return b;
             const baked = self.ft_face.bake(&self.atlas, cp, style) catch |err| blk: {
                 if (err != error.AtlasFull) return null;
+                if (!self.atlas_grown and self.atlas.size < 1024) {
+                    // First overflow: grow 512 -> 1024 once instead of
+                    // wiping (avoids re-bake storms on Nerd-heavy screens).
+                    self.atlas.resize(self.gpa, 1024) catch {
+                        self.atlas.clear();
+                        self.glyphs.clearRetainingCapacity();
+                        self.ctx.grid.markAllDirty();
+                        break :blk self.ft_face.bake(&self.atlas, cp, style) catch return null;
+                    };
+                    self.atlas_grown = true;
+                    self.glyphs.clearRetainingCapacity();
+                    self.ctx.grid.markAllDirty();
+                    memDbg("atlas grown 512->1024 (first AtlasFull)\n", .{});
+                    break :blk self.ft_face.bake(&self.atlas, cp, style) catch return null;
+                }
                 // Atlas full: wipe and rebake (all rows already dirty).
                 self.atlas.clear();
                 self.glyphs.clearRetainingCapacity();
                 self.ctx.grid.markAllDirty();
                 break :blk self.ft_face.bake(&self.atlas, cp, style) catch return null;
             };
+            if (self.glyphs.count() >= @as(usize, cfg.font_glyph_cap)) {
+                // Unbounded HashMap guard: wipe once at cap (rare; typical
+                // working sets are in the hundreds, cap is 4096).
+                self.atlas.clear();
+                self.glyphs.clearRetainingCapacity();
+                self.ctx.grid.markAllDirty();
+                const fresh = self.ft_face.bake(&self.atlas, cp, style) catch return null;
+                self.glyphs.put(key, fresh) catch {};
+                return fresh;
+            }
             self.glyphs.put(key, baked) catch {};
             return baked;
         }
@@ -1117,6 +1152,115 @@ pub fn App(comptime cfg: config_mod.Config) type {
             return dmg;
         }
 
+        fn renderCursorCell(self: *Self) software.Damage {
+            var dmg = software.Damage{};
+            const W: u32 = @intCast(self.width);
+            const H: u32 = @intCast(self.height);
+            const offsets = self.cellOffsets();
+            const px: i32 = offsets.x;
+            const py: i32 = offsets.y;
+            const cw: i32 = self.cell_w;
+            const ch: i32 = self.cell_h;
+            const col = self.ctx.cursor_col;
+            const row = self.ctx.cursor_row;
+
+            if (col >= self.ctx.grid.cols or row >= self.ctx.grid.rows) return dmg;
+            const ccx_i: i32 = px + @as(i32, col) * cw;
+            const ccy_i: i32 = py + @as(i32, row) * ch;
+            const ccx: u32 = @intCast(ccx_i);
+            const ccy: u32 = @intCast(ccy_i);
+            const cwu: u32 = @intCast(cw);
+            const chu: u32 = @intCast(ch);
+
+            // 1. Fill the cursor cell background
+            const cell_ptr = self.ctx.grid.viewCell(col, row);
+            const cell = if (cell_ptr) |cp| cp.* else cell_mod.Cell(cfg){};
+            const is_selected = self.isCellSelected(col, row);
+            const is_reversed = cell.attr.reverse;
+            const is_def_bg = cell_mod.isDefaultColor(cell.bg) and !is_reversed and !is_selected;
+
+            var bg_straight: u32 = undefined;
+            if (is_selected) {
+                bg_straight = self.selection_bg & 0xFFFFFF;
+            } else if (is_reversed) {
+                bg_straight = self.resolveFg(cell.fg) & 0xFFFFFF;
+            } else if (cell_mod.isDefaultColor(cell.bg)) {
+                bg_straight = self.ctx.bg & 0xFFFFFF;
+            } else if (cell_mod.isIndexedColor(cell.bg)) {
+                bg_straight = self.ctx.palette[cell_mod.colorIndex(cell.bg)] & 0xFFFFFF;
+            } else {
+                bg_straight = cell.bg & 0xFFFFFF;
+            }
+            const bg_color = self.themed(bg_straight, is_def_bg);
+            software.fillRect(self.pool_pixels, W, H, ccx, ccy, cwu, chu, bg_color, &dmg);
+
+            // 2. Draw glyph if non-blank
+            if (cell.rune != 0 and cell.rune != ' ') {
+                const fg_straight = if (is_selected)
+                    self.selection_fg & 0xFFFFFF
+                else if (is_reversed)
+                    self.resolveBg(cell.bg) & 0xFFFFFF
+                else
+                    self.resolveFg(cell.fg) & 0xFFFFFF;
+                const fg_color = self.themed(fg_straight, false);
+                const cp = cellCp(cell.rune);
+                var drawn_box = false;
+                if (box_drawing.isBlockElement(cp)) {
+                    drawn_box = box_drawing.draw(self.pool_pixels, W, H, ccx, ccy, cw, ch, cp, fg_color, &dmg);
+                }
+                if (!drawn_box) {
+                    const style: ft_mod.Style = if (cell.attr.bold and cell.attr.italic)
+                        .bold_italic
+                    else if (cell.attr.bold)
+                        .bold
+                    else if (cell.attr.italic)
+                        .italic
+                    else
+                        .regular;
+                    if (self.glyphFor(cp, style)) |g| {
+                        const gdmg = software.blitGlyph(
+                            self.pool_pixels,
+                            W,
+                            H,
+                            self.atlas.pixels,
+                            self.atlas.size,
+                            g.x,
+                            g.y,
+                            g.w,
+                            g.h,
+                            g.xoff,
+                            g.yoff,
+                            @intCast(ccx),
+                            @as(i32, @intCast(ccy)) + self.ascent,
+                            fg_color,
+                        );
+                        dmgMerge(&dmg, gdmg);
+                    }
+                }
+            }
+
+            // 3. Draw cursor overlay if visible
+            const show_cursor = (!self.cursor_blink or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0;
+            if (show_cursor) {
+                const cur = self.themed(self.ctx.cursor_color, false);
+                const t: u32 = @intCast(@max(1, @as(i32, @intFromFloat(@ceil(self.cursor_thick_px)))));
+                if (self.ctx.focused) {
+                    switch (self.cursor_style) {
+                        .block => software.fillRect(self.pool_pixels, W, H, ccx, ccy, cwu, chu, cur, &dmg),
+                        .bar => software.fillRect(self.pool_pixels, W, H, ccx, ccy, @min(t, cwu), chu, cur, &dmg),
+                        .underline => software.fillRect(self.pool_pixels, W, H, ccx, ccy + chu - t, cwu, t, cur, &dmg),
+                    }
+                } else {
+                    const ot: u32 = @intCast(@max(1, @divFloor(cw, 8)));
+                    software.fillRect(self.pool_pixels, W, H, ccx, ccy, cwu, ot, cur, &dmg);
+                    software.fillRect(self.pool_pixels, W, H, ccx, ccy + chu - ot, cwu, ot, cur, &dmg);
+                    software.fillRect(self.pool_pixels, W, H, ccx, ccy, ot, chu, cur, &dmg);
+                    software.fillRect(self.pool_pixels, W, H, ccx + cwu - ot, ccy, ot, chu, cur, &dmg);
+                }
+            }
+            return dmg;
+        }
+
         var prof_frames: u32 = 0;
         var prof_last_sec: i64 = 0;
 
@@ -1221,7 +1365,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.recreatePool() catch return;
             const is_prof = std.c.getenv("ZINC_PROFILE") != null;
             const t0: i64 = if (is_prof) context_mod.nowMs() else 0;
-            const dmg = self.renderCells();
+            const is_cursor_only = self.cursor_only_render and self.pending_resize == null and self.resize_settle_ms == 0;
+            self.cursor_only_render = false;
+            const dmg = if (is_cursor_only) self.renderCursorCell() else self.renderCells();
             const t1: i64 = if (is_prof) context_mod.nowMs() else 0;
             if (is_prof) {
                 prof_frames += 1;
@@ -1259,6 +1405,19 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         // -- main loop ------------------------------------------------------
 
+        fn markActivity(self: *Self) void {
+            const now = context_mod.nowMs();
+            if (self.deep_sleep) {
+                self.deep_sleep = false;
+                memDbg("deep sleep exit idle_ms={}\n", .{now - self.last_activity_ms});
+            }
+            self.last_activity_ms = now;
+            self.idle_trimmed = false;
+            // Resume crisp blinking on any real activity.
+            self.ctx.blink_visible = true;
+            self.ctx.blink_last_ms = now;
+        }
+
         pub fn run(self: *Self) void {
             const wl_fd = c.wl_display_get_fd(self.display);
             var pty_buf: [4096]u8 = undefined;
@@ -1274,6 +1433,12 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 };
                 const nfds: usize = if (self.repeat_fd >= 0) 3 else 2;
                 var poll_timeout: i32 = self.ctx.getTimeoutMs();
+                // Blink deep-sleep: past the inactivity timeout the cursor
+                // is solid and the timer disarms, so poll blocks forever
+                // (zero wakeups). Checked against last_activity_ms — never
+                // the self-resetting blink phase — so it actually fires.
+                const pre_idle = context_mod.nowMs() - self.last_activity_ms;
+                if (pre_idle >= cfg.cursor_blink_timeout_ms) poll_timeout = -1;
                 if (self.resize_settle_ms > 0) {
                     const now = context_mod.nowMs();
                     if (now >= self.resize_settle_ms) {
@@ -1296,6 +1461,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 }
 
                 if ((fds[1].revents & linux.POLL.IN) != 0) {
+                    self.markActivity();
+                    self.cursor_only_render = false;
                     var iters: u8 = 0;
                     while (iters < 4) : (iters += 1) {
                         const rrc = linux.read(self.pty_fd, &pty_buf, pty_buf.len);
@@ -1324,6 +1491,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     }
                 }
                 if (nfds == 3 and (fds[2].revents & linux.POLL.IN) != 0) {
+                    self.markActivity();
+                    self.cursor_only_render = false;
                     // Repeat tick: drain the timer, re-emit, go periodic.
                     var exp: u64 = 0;
                     _ = linux.read(self.repeat_fd, @ptrCast(&exp), 8);
@@ -1336,9 +1505,43 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         }
                     }
                 }
-                if (self.ctx.tick()) self.needs_render = true;
+                const tick_idle = context_mod.nowMs() - self.last_activity_ms;
+                if (tick_idle >= cfg.cursor_blink_timeout_ms) {
+                    // Deep sleep: keep the cursor solid with no timer.
+                    // One micro render on the transition, then silence.
+                    if (!self.ctx.blink_visible) {
+                        self.ctx.blink_visible = true;
+                        if (!self.needs_render) {
+                            self.cursor_only_render = true;
+                        }
+                        self.needs_render = true;
+                    }
+                    if (!self.deep_sleep) {
+                        self.deep_sleep = true;
+                        memDbg("deep sleep enter idle_ms={}\n", .{tick_idle});
+                    }
+                } else if (self.ctx.tick()) {
+                    if (!self.needs_render) {
+                        self.cursor_only_render = true;
+                    }
+                    self.needs_render = true;
+                }
                 if (self.needs_render and self.configured and !self.frame_pending) {
                     self.present();
+                }
+
+                // Idle settle trimming: if no PTY or input activity for 2000ms, reclaim free arena memory to Linux.
+                const now_idle = context_mod.nowMs();
+                if (!self.idle_trimmed and (now_idle - self.last_activity_ms >= 2000)) {
+                    const rc = malloc_trim(0);
+                    memDbg("trim idle_ms={} rc={} sb_len={} glyphs={} atlas={}\n", .{
+                        now_idle - self.last_activity_ms,
+                        rc,
+                        self.ctx.grid.sb_len,
+                        self.glyphs.count(),
+                        self.atlas.size,
+                    });
+                    self.idle_trimmed = true;
                 }
             }
         }
@@ -1627,6 +1830,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
         fn keyDbg(comptime fmt: []const u8, args: anytype) void {
             if (std.c.getenv("ZINC_DEBUG") == null) return;
             std.debug.print("[zinc key] " ++ fmt, args);
+        }
+
+        /// Transition-only idle/memory log (trim fired, atlas grown,
+        /// deep-sleep enter/exit). Zero output in steady state.
+        fn memDbg(comptime fmt: []const u8, args: anytype) void {
+            if (std.c.getenv("ZINC_DEBUG") == null) return;
+            std.debug.print("[zinc mem] " ++ fmt, args);
         }
 
         /// Copy the active selection to the Wayland clipboard (no-op when
@@ -1975,6 +2185,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
             _ = pointer;
             _ = time;
             const self: *Self = @ptrCast(@alignCast(data));
+            // Pointer motion alone is not activity: it must not reset the
+            // idle-trim / blink-sleep timers (hover changes already flag
+            // needs_render via updateHover/clearHover when they matter).
             self.ptr_sx = sx;
             self.ptr_sy = sy;
             const mods = self.currentMods();
@@ -2019,6 +2232,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
         fn appOnPointerButton(data: ?*anyopaque, pointer: ?*P.Pointer, serial: u32, time: u32, button: u32, state: u32) callconv(.c) void {
             _ = pointer;
             const self: *Self = @ptrCast(@alignCast(data));
+            self.markActivity();
+            self.cursor_only_render = false;
             self.last_serial = serial;
             self.ptr_serial = serial;
             if (!cfg.mouse) return;
@@ -2110,6 +2325,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             _ = pointer;
             _ = time;
             const self: *Self = @ptrCast(@alignCast(data));
+            self.markActivity();
+            self.cursor_only_render = false;
             if (!cfg.mouse) return;
             if (axis != 0) return; // vertical only
             const mods = self.currentMods();
@@ -2221,6 +2438,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
         fn appOnToplevelConfigure(data: ?*anyopaque, tl: ?*P.XdgToplevel, w: i32, h: i32, states: ?*P.Array) callconv(.c) void {
             _ = tl;
             const self: *Self = @ptrCast(@alignCast(data));
+            self.markActivity();
+            self.cursor_only_render = false;
             var is_resizing = false;
             if (states) |st| {
                 if (st.data) |ptr| {
@@ -2316,6 +2535,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             _ = kb;
             _ = time;
             const self: *Self = @ptrCast(@alignCast(data));
+            self.markActivity();
+            self.cursor_only_render = false;
             self.last_serial = serial;
             if (self.xkb_state == null) return;
             const keycode = key + 8; // evdev offset

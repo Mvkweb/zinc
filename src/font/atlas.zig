@@ -60,6 +60,19 @@ pub const Atlas = struct {
         self.cursor_y = 0;
         self.row_h = 0;
     }
+
+    /// Grow to a larger square (adaptive 512 -> 1024 on AtlasFull).
+    /// Allocates first so failure keeps the old buffer intact.
+    pub fn resize(self: *Atlas, gpa: std.mem.Allocator, new_size: u16) !void {
+        const pixels = try gpa.alloc(u8, @as(usize, new_size) * new_size);
+        @memset(pixels, 0);
+        gpa.free(self.pixels);
+        self.pixels = pixels;
+        self.size = new_size;
+        self.cursor_x = 0;
+        self.cursor_y = 0;
+        self.row_h = 0;
+    }
 };
 
 test "atlas packs rows" {

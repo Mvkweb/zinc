@@ -308,6 +308,71 @@ pub const Face = struct {
     ul_thick_px: u8 = 0,
     ul_pos_px: i8 = 0, // negative: below baseline
 
+    px: u16 = 0,
+    gpa: ?std.mem.Allocator = null,
+    io: ?std.Io = null,
+    ppath_buf: [1024]u8 = undefined,
+    ppath_len: usize = 0,
+    nerd_path_buf: [1024]u8 = undefined,
+    nerd_path_len: usize = 0,
+    bold_tried: bool = false,
+    italic_tried: bool = false,
+    bold_italic_tried: bool = false,
+    fallback_tried: [3]bool = [_]bool{false} ** 3,
+
+    pub fn ensureBold(self: *Face) ?c.FT_Face {
+        if (self.bold != null or self.bold_tried) return self.bold;
+        self.bold_tried = true;
+        const ppath = self.ppath_buf[0..self.ppath_len];
+        if (ppath.len > 0) {
+            self.bold = loadVariant(self.lib, self.px, ppath, &.{"Bold"});
+        }
+        return self.bold;
+    }
+
+    pub fn ensureItalic(self: *Face) ?c.FT_Face {
+        if (self.italic != null or self.italic_tried) return self.italic;
+        self.italic_tried = true;
+        const ppath = self.ppath_buf[0..self.ppath_len];
+        if (ppath.len > 0) {
+            self.italic = loadVariant(self.lib, self.px, ppath, &.{ "Italic", "Oblique" });
+        }
+        return self.italic;
+    }
+
+    pub fn ensureBoldItalic(self: *Face) ?c.FT_Face {
+        if (self.bold_italic != null or self.bold_italic_tried) return self.bold_italic;
+        self.bold_italic_tried = true;
+        const ppath = self.ppath_buf[0..self.ppath_len];
+        if (ppath.len > 0) {
+            self.bold_italic = loadVariant(self.lib, self.px, ppath, &.{ "BoldItalic", "BoldOblique" });
+        }
+        return self.bold_italic;
+    }
+
+    pub fn ensureFallback(self: *Face, slot: usize) ?c.FT_Face {
+        if (slot >= 3) return null;
+        if (self.fallbacks[slot] != null or self.fallback_tried[slot]) return self.fallbacks[slot];
+        self.fallback_tried[slot] = true;
+        const ppath = self.ppath_buf[0..self.ppath_len];
+        switch (slot) {
+            0 => {
+                if (self.gpa != null and self.io != null) {
+                    const npath = self.nerd_path_buf[0..self.nerd_path_len];
+                    self.fallbacks[0] = loadNerd(self.lib, self.gpa.?, self.io.?, self.px, npath, ppath);
+                }
+            },
+            1 => {
+                self.fallbacks[1] = loadFallback(self.lib, self.px, &UNICODE_FALLBACK_CANDIDATES, ppath, 0);
+            },
+            2 => {
+                self.fallbacks[2] = loadFallback(self.lib, self.px, &SYMBOLS_FALLBACK_CANDIDATES, ppath, 1);
+            },
+            else => {},
+        }
+        return self.fallbacks[slot];
+    }
+
     pub fn init(gpa: std.mem.Allocator, io: std.Io, px: u16, config_path: []const u8, nerd_path: []const u8) Error!Face {
         defer fc.deinit();
 
@@ -387,18 +452,18 @@ pub const Face = struct {
         }
         var self = primary orelse return error.NoFont;
         errdefer self.deinit();
-        // Real style variants live next to the primary file.
+        self.px = px;
+        self.gpa = gpa;
+        self.io = io;
         const ppath = ppath_buf[0..ppath_len];
-        if (ppath.len > 0) {
-            self.bold = loadVariant(lib, px, ppath, &.{"Bold"});
-            self.italic = loadVariant(lib, px, ppath, &.{ "Italic", "Oblique" });
-            self.bold_italic = loadVariant(lib, px, ppath, &.{ "BoldItalic", "BoldOblique" });
+        if (ppath.len <= self.ppath_buf.len) {
+            @memcpy(self.ppath_buf[0..ppath.len], ppath);
+            self.ppath_len = ppath.len;
         }
-        // Fallbacks: dedicated Nerd symbols, Unicode symbols (DejaVuMono for ↯, math),
-        // and extended symbols (NotoSansSymbols2).
-        self.fallbacks[0] = loadNerd(lib, gpa, io, px, nerd_path, ppath);
-        self.fallbacks[1] = loadFallback(lib, px, &UNICODE_FALLBACK_CANDIDATES, ppath, 0);
-        self.fallbacks[2] = loadFallback(lib, px, &SYMBOLS_FALLBACK_CANDIDATES, ppath, 1);
+        if (nerd_path.len <= self.nerd_path_buf.len) {
+            @memcpy(self.nerd_path_buf[0..nerd_path.len], nerd_path);
+            self.nerd_path_len = nerd_path.len;
+        }
         return self;
     }
 
@@ -714,6 +779,7 @@ pub const Face = struct {
     /// Dynamically change the raster pixel size of the face, style variants, and fallbacks.
     pub fn setPixelSize(self: *Face, px: u16) Error!void {
         if (px == 0) return error.InvalidSize;
+        self.px = px;
         if (c.FT_Set_Pixel_Sizes(self.face, 0, @intCast(px)) != 0) return error.SizeFailed;
         if (self.bold) |f| _ = c.FT_Set_Pixel_Sizes(f, 0, @intCast(px));
         if (self.italic) |f| _ = c.FT_Set_Pixel_Sizes(f, 0, @intCast(px));
@@ -755,33 +821,36 @@ pub const Face = struct {
     /// regular, then fallback faces (char index 0 = missing everywhere).
     /// Returns blank metrics instead of .notdef for missing glyphs.
     pub fn bake(self: *Face, atlas: *atlas_mod.Atlas, cp: u21, style: Style) Error!atlas_mod.Baked {
-        var cands: [5]?c.FT_Face = .{
-            null,
-            self.face,
-            self.fallbacks[0],
-            self.fallbacks[1],
-            self.fallbacks[2],
-        };
+        var style_face: ?c.FT_Face = null;
         switch (style) {
-            .regular => cands[0] = self.face,
-            .bold => cands[0] = self.bold,
-            .italic => cands[0] = self.italic,
-            .bold_italic => cands[0] = self.bold_italic,
+            .regular => style_face = self.face,
+            .bold => style_face = self.ensureBold(),
+            .italic => style_face = self.ensureItalic(),
+            .bold_italic => style_face = self.ensureBoldItalic(),
         }
         var target: ?c.FT_Face = null;
         var slot_n: u2 = 0;
-        var ci: usize = 0;
-        while (ci < cands.len) : (ci += 1) {
-            const f = cands[ci] orelse continue;
+        if (style_face) |f| {
             if (cp == 0 or c.FT_Get_Char_Index(f, @intCast(cp)) != 0) {
                 target = f;
-                slot_n = switch (ci) {
-                    0, 1 => 0,
-                    2 => 1,
-                    3 => 2,
-                    else => 3,
-                };
-                break;
+                slot_n = 0;
+            }
+        }
+        if (target == null and (style_face == null or style_face.? != self.face)) {
+            if (cp == 0 or c.FT_Get_Char_Index(self.face, @intCast(cp)) != 0) {
+                target = self.face;
+                slot_n = 0;
+            }
+        }
+        if (target == null) {
+            for (0..3) |slot_idx| {
+                if (self.ensureFallback(slot_idx)) |f| {
+                    if (cp == 0 or c.FT_Get_Char_Index(f, @intCast(cp)) != 0) {
+                        target = f;
+                        slot_n = @intCast(slot_idx + 1);
+                        break;
+                    }
+                }
             }
         }
         const t = target orelse {
