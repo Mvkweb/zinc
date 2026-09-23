@@ -336,10 +336,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
         last_activity_ms: i64 = 0,
         idle_trimmed: bool = false,
         cursor_only_render: bool = false,
-        /// Adaptive atlas: grown 512 -> 1024 once on first AtlasFull.
-        atlas_grown: bool = false,
-        /// Blink deep-sleep state (transition-only debug log).
-        deep_sleep: bool = false,
 
         pty_pid: i32 = 0,
         pty_fd: i32 = -1,
@@ -838,37 +834,12 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (self.glyphs.get(key)) |b| return b;
             const baked = self.ft_face.bake(&self.atlas, cp, style) catch |err| blk: {
                 if (err != error.AtlasFull) return null;
-                if (!self.atlas_grown and self.atlas.size < 1024) {
-                    // First overflow: grow 512 -> 1024 once instead of
-                    // wiping (avoids re-bake storms on Nerd-heavy screens).
-                    self.atlas.resize(self.gpa, 1024) catch {
-                        self.atlas.clear();
-                        self.glyphs.clearRetainingCapacity();
-                        self.ctx.grid.markAllDirty();
-                        break :blk self.ft_face.bake(&self.atlas, cp, style) catch return null;
-                    };
-                    self.atlas_grown = true;
-                    self.glyphs.clearRetainingCapacity();
-                    self.ctx.grid.markAllDirty();
-                    memDbg("atlas grown 512->1024 (first AtlasFull)\n", .{});
-                    break :blk self.ft_face.bake(&self.atlas, cp, style) catch return null;
-                }
                 // Atlas full: wipe and rebake (all rows already dirty).
                 self.atlas.clear();
                 self.glyphs.clearRetainingCapacity();
                 self.ctx.grid.markAllDirty();
                 break :blk self.ft_face.bake(&self.atlas, cp, style) catch return null;
             };
-            if (self.glyphs.count() >= @as(usize, cfg.font_glyph_cap)) {
-                // Unbounded HashMap guard: wipe once at cap (rare; typical
-                // working sets are in the hundreds, cap is 4096).
-                self.atlas.clear();
-                self.glyphs.clearRetainingCapacity();
-                self.ctx.grid.markAllDirty();
-                const fresh = self.ft_face.bake(&self.atlas, cp, style) catch return null;
-                self.glyphs.put(key, fresh) catch {};
-                return fresh;
-            }
             self.glyphs.put(key, baked) catch {};
             return baked;
         }
@@ -1406,16 +1377,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
         // -- main loop ------------------------------------------------------
 
         fn markActivity(self: *Self) void {
-            const now = context_mod.nowMs();
-            if (self.deep_sleep) {
-                self.deep_sleep = false;
-                memDbg("deep sleep exit idle_ms={}\n", .{now - self.last_activity_ms});
-            }
-            self.last_activity_ms = now;
+            self.last_activity_ms = context_mod.nowMs();
             self.idle_trimmed = false;
-            // Resume crisp blinking on any real activity.
-            self.ctx.blink_visible = true;
-            self.ctx.blink_last_ms = now;
         }
 
         pub fn run(self: *Self) void {
@@ -1433,12 +1396,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 };
                 const nfds: usize = if (self.repeat_fd >= 0) 3 else 2;
                 var poll_timeout: i32 = self.ctx.getTimeoutMs();
-                // Blink deep-sleep: past the inactivity timeout the cursor
-                // is solid and the timer disarms, so poll blocks forever
-                // (zero wakeups). Checked against last_activity_ms — never
-                // the self-resetting blink phase — so it actually fires.
-                const pre_idle = context_mod.nowMs() - self.last_activity_ms;
-                if (pre_idle >= cfg.cursor_blink_timeout_ms) poll_timeout = -1;
                 if (self.resize_settle_ms > 0) {
                     const now = context_mod.nowMs();
                     if (now >= self.resize_settle_ms) {
@@ -1505,22 +1462,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         }
                     }
                 }
-                const tick_idle = context_mod.nowMs() - self.last_activity_ms;
-                if (tick_idle >= cfg.cursor_blink_timeout_ms) {
-                    // Deep sleep: keep the cursor solid with no timer.
-                    // One micro render on the transition, then silence.
-                    if (!self.ctx.blink_visible) {
-                        self.ctx.blink_visible = true;
-                        if (!self.needs_render) {
-                            self.cursor_only_render = true;
-                        }
-                        self.needs_render = true;
-                    }
-                    if (!self.deep_sleep) {
-                        self.deep_sleep = true;
-                        memDbg("deep sleep enter idle_ms={}\n", .{tick_idle});
-                    }
-                } else if (self.ctx.tick()) {
+                if (self.ctx.tick()) {
                     if (!self.needs_render) {
                         self.cursor_only_render = true;
                     }
@@ -1533,14 +1475,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 // Idle settle trimming: if no PTY or input activity for 2000ms, reclaim free arena memory to Linux.
                 const now_idle = context_mod.nowMs();
                 if (!self.idle_trimmed and (now_idle - self.last_activity_ms >= 2000)) {
-                    const rc = malloc_trim(0);
-                    memDbg("trim idle_ms={} rc={} sb_len={} glyphs={} atlas={}\n", .{
-                        now_idle - self.last_activity_ms,
-                        rc,
-                        self.ctx.grid.sb_len,
-                        self.glyphs.count(),
-                        self.atlas.size,
-                    });
+                    _ = malloc_trim(0);
                     self.idle_trimmed = true;
                 }
             }
@@ -1830,13 +1765,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
         fn keyDbg(comptime fmt: []const u8, args: anytype) void {
             if (std.c.getenv("ZINC_DEBUG") == null) return;
             std.debug.print("[zinc key] " ++ fmt, args);
-        }
-
-        /// Transition-only idle/memory log (trim fired, atlas grown,
-        /// deep-sleep enter/exit). Zero output in steady state.
-        fn memDbg(comptime fmt: []const u8, args: anytype) void {
-            if (std.c.getenv("ZINC_DEBUG") == null) return;
-            std.debug.print("[zinc mem] " ++ fmt, args);
         }
 
         /// Copy the active selection to the Wayland clipboard (no-op when
@@ -2185,9 +2113,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             _ = pointer;
             _ = time;
             const self: *Self = @ptrCast(@alignCast(data));
-            // Pointer motion alone is not activity: it must not reset the
-            // idle-trim / blink-sleep timers (hover changes already flag
-            // needs_render via updateHover/clearHover when they matter).
+            self.markActivity();
             self.ptr_sx = sx;
             self.ptr_sy = sy;
             const mods = self.currentMods();

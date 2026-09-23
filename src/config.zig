@@ -80,10 +80,6 @@ pub const Config = struct {
     // Cursor / underline.
     cursor_blink: bool = true,
     cursor_blink_rate_ms: u32 = 500,
-    /// Idle deep-sleep: no input/PTY output for this long solidifies the
-    /// cursor and disarms the blink timer, so poll() blocks forever
-    /// (0 wakeups, 0.00% CPU). Any activity resumes blinking instantly.
-    cursor_blink_timeout_ms: u32 = 10000,
     cursor_dynamic: bool = true,
     /// Block, bar (beam), or underline. Foot.ini match: beam.
     cursor_style: CursorStyle = .bar,
