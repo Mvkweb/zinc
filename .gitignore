@@ -12,3 +12,6 @@ AGENTS.md
 *.swp
 *~
 .DS_Store
+
+# Local manual test scripts (kitty harness, not shipped)
+scripts/

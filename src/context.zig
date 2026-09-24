@@ -13,6 +13,10 @@ const scratch_mod = @import("util/scratch.zig");
 const utf8_mod = @import("util/utf8.zig");
 const pool_mod = @import("gfx/image_pool.zig");
 const sixel_mod = @import("gfx/sixel.zig");
+const kitty_mod = @import("gfx/kitty.zig");
+const placeholder_mod = @import("gfx/placeholder.zig");
+const png_mod = @import("util/png.zig");
+const inflate_mod = @import("util/inflate.zig");
 const mouse_mod = @import("input/mouse.zig");
 
 pub const WriteCb = *const fn (user_data: ?*anyopaque, data: []const u8) void;
@@ -32,6 +36,10 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         pen: sgr_mod.Attr = .{},
         cursor_col: u16 = 0,
         cursor_row: u16 = 0,
+        /// Cell pixel size for kitty image cursor-advance math. Set by the
+        /// backend after font load / zoom (defaults fit headless tests).
+        cell_w_px: u16 = 8,
+        cell_h_px: u16 = 16,
         /// Last-column flag (Ghostty `pending_wrap` parity): set when a print
         /// lands on the final column. cursor_col always stays a valid cell
         /// (< cols); the soft-wrap is performed by the NEXT print. Any
@@ -45,6 +53,11 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         scroll_bot: u16 = 0,
         osc_buf: std.ArrayList(u8),
         kitty_b64: std.ArrayList(u8),
+        /// Chunked-upload reassembly (m=1): payload accumulates here across
+        /// APC dispatches; kitty_ctrl holds the first chunk's control data.
+        kitty_data: std.ArrayList(u8),
+        kitty_ctrl: kitty_mod.Control = .{},
+        kitty_pending: bool = false,
         /// DCS payload (sixel data). Phase 4 streams this incrementally.
         dcs_buf: std.ArrayList(u8),
         images: pool_mod.Pool,
@@ -100,6 +113,8 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             errdefer osc_buf.deinit(gpa);
             var kitty_b64 = try std.ArrayList(u8).initCapacity(gpa, cfg.kitty_b64_init_cap);
             errdefer kitty_b64.deinit(gpa);
+            var kitty_data = try std.ArrayList(u8).initCapacity(gpa, cfg.kitty_b64_init_cap);
+            errdefer kitty_data.deinit(gpa);
             var dcs_buf = try std.ArrayList(u8).initCapacity(gpa, cfg.osc_init_cap);
             errdefer dcs_buf.deinit(gpa);
             var links = try std.ArrayList([]u8).initCapacity(gpa, cfg.hyperlinks_init_cap);
@@ -124,6 +139,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 .grid = grid,
                 .osc_buf = osc_buf,
                 .kitty_b64 = kitty_b64,
+                .kitty_data = kitty_data,
                 .dcs_buf = dcs_buf,
                 .links = links,
                 .images = images,
@@ -142,6 +158,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             self.grid.deinit();
             self.osc_buf.deinit(self.gpa);
             self.kitty_b64.deinit(self.gpa);
+            self.kitty_data.deinit(self.gpa);
             self.dcs_buf.deinit(self.gpa);
             for (self.links.items) |u| self.gpa.free(u);
             self.links.deinit(self.gpa);
@@ -156,6 +173,529 @@ pub fn Context(comptime cfg: config_mod.Config) type {
 
         fn emit(self: *Self, data: []const u8) void {
             if (self.write_cb) |cb| cb(self.write_user, data);
+        }
+
+        /// Reply to a kitty graphics command. q=0 responds to everything,
+        /// q=1 suppresses OK (errors still sent), q=2 suppresses all.
+        fn replyKitty(self: *Self, id: u32, quiet: u8, err_msg: ?[]const u8) void {
+            var rbuf: [64]u8 = undefined;
+            if (err_msg) |m| {
+                if (quiet == 2) return;
+                self.emit(kitty_mod.formatErr(&rbuf, id, m));
+            } else {
+                if (quiet != 0) return;
+                self.emit(kitty_mod.formatOk(&rbuf, id));
+            }
+        }
+
+        /// Kitty graphics APC entry. kitty_b64 holds `G<control>;<payload>`
+        /// (parser accumulates both; the ESC introducer/ST never land here).
+        /// Payload-less commands (`a=d`, `a=q`) carry no ';'.
+        fn dispatchKitty(self: *Self) void {
+            const buf = self.kitty_b64.items;
+            if (buf.len < 2 or buf[0] != 'G') return; // not kitty gfx: silent
+            const semi = std.mem.indexOfScalar(u8, buf, ';');
+            const ctrl_slice = if (semi) |s| buf[1..s] else buf[1..];
+            const payload: []const u8 = if (semi) |s| buf[s + 1 ..] else &.{};
+            const ctrl = kitty_mod.parseControl(ctrl_slice);
+            // Continuation chunks carry no action key (raw base64 is not
+            // k=v, so parse_err is meaningless here by design).
+            if (!ctrl.has_action) {
+                self.kittyContinue(ctrl, payload);
+                return;
+            }
+            if (ctrl.parse_err) |e| {
+                self.replyKitty(ctrl.image_id, ctrl.quiet, e);
+                return;
+            }
+            // A fresh action aborts any in-flight chunked upload (delete
+            // abort is spec-mandated; same rule for the rest is sane).
+            if (self.kitty_pending) self.abortKittyUpload();
+            switch (ctrl.action) {
+                .transmit, .transmit_and_place => self.kittyTransmit(ctrl, payload),
+                .query => self.kittyQuery(ctrl),
+                .delete => self.kittyDelete(ctrl),
+                .put => self.kittyPut(ctrl),
+                .unknown => self.replyKitty(ctrl.image_id, ctrl.quiet, "unsupported action"),
+            }
+        }
+
+        /// Release a transfer buffer back to init size when a large upload
+        /// ballooned it (else a 16MB PNG pins 16MB heap indefinitely).
+        fn shrinkTransferBuf(self: *Self, list: *std.ArrayList(u8)) void {
+            if (list.capacity > cfg.kitty_b64_max_cap / 16) {
+                list.deinit(self.gpa);
+                list.* = std.ArrayList(u8).initCapacity(self.gpa, cfg.kitty_b64_init_cap) catch std.ArrayList(u8).empty;
+            } else list.clearRetainingCapacity();
+        }
+
+        /// Drop in-flight chunked data.
+        fn abortKittyUpload(self: *Self) void {
+            self.kitty_pending = false;
+            self.kitty_ctrl = .{};
+            self.shrinkTransferBuf(&self.kitty_data);
+        }
+
+        /// Append a chunk; false when the reassembly cap is exceeded.
+        fn appendKittyChunk(self: *Self, payload: []const u8) bool {
+            if (self.kitty_data.items.len + payload.len > cfg.kitty_b64_max_cap) return false;
+            self.kitty_data.appendSlice(self.gpa, payload) catch return false;
+            return true;
+        }
+
+        /// Continuation chunk (no action key): accumulate while pending,
+        /// finalize on m=0 using the FIRST chunk's control data.
+        fn kittyContinue(self: *Self, ctrl: kitty_mod.Control, payload: []const u8) void {
+            if (!self.kitty_pending) {
+                self.replyKitty(ctrl.image_id, ctrl.quiet, "unexpected chunk");
+                return;
+            }
+            const q = self.kitty_ctrl.quiet;
+            const id = self.kitty_ctrl.image_id;
+            if (!self.appendKittyChunk(payload)) {
+                self.abortKittyUpload();
+                self.replyKitty(id, q, "image too large");
+                return;
+            }
+            if (ctrl.more) return; // wait for more; no reply yet
+            var saved = self.kitty_ctrl;
+            saved.more = false;
+            // Transmit synchronously off the retained buffer, then release.
+            self.kittyTransmit(saved, self.kitty_data.items);
+            self.abortKittyUpload();
+        }
+
+        /// Direct RGB/RGBA transmit (M1: single-shot m=0, medium direct).
+        fn kittyTransmit(self: *Self, ctrl: kitty_mod.Control, payload: []const u8) void {
+            const id = ctrl.image_id;
+            const q = ctrl.quiet;
+            if (id != 0 and ctrl.request_num != 0) {
+                self.replyKitty(id, q, "i and I mutually exclusive");
+                return;
+            }
+            if (ctrl.more) {
+                // First chunk: stash control, accumulate payload, wait.
+                self.kitty_ctrl = ctrl;
+                self.kitty_pending = true;
+                if (!self.appendKittyChunk(payload)) {
+                    self.abortKittyUpload();
+                    self.replyKitty(id, q, "image too large");
+                }
+                return;
+            }
+            if (ctrl.medium != 'd') {
+                self.replyKitty(id, q, "unsupported transmission medium");
+                return;
+            }
+            const bpp: usize = switch (ctrl.format) {
+                .rgb => 3,
+                .rgba => 4,
+                .png => {
+                    self.kittyTransmitPng(ctrl, payload);
+                    return;
+                },
+                else => {
+                    self.replyKitty(id, q, "unsupported format");
+                    return;
+                },
+            };
+            if (ctrl.compressed) {
+                self.kittyTransmitZlib(ctrl, payload);
+                return;
+            }
+            if (ctrl.img_w == 0 or ctrl.img_h == 0 or ctrl.img_w > 4096 or ctrl.img_h > 4096) {
+                self.replyKitty(id, q, "bad image dimensions");
+                return;
+            }
+            const expected: usize = @as(usize, ctrl.img_w) * ctrl.img_h * bpp;
+            // Single-transfer cap mirrors the reassembly buffer cap (M4
+            // adds a total-bytes storage quota on top).
+            if (expected > cfg.kitty_b64_max_cap) {
+                self.replyKitty(id, q, "image too large");
+                return;
+            }
+            const raw = kitty_mod.decodeToBytes(self.gpa, payload, expected) catch |e| {
+                const msg: []const u8 = switch (e) {
+                    error.OutOfMemory => "out of memory",
+                    error.BadBase64 => "bad base64 data",
+                    error.BadLength => "size mismatch",
+                };
+                self.replyKitty(id, q, msg);
+                return;
+            };
+            defer self.gpa.free(raw);
+            // Re-transmit replaces: existing image + placements go first.
+            if (id != 0) _ = self.images.deleteImage(id);
+            if (self.images.total_bytes + expected > @as(usize, cfg.img_pool_max_bytes)) {
+                self.replyKitty(id, q, "ENOMEM");
+                return;
+            }
+            const img = self.images.insert(ctrl.img_w, ctrl.img_h, false) catch {
+                self.replyKitty(id, q, "image store full");
+                return;
+            };
+            kitty_mod.swizzlePixels(img.pixels, raw, ctrl.format);
+            self.finishStore(ctrl, img);
+        }
+
+        /// Finalize a stored image: id assign, optional placement, replies.
+        /// img already holds pixels. Every outcome replies (quiet honored).
+        fn finishStore(self: *Self, ctrl: kitty_mod.Control, img: *pool_mod.Image) void {
+            const id = ctrl.image_id;
+            const q = ctrl.quiet;
+            if (id != 0) {
+                img.id = id;
+                var bump = id +% 1;
+                if (bump == 0) bump = 1;
+                if (bump > self.images.next_id) self.images.next_id = bump;
+            }
+            img.number = ctrl.request_num;
+            const assigned = img.id;
+            if (ctrl.action == .transmit_and_place) {
+                if (!self.placeExisting(img, ctrl)) {
+                    _ = self.images.deleteImage(assigned);
+                    self.replyKitty(id, q, "placement store full");
+                    return;
+                }
+            }
+            if (ctrl.request_num != 0) {
+                if (q == 2) return;
+                var rbuf: [64]u8 = undefined;
+                self.emit(kitty_mod.formatOkI(&rbuf, assigned, ctrl.request_num));
+                return;
+            }
+            self.replyPlaced(assigned, ctrl);
+        }
+
+        /// PNG transmit (f=100): the file carries own dims (s/v ignored),
+        /// with optional zlib re-wrap (o=z). Pixel cap mirrors byte cap / 4.
+        fn kittyTransmitPng(self: *Self, ctrl: kitty_mod.Control, payload: []const u8) void {
+            const id = ctrl.image_id;
+            const q = ctrl.quiet;
+            const file = kitty_mod.decodeAllBounded(self.gpa, payload, cfg.kitty_b64_max_cap) catch |e| {
+                const msg: []const u8 = switch (e) {
+                    error.OutOfMemory => "out of memory",
+                    error.TooLarge => "image too large",
+                    error.BadBase64 => "bad base64 data",
+                };
+                self.replyKitty(id, q, msg);
+                return;
+            };
+            defer self.gpa.free(file);
+            var owned_zlib: ?[]u8 = null;
+            defer if (owned_zlib) |b| self.gpa.free(b);
+            const png_file: []const u8 = if (!ctrl.compressed) file else blk: {
+                owned_zlib = inflate_mod.zlibDecompressBounded(self.gpa, file, cfg.kitty_b64_max_cap) catch |e| {
+                    const msg: []const u8 = switch (e) {
+                        error.OutOfMemory => "out of memory",
+                        error.OverLimit => "image too large",
+                        error.BadAdler, error.InvalidData => "bad compressed data",
+                        error.Unsupported => "unsupported compression",
+                    };
+                    self.replyKitty(id, q, msg);
+                    return;
+                };
+                break :blk owned_zlib.?;
+            };
+            const dec = png_mod.decodeRgba(self.gpa, png_file, cfg.kitty_b64_max_cap / 4) catch |e| {
+                const msg: []const u8 = switch (e) {
+                    error.OutOfMemory => "out of memory",
+                    error.OverLimit => "image too large",
+                    else => "bad PNG data",
+                };
+                self.replyKitty(id, q, msg);
+                return;
+            };
+            defer self.gpa.free(dec.pixels);
+            if (id != 0) _ = self.images.deleteImage(id);
+            if (self.images.total_bytes + dec.pixels.len * 4 > @as(usize, cfg.img_pool_max_bytes)) {
+                self.replyKitty(id, q, "ENOMEM");
+                return;
+            }
+            const img = self.images.insert(dec.w, dec.h, false) catch {
+                self.replyKitty(id, q, "image store full");
+                return;
+            };
+            @memcpy(img.pixels, dec.pixels);
+            self.finishStore(ctrl, img);
+        }
+
+        /// zlib-compressed raw pixels (o=z): unwrap + inflate to the exact
+        /// s*v*bpp size, then rejoin the raw path at swizzle time.
+        fn kittyTransmitZlib(self: *Self, ctrl: kitty_mod.Control, payload: []const u8) void {
+            const id = ctrl.image_id;
+            const q = ctrl.quiet;
+            const bpp: usize = switch (ctrl.format) {
+                .rgb => 3,
+                .rgba => 4,
+                else => {
+                    self.replyKitty(id, q, "unsupported format");
+                    return;
+                },
+            };
+            if (ctrl.img_w == 0 or ctrl.img_h == 0 or ctrl.img_w > 4096 or ctrl.img_h > 4096) {
+                self.replyKitty(id, q, "bad image dimensions");
+                return;
+            }
+            const expected: usize = @as(usize, ctrl.img_w) * ctrl.img_h * bpp;
+            if (expected > cfg.kitty_b64_max_cap) {
+                self.replyKitty(id, q, "image too large");
+                return;
+            }
+            const raw = kitty_mod.decodeZlibBounded(self.gpa, payload, expected) catch |e| {
+                const msg: []const u8 = switch (e) {
+                    error.OutOfMemory => "out of memory",
+                    error.TooLarge, error.BadLength => "size mismatch",
+                    error.BadBase64 => "bad base64 data",
+                    error.BadData => "bad compressed data",
+                    error.Unsupported => "unsupported compression",
+                };
+                self.replyKitty(id, q, msg);
+                return;
+            };
+            defer self.gpa.free(raw);
+            if (id != 0) _ = self.images.deleteImage(id);
+            if (self.images.total_bytes + expected > @as(usize, cfg.img_pool_max_bytes)) {
+                self.replyKitty(id, q, "ENOMEM");
+                return;
+            }
+            const img = self.images.insert(ctrl.img_w, ctrl.img_h, false) catch {
+                self.replyKitty(id, q, "image store full");
+                return;
+            };
+            kitty_mod.swizzlePixels(img.pixels, raw, ctrl.format);
+            self.finishStore(ctrl, img);
+        }
+
+        /// Move the cursor past a placed image (spec default; C=1 skips).
+        /// Right with wrap, then down clamped without scrolling (edge
+        /// behavior is implementation-defined; clamping is ours).
+        fn advanceAfterImage(self: *Self, img_w: u32, img_h: u32) void {
+            const cw: u32 = @max(1, self.cell_w_px);
+            const ch: u32 = @max(1, self.cell_h_px);
+            var cols_needed: u32 = @min(@as(u32, 0xFFFF), (img_w + cw - 1) / cw);
+            while (cols_needed > 0) : (cols_needed -= 1) {
+                if (self.cursor_col + 1 < self.grid.cols) {
+                    self.cursor_col += 1;
+                } else if (self.cursor_row + 1 < self.grid.rows) {
+                    self.cursor_col = 0;
+                    self.cursor_row += 1;
+                } else {
+                    self.cursor_col = self.grid.cols -| 1;
+                    break;
+                }
+            }
+            var rows_needed: u32 = @min(@as(u32, 0xFFFF), (img_h + ch - 1) / ch);
+            if (rows_needed > 0) rows_needed -= 1; // first row already occupied
+            while (rows_needed > 0) : (rows_needed -= 1) {
+                if (self.cursor_row + 1 < self.grid.rows) {
+                    self.cursor_row += 1;
+                } else break;
+            }
+            self.pending_wrap = false;
+        }
+
+        /// Resolved unicode placeholder: pool image + source cell offset.
+        pub const PlaceholderRef = struct {
+            img_id: u32,
+            row: u16,
+            col: u16,
+        };
+
+        const PlaceholderGrid = struct {
+            r: u16,
+            c: u16,
+            x: u16,
+        };
+
+        /// Grid position inside a placeholder image: explicit diacritics
+        /// win ([row, col, id-extra]); bare cells inherit from the left
+        /// neighbor (same row) or the cell above (row+1, same col).
+        fn placeholderGrid(self: *Self, col: u16, row: u16) ?PlaceholderGrid {
+            const cell = self.grid.viewCell(col, row) orelse return null;
+            if (cell.rune != placeholder_mod.PLACEHOLDER) return null;
+            var vals: [3]u16 = undefined;
+            var n: u8 = 0;
+            for (cell.combining[0..cell.combining_count]) |m| {
+                if (n >= 3) break;
+                if (placeholder_mod.diacriticValue(m)) |v| {
+                    vals[n] = v;
+                    n += 1;
+                }
+            }
+            const fb = if (n < 3) blk: {
+                if (col > 0) break :blk self.placeholderGrid(col - 1, row);
+                if (row > 0) break :blk self.placeholderGrid(col, row - 1);
+                break :blk null;
+            } else null;
+            if (n == 0) {
+                const f = fb orelse return null;
+                return .{
+                    .r = if (col > 0) f.r else f.r + 1,
+                    .c = if (col > 0) f.c + 1 else f.c,
+                    .x = f.x,
+                };
+            }
+            const c: u16 = if (n > 1) vals[1] else if (fb) |f| (if (col > 0) f.c + 1 else f.c) else 0;
+            const x: u16 = if (n > 2) vals[2] else if (fb) |f| f.x else 0;
+            return .{ .r = vals[0], .c = c, .x = x };
+        }
+
+        /// Resolve a U+10EEEE cell to its image + source offset. The low 24
+        /// id bits come from the cell fg (ratatui-image encodes the id as an
+        /// SGR truecolor); the high byte is the id-extra diacritic. Null when
+        /// the cell isn't a painted placeholder or the image is gone (scroll/
+        /// overwrite/alt changes dissolve virtual placements for free).
+        pub fn resolvePlaceholder(self: *Self, col: u16, row: u16) ?PlaceholderRef {
+            if (!cfg.kitty_gfx or cfg.ascii_only) return null;
+            const g = self.placeholderGrid(col, row) orelse return null;
+            const cell = self.grid.viewCell(col, row) orelse return null;
+            if (cell_mod.isDefaultColor(cell.fg) or cell_mod.isIndexedColor(cell.fg)) return null;
+            const id = (@as(u32, g.x) << 24) | (cell.fg & 0xFFFFFF);
+            if (self.images.findImage(id) == null) return null;
+            return .{ .img_id = id, .row = g.r, .col = g.c };
+        }
+
+        /// Display an image at the cursor: replace-duplicate, store geometry,
+        /// sort, advance. False = placement store full (caller rolls back).
+        fn placeExisting(self: *Self, img: *pool_mod.Image, ctrl: kitty_mod.Control) bool {
+            const id = img.id;
+            if (ctrl.placement_id != 0) {
+                var k: usize = 0;
+                while (k < self.images.placements.items.len) {
+                    const e = self.images.placements.items[k];
+                    if (e.img_id == id and e.placement_id == ctrl.placement_id) {
+                        _ = self.images.placements.swapRemove(k);
+                    } else k += 1;
+                }
+            }
+            self.images.place(id, self.cursor_col, self.cursor_row) catch return false;
+            const slot = &self.images.placements.items[self.images.placements.items.len - 1];
+            slot.alt_screen = self.alt_active;
+            slot.x_off = ctrl.off_x;
+            slot.y_off = ctrl.off_y;
+            slot.z_index = ctrl.z_index;
+            slot.placement_id = ctrl.placement_id;
+            self.images.sortPlacements();
+            if (ctrl.cursor_move) self.advanceAfterImage(img.w, img.h);
+            return true;
+        }
+
+        /// q-aware placement reply (with ,p= when set).
+        fn replyPlaced(self: *Self, id: u32, ctrl: kitty_mod.Control) void {
+            if (ctrl.placement_id == 0) {
+                self.replyKitty(id, ctrl.quiet, null);
+                return;
+            }
+            if (ctrl.quiet == 2) return;
+            var rbuf: [64]u8 = undefined;
+            self.emit(kitty_mod.formatOkP(&rbuf, id, ctrl.placement_id));
+        }
+
+        /// Display a previously transmitted image at the cursor (a=p).
+        fn kittyPut(self: *Self, ctrl: kitty_mod.Control) void {
+            if (ctrl.image_id == 0) {
+                self.replyKitty(0, ctrl.quiet, "missing image id");
+                return;
+            }
+            const found = self.images.findImage(ctrl.image_id) orelse {
+                self.replyKitty(ctrl.image_id, ctrl.quiet, "unknown image id");
+                return;
+            };
+            const id = found.id;
+            if (!self.placeExisting(found, ctrl)) {
+                self.replyKitty(id, ctrl.quiet, "placement store full");
+                return;
+            }
+            self.replyPlaced(id, ctrl);
+        }
+
+        /// Query always answers OK, even for never-transmitted ids: the
+        /// ratatui-image probe (`Gi=31,s=1,v=1,a=q,...`) requires byte-exact
+        /// `Gi=<id>;OK` to select the kitty backend, matching real
+        /// kitty/ghostty/wezterm behavior.
+        fn kittyQuery(self: *Self, ctrl: kitty_mod.Control) void {
+            self.replyKitty(ctrl.image_id, ctrl.quiet, null);
+        }
+
+        /// Delete matrix. Lowercase removes placements (data retained for
+        /// redisplay); uppercase additionally frees newly-unplaced images.
+        fn kittyDelete(self: *Self, ctrl: kitty_mod.Control) void {
+            const d = ctrl.del;
+            const q = ctrl.quiet;
+            const upper = d >= 'A' and d <= 'Z';
+            const kind: u8 = if (upper) d + 32 else d;
+            switch (kind) {
+                0, 'a' => {
+                    _ = self.images.removePlacements(null, null);
+                    if (upper) self.images.clearAll();
+                    self.replyKitty(ctrl.image_id, q, null);
+                },
+                'i' => {
+                    if (ctrl.image_id == 0) {
+                        self.replyKitty(0, q, "missing image id");
+                        return;
+                    }
+                    const plc: ?u32 = if (ctrl.placement_id != 0) ctrl.placement_id else null;
+                    const n = self.images.removePlacements(ctrl.image_id, plc);
+                    if (upper) self.images.freeUnplaced();
+                    if (n == 0) {
+                        self.replyKitty(ctrl.image_id, q, "unknown image id");
+                        return;
+                    }
+                    self.replyKitty(ctrl.image_id, q, null);
+                },
+                'n' => {
+                    // Newest image tracked under number I (optional p scope).
+                    if (ctrl.request_num == 0) {
+                        self.replyKitty(0, q, "missing image number");
+                        return;
+                    }
+                    var target: ?u32 = null;
+                    var k = self.images.images.items.len;
+                    while (k > 0) {
+                        k -= 1;
+                        if (self.images.images.items[k].number == ctrl.request_num) {
+                            target = self.images.images.items[k].id;
+                            break;
+                        }
+                    }
+                    const tid = target orelse {
+                        self.replyKitty(0, q, "unknown image number");
+                        return;
+                    };
+                    const plc: ?u32 = if (ctrl.placement_id != 0) ctrl.placement_id else null;
+                    _ = self.images.removePlacements(tid, plc);
+                    if (upper) self.images.freeUnplaced();
+                    self.replyKitty(tid, q, null);
+                },
+                'c' => {
+                    // Placements intersecting the cursor cell.
+                    const cw: u32 = @max(1, self.cell_w_px);
+                    const ch: u32 = @max(1, self.cell_h_px);
+                    const cc = self.cursor_col;
+                    const cr = self.cursor_row;
+                    var k: usize = 0;
+                    while (k < self.images.placements.items.len) {
+                        const pl = self.images.placements.items[k];
+                        var hit = false;
+                        if (self.images.findImage(pl.img_id)) |im| {
+                            const span_c: u16 = @intCast(@min(@as(u32, 0xFFFF), (@as(u32, pl.x_off) + im.w + cw - 1) / cw));
+                            const rem_h: u32 = im.h -| @min(@as(u32, pl.clip_top), im.h);
+                            const span_r: u16 = @intCast(@min(@as(u32, 0xFFFF), (@as(u32, pl.y_off) + rem_h + ch - 1) / ch));
+                            const c1 = pl.col +| span_c -| 1;
+                            const r1 = pl.row +| span_r -| 1;
+                            hit = cc >= pl.col and cc <= c1 and cr >= pl.row and cr <= r1;
+                        }
+                        if (hit) {
+                            _ = self.images.placements.swapRemove(k);
+                        } else k += 1;
+                    }
+                    if (upper) self.images.freeUnplaced();
+                    self.replyKitty(ctrl.image_id, q, null);
+                },
+                else => self.replyKitty(ctrl.image_id, q, "unsupported delete target"),
+            }
         }
 
         /// Feed PTY bytes into the state machine. Snaps view to follow.
@@ -230,8 +770,8 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     self.osc_buf.clearRetainingCapacity();
                 },
                 .apc_dispatch => {
-                    // Phase 4: decode kitty payload from kitty_b64.
-                    self.kitty_b64.clearRetainingCapacity();
+                    if (cfg.kitty_gfx) self.dispatchKitty();
+                    self.shrinkTransferBuf(&self.kitty_b64);
                 },
                 .dcs_dispatch => {
                     // Phase 4: stream sixel payload from dcs_buf.
@@ -326,6 +866,14 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     if (top < bot and bot < self.grid.rows) {
                         self.scroll_top = top;
                         self.scroll_bot = bot;
+                    }
+                },
+                't' => { // XTWINOPS: 16 reports the text area in pixels
+                    // (ratatui-image sizes cover art from this).
+                    if (n(params, 0, 0) == 16) {
+                        var rbuf: [32]u8 = undefined;
+                        const msg = std.fmt.bufPrint(&rbuf, "\x1b[6;{d};{d}t", .{ self.cell_h_px, self.cell_w_px }) catch null;
+                        if (msg) |m| self.emit(m);
                     }
                 },
                 'h', 'l' => {
@@ -615,6 +1163,19 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 const col = self.cursor_col;
                 std.mem.copyBackwards(CellT, self.grid.cells[off + col + 1 .. off + self.grid.cols], self.grid.cells[off + col .. off + self.grid.cols - 1]);
             }
+            // Combining marks attach to the preceding cell instead of
+            // overwriting it (kitty unicode-placeholder diacritics ride
+            // here); they never advance the cursor.
+            if (utf8_mod.isCombining(cp) or placeholder_mod.isDiacritic(cp)) {
+                const base_col = if (self.pending_wrap or self.cursor_col == 0) self.cursor_col else self.cursor_col - 1;
+                const mark_cell = self.grid.at(base_col, self.cursor_row);
+                if (mark_cell.combining_count < cfg.font_max_combining) {
+                    mark_cell.combining[mark_cell.combining_count] = cp;
+                    mark_cell.combining_count += 1;
+                }
+                mark_cell.dirty = true;
+                return;
+            }
             const cell = self.grid.at(self.cursor_col, self.cursor_row);
             cell.setRune(cp);
             const fg = self.resolveColor(self.pen.fg);
@@ -686,6 +1247,52 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
         }
 
+        /// M4 scroll: placements anchored in [top, bot] ride a 1-row
+        /// scroll. Scroll-up clips a top-anchored image by one cell row
+        /// (clip_top px); fully-clipped images die. Scroll-down drops
+        /// bottom-anchored placements (their content is destroyed) and
+        /// shifts the rest down. Placements on the inactive screen stay.
+        fn shiftPlacements(self: *Self, top: u16, bot: u16, up: bool) void {
+            if (!cfg.kitty_gfx) return;
+            const ch: u32 = @max(1, self.cell_h_px);
+            var i: usize = 0;
+            while (i < self.images.placements.items.len) {
+                const row = self.images.placements.items[i].row;
+                const alt = self.images.placements.items[i].alt_screen;
+                const iid = self.images.placements.items[i].img_id;
+                if (alt != self.alt_active or row < top or row > bot) {
+                    i += 1;
+                    continue;
+                }
+                if (up) {
+                    if (row == top) {
+                        const img = self.images.findImage(iid) orelse {
+                            _ = self.images.placements.swapRemove(i);
+                            continue;
+                        };
+                        const old = self.images.placements.items[i].clip_top;
+                        const sum = @as(u32, old) + ch;
+                        if (sum >= img.h) {
+                            _ = self.images.placements.swapRemove(i);
+                            continue;
+                        }
+                        self.images.placements.items[i].clip_top = @intCast(@min(sum, 0xFFFF));
+                        i += 1;
+                    } else {
+                        self.images.placements.items[i].row -= 1;
+                        i += 1;
+                    }
+                } else {
+                    if (row == bot) {
+                        _ = self.images.placements.swapRemove(i);
+                    } else {
+                        self.images.placements.items[i].row += 1;
+                        i += 1;
+                    }
+                }
+            }
+        }
+
         fn scrollRegionUp(self: *Self) void {
             if (self.prompt_start_row) |*psr| {
                 if (psr.* > 0) {
@@ -697,6 +1304,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             if (self.scroll_top == 0 and self.scroll_bot == self.grid.rows - 1) {
                 self.grid.scrollUp(!self.alt_active);
                 self.cursor_row = self.scroll_bot;
+                self.shiftPlacements(0, self.grid.rows -| 1, true);
                 return;
             }
             var r = self.scroll_top;
@@ -709,6 +1317,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             const CellT = @TypeOf(self.grid.cells[0]);
             const blank = CellT{};
             @memset(self.grid.cells[last..][0..self.grid.cols], blank);
+            self.shiftPlacements(self.scroll_top, self.scroll_bot, true);
         }
 
         fn reverseIndex(self: *Self) void {
@@ -724,6 +1333,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     @memcpy(self.grid.cells[dst..][0..self.grid.cols], self.grid.cells[src..][0..self.grid.cols]);
                 }
                 @memset(self.grid.cells[@as(usize, self.scroll_top) * self.grid.cols ..][0..self.grid.cols], blank);
+                self.shiftPlacements(self.scroll_top, self.scroll_bot, false);
             } else if (self.cursor_row > 0) {
                 self.cursor_row -= 1;
             }
@@ -851,6 +1461,385 @@ test "answerQueries replies DA + CPR + XTGETTCAP" {
     sink.len = 0;
     ctx.answerQueries("\x1b[6n");
     try std.testing.expectEqualStrings("\x1b[5;10R", sink.buf[0..sink.len]);
+}
+
+test "kitty transmit RGBA end-to-end" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    const Sink = struct {
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+        fn cb(user: ?*anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(user));
+            const n = @min(data.len, self.buf.len - self.len);
+            @memcpy(self.buf[self.len..][0..n], data[0..n]);
+            self.len += n;
+        }
+    };
+    var sink = Sink{};
+    ctx.onWrite(Sink.cb, &sink);
+    ctx.cursor_col = 2;
+    ctx.cursor_row = 3;
+    // 2x1 RGBA: red, green.
+    ctx.parse("\x1b_Ga=t,f=32,s=2,v=1,i=7;/wAA/wD/AP8=\x1b\\");
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.images.items.len);
+    const img = &ctx.images.images.items[0];
+    try std.testing.expectEqual(@as(u32, 7), img.id);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), img.pixels[0]);
+    try std.testing.expectEqual(@as(u32, 0xFF00FF00), img.pixels[1]);
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
+    const pl = ctx.images.placements.items[0];
+    try std.testing.expectEqual(@as(u16, 2), pl.col);
+    try std.testing.expectEqual(@as(u16, 3), pl.row);
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "Gi=7;OK") != null);
+    // q=2 suppresses the reply entirely.
+    sink.len = 0;
+    ctx.parse("\x1b_Ga=t,f=32,s=1,v=1,q=2;/wAA/w==\x1b\\");
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
+    try std.testing.expectEqual(@as(usize, 2), ctx.images.images.items.len);
+    // Chunked upload starts pending: silent, nothing stored yet.
+    sink.len = 0;
+    ctx.parse("\x1b_Ga=t,f=32,s=1,v=1,m=1;/wAA/w==\x1b\\");
+    try std.testing.expect(ctx.kitty_pending);
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
+    try std.testing.expectEqual(@as(usize, 2), ctx.images.images.items.len);
+    // Bare delete clears placements but retains data (lowercase semantics).
+    ctx.parse("\x1b_Ga=d\x1b\\");
+    try std.testing.expectEqual(@as(usize, 0), ctx.images.placements.items.len);
+    try std.testing.expectEqual(@as(usize, 2), ctx.images.images.items.len);
+    // Uppercase frees everything.
+    ctx.parse("\x1b_Ga=d,d=A\x1b\\");
+    try std.testing.expectEqual(@as(usize, 0), ctx.images.images.items.len);
+    // Bare probe (no semicolon) advertises support.
+    sink.len = 0;
+    ctx.parse("\x1b_Ga=q\x1b\\");
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], ";OK") != null);
+    // ratatui-image probe: query for a never-transmitted id must still
+    // answer `Gi=31;OK` or the app falls back to halfblocks.
+    sink.len = 0;
+    ctx.parse("\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\");
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "Gi=31;OK") != null);
+}
+
+test "kitty chunked upload reassembles" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    const Sink = struct {
+        buf: [512]u8 = undefined,
+        len: usize = 0,
+        fn cb(user: ?*anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(user));
+            const n = @min(data.len, self.buf.len - self.len);
+            @memcpy(self.buf[self.len..][0..n], data[0..n]);
+            self.len += n;
+        }
+    };
+    var sink = Sink{};
+    ctx.onWrite(Sink.cb, &sink);
+    ctx.cursor_col = 1;
+    ctx.cursor_row = 2;
+    // Same 2x1 red/green ("redacted..." full b64 "/wAA/wD/AP8="), split
+    // into m=1 + m=0 chunks. No reply until the final chunk.
+    ctx.parse("\x1b_Ga=t,f=32,s=2,v=1,i=9,m=1;/wAA/w\x1b\\");
+    try std.testing.expect(ctx.kitty_pending);
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.images.images.items.len);
+    ctx.parse("\x1b_Gm=0;D/AP8=\x1b\\");
+    try std.testing.expect(!ctx.kitty_pending);
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.images.items.len);
+    const img = &ctx.images.images.items[0];
+    try std.testing.expectEqual(@as(u32, 9), img.id);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), img.pixels[0]);
+    try std.testing.expectEqual(@as(u32, 0xFF00FF00), img.pixels[1]);
+    const pl = ctx.images.placements.items[0];
+    try std.testing.expectEqual(@as(u16, 1), pl.col);
+    try std.testing.expectEqual(@as(u16, 2), pl.row);
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "Gi=9;OK") != null);
+    // Delete aborts an in-flight upload.
+    sink.len = 0;
+    ctx.parse("\x1b_Ga=t,f=32,s=2,v=1,i=10,m=1;/wAA/w\x1b\\");
+    try std.testing.expect(ctx.kitty_pending);
+    ctx.parse("\x1b_Ga=d\x1b\\");
+    try std.testing.expect(!ctx.kitty_pending);
+    try std.testing.expectEqual(@as(usize, 0), ctx.images.placements.items.len);
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.images.items.len); // data retained
+    // Continuation with nothing pending errors (default q=0 replies).
+    sink.len = 0;
+    ctx.parse("\x1b_Gm=0;AAAA\x1b\\");
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], ";OK") == null);
+    try std.testing.expect(sink.len > 0);
+}
+
+test "kitty geometry + cursor advance" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    const Sink = struct {
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+        fn cb(user: ?*anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(user));
+            const n = @min(data.len, self.buf.len - self.len);
+            @memcpy(self.buf[self.len..][0..n], data[0..n]);
+            self.len += n;
+        }
+    };
+    var sink = Sink{};
+    ctx.onWrite(Sink.cb, &sink);
+    ctx.cell_w_px = 9;
+    ctx.cell_h_px = 19;
+    ctx.cursor_col = 0;
+    ctx.cursor_row = 0;
+    // 4x2 transparent pixels (32 zero bytes -> 43x'A' + '=').
+    var b64: [44]u8 = undefined;
+    @memset(&b64, 'A');
+    b64[43] = '=';
+    var seq: [128]u8 = undefined;
+    const cmd = try std.fmt.bufPrint(&seq, "\x1b_Ga=t,f=32,s=4,v=2,X=3,Y=4,z=-5,p=2;{s}\x1b\\", .{b64[0..]});
+    ctx.parse(cmd);
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
+    const pl = ctx.images.placements.items[0];
+    try std.testing.expectEqual(@as(u16, 0), pl.col);
+    try std.testing.expectEqual(@as(u16, 0), pl.row);
+    try std.testing.expectEqual(@as(u16, 3), pl.x_off);
+    try std.testing.expectEqual(@as(u16, 4), pl.y_off);
+    try std.testing.expectEqual(@as(i32, -5), pl.z_index);
+    try std.testing.expectEqual(@as(u32, 2), pl.placement_id);
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "Gi=1,p=2;OK") != null);
+    // 4px wide on 9px cells = 1 col; 2px tall on 19px = 1 row: cursor (1,0).
+    try std.testing.expectEqual(@as(u16, 1), ctx.cursor_col);
+    try std.testing.expectEqual(@as(u16, 0), ctx.cursor_row);
+    // C=1: placement lands, cursor stays.
+    ctx.cursor_col = 0;
+    ctx.cursor_row = 0;
+    sink.len = 0;
+    const cmd2 = try std.fmt.bufPrint(&seq, "\x1b_Ga=t,f=32,s=4,v=2,i=5,C=1;{s}\x1b\\", .{b64[0..]});
+    ctx.parse(cmd2);
+    try std.testing.expectEqual(@as(u16, 0), ctx.cursor_col);
+    try std.testing.expectEqual(@as(u16, 0), ctx.cursor_row);
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "Gi=5;OK") != null);
+    // Re-sending (image 1, placement 2) replaces in place: still 2.
+    const cmd3 = try std.fmt.bufPrint(&seq, "\x1b_Ga=t,f=32,s=4,v=2,i=1,p=2,C=1;{s}\x1b\\", .{b64[0..]});
+    ctx.parse(cmd3);
+    try std.testing.expectEqual(@as(usize, 2), ctx.images.placements.items.len);
+    try std.testing.expectEqual(@as(u32, 1), ctx.images.placements.items[0].img_id);
+    try std.testing.expectEqual(@as(u32, 2), ctx.images.placements.items[0].placement_id);
+    try std.testing.expectEqual(@as(u32, 5), ctx.images.placements.items[1].img_id);
+}
+
+test "kitty scroll-shift, clip, alt round-trip" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    const Sink = struct {
+        buf: [512]u8 = undefined,
+        len: usize = 0,
+        fn cb(user: ?*anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(user));
+            const n = @min(data.len, self.buf.len - self.len);
+            @memcpy(self.buf[self.len..][0..n], data[0..n]);
+            self.len += n;
+        }
+    };
+    var sink = Sink{};
+    ctx.onWrite(Sink.cb, &sink);
+    ctx.cell_h_px = 10;
+    // 4x40 RGBA = 640 bytes -> 856 b64 chars (last group carries 1 byte).
+    var b64: [856]u8 = undefined;
+    @memset(&b64, 'A');
+    b64[854] = '=';
+    b64[855] = '=';
+    var seq: [1024]u8 = undefined;
+    ctx.cursor_col = 0;
+    ctx.cursor_row = 0;
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=t,f=32,s=4,v=40;{s}\x1b\\", .{b64[0..]}));
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
+    // Full-screen scroll clips the top-anchored image 10px at a time.
+    ctx.scrollRegionUp();
+    try std.testing.expectEqual(@as(u16, 0), ctx.images.placements.items[0].row);
+    try std.testing.expectEqual(@as(u16, 10), ctx.images.placements.items[0].clip_top);
+    ctx.scrollRegionUp();
+    ctx.scrollRegionUp();
+    try std.testing.expectEqual(@as(u16, 30), ctx.images.placements.items[0].clip_top);
+    ctx.scrollRegionUp(); // 40 >= 40: fully clipped, placement dies.
+    try std.testing.expectEqual(@as(usize, 0), ctx.images.placements.items.len);
+    // Mid-screen anchor rides up one row per scroll.
+    var tiny: [44]u8 = undefined;
+    @memset(&tiny, 'A');
+    tiny[43] = '=';
+    ctx.cursor_col = 0;
+    ctx.cursor_row = 5;
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=t,f=32,s=4,v=2,i=2;{s}\x1b\\", .{tiny[0..]}));
+    try std.testing.expectEqual(@as(u16, 5), ctx.images.placements.items[0].row);
+    ctx.scrollRegionUp();
+    try std.testing.expectEqual(@as(u16, 4), ctx.images.placements.items[0].row);
+    try std.testing.expectEqual(@as(u16, 0), ctx.images.placements.items[0].clip_top);
+    // Alt round-trip keeps the primary placement (hidden while away).
+    ctx.enterAlt();
+    try std.testing.expect(ctx.alt_active);
+    ctx.exitAlt();
+    try std.testing.expect(!ctx.alt_active);
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
+    // Scroll-down shifts the anchor back down.
+    ctx.cursor_row = 0;
+    ctx.reverseIndex();
+    try std.testing.expectEqual(@as(u16, 5), ctx.images.placements.items[0].row);
+}
+
+test "kitty storage quota" {
+    var ctx = try Context(.{ .img_pool_max_bytes = 100 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    const Sink = struct {
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+        fn cb(user: ?*anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(user));
+            const n = @min(data.len, self.buf.len - self.len);
+            @memcpy(self.buf[self.len..][0..n], data[0..n]);
+            self.len += n;
+        }
+    };
+    var sink = Sink{};
+    ctx.onWrite(Sink.cb, &sink);
+    // 4x2 RGBA = 32 bytes each; quota 100 fits 3, the 4th gets ENOMEM.
+    var b64: [44]u8 = undefined;
+    @memset(&b64, 'A');
+    b64[43] = '=';
+    var seq: [128]u8 = undefined;
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,i=1,C=1;{s}\x1b\\", .{b64[0..]}));
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,i=2,C=1;{s}\x1b\\", .{b64[0..]}));
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,i=3,C=1;{s}\x1b\\", .{b64[0..]}));
+    try std.testing.expectEqual(@as(usize, 96), ctx.images.total_bytes);
+    sink.len = 0;
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,i=4,C=1;{s}\x1b\\", .{b64[0..]}));
+    try std.testing.expectEqual(@as(usize, 3), ctx.images.images.items.len);
+    try std.testing.expectEqual(@as(usize, 96), ctx.images.total_bytes);
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "ENOMEM") != null);
+}
+
+test "kitty unicode placeholder resolve + 16t" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    const Sink = struct {
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+        fn cb(user: ?*anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(user));
+            const n = @min(data.len, self.buf.len - self.len);
+            @memcpy(self.buf[self.len..][0..n], data[0..n]);
+            self.len += n;
+        }
+    };
+    var sink = Sink{};
+    ctx.onWrite(Sink.cb, &sink);
+    // Store 4x2 RGBA under id 9 (virtual placement: no pool placement).
+    var b64: [44]u8 = undefined;
+    @memset(&b64, 'A');
+    b64[43] = '=';
+    var seq: [160]u8 = undefined;
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,i=9,C=1;{s}\x1b\\", .{b64[0..]}));
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.images.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.images.placements.items.len);
+    // Ratatui-style row: SGR id-color + placeholder + 3 diacritics
+    // (row 0, col 0, extra 0 = U+0305 x3), then 3 bare cells.
+    // U+10EEEE = F4 8E BB AE; U+0305 = CC 85.
+    ctx.parse("\x1b[38;2;0;0;9m\xF4\x8E\xBB\xAE\xCC\x85\xCC\x85\xCC\x85\xF4\x8E\xBB\xAE\xF4\x8E\xBB\xAE\xF4\x8E\xBB\xAE");
+    const r0 = ctx.resolvePlaceholder(0, 0).?;
+    try std.testing.expectEqual(@as(u32, 9), r0.img_id);
+    try std.testing.expectEqual(@as(u16, 0), r0.row);
+    try std.testing.expectEqual(@as(u16, 0), r0.col);
+    const r1 = ctx.resolvePlaceholder(1, 0).?;
+    try std.testing.expectEqual(@as(u32, 9), r1.img_id);
+    try std.testing.expectEqual(@as(u16, 0), r1.row);
+    try std.testing.expectEqual(@as(u16, 1), r1.col);
+    const r3 = ctx.resolvePlaceholder(3, 0).?;
+    try std.testing.expectEqual(@as(u16, 3), r3.col);
+    try std.testing.expect(ctx.resolvePlaceholder(4, 0) == null);
+    // Image freed: the virtual placement dissolves.
+    ctx.parse("\x1b_Ga=d,d=A\x1b\\");
+    try std.testing.expect(ctx.resolvePlaceholder(0, 0) == null);
+    // XTWINOPS 16t reports the headless cell size (8x16).
+    sink.len = 0;
+    ctx.parse("\x1b[16t");
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "[6;16;8t") != null);
+}
+
+test "kitty put, request-id, delete matrix" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    const Sink = struct {
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+        fn cb(user: ?*anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(user));
+            const n = @min(data.len, self.buf.len - self.len);
+            @memcpy(self.buf[self.len..][0..n], data[0..n]);
+            self.len += n;
+        }
+    };
+    var sink = Sink{};
+    ctx.onWrite(Sink.cb, &sink);
+    ctx.cell_w_px = 9;
+    ctx.cell_h_px = 19;
+    // 4x2 transparent pixels (32 zero bytes -> 43x'A' + '=').
+    var b64: [44]u8 = undefined;
+    @memset(&b64, 'A');
+    b64[43] = '=';
+    var seq: [160]u8 = undefined;
+    // 1. Store-only transmit, then display via a=p at (5,6).
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,i=21,C=1;{s}\x1b\\", .{b64[0..]}));
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.images.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.images.placements.items.len);
+    ctx.cursor_col = 5;
+    ctx.cursor_row = 6;
+    sink.len = 0;
+    ctx.parse("\x1b_Ga=p,i=21\x1b\\");
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
+    try std.testing.expectEqual(@as(u16, 5), ctx.images.placements.items[0].col);
+    try std.testing.expectEqual(@as(u16, 6), ctx.images.placements.items[0].row);
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "Gi=21;OK") != null);
+    // 2. Unknown id errors, pool untouched.
+    sink.len = 0;
+    ctx.parse("\x1b_Ga=p,i=77\x1b\\");
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "unknown image id") != null);
+    // 3. I request: auto id + number stored + I reply.
+    sink.len = 0;
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,I=13,C=1;{s}\x1b\\", .{b64[0..]}));
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], ",I=13;OK") != null);
+    try std.testing.expectEqual(@as(u32, 13), ctx.images.images.items[1].number);
+    // 4. i+I conflict is EINVAL, nothing stored.
+    sink.len = 0;
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,i=5,I=13,C=1;{s}\x1b\\", .{b64[0..]}));
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "mutually exclusive") != null);
+    try std.testing.expectEqual(@as(usize, 2), ctx.images.images.items.len);
+    // 5. Two number-7 images placed; d=n removes the newest placement only.
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,I=7,C=1;{s}\x1b\\", .{b64[0..]}));
+    const id_a = ctx.images.images.items[2].id;
+    ctx.cursor_col = 0;
+    ctx.cursor_row = 0;
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=p,i={d}\x1b\\", .{id_a}));
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,I=7,C=1;{s}\x1b\\", .{b64[0..]}));
+    const id_b = ctx.images.images.items[3].id;
+    ctx.cursor_col = 0;
+    ctx.cursor_row = 1;
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=p,i={d}\x1b\\", .{id_b}));
+    try std.testing.expectEqual(@as(usize, 3), ctx.images.placements.items.len);
+    ctx.parse("\x1b_Ga=d,d=n,I=7\x1b\\");
+    try std.testing.expectEqual(@as(usize, 2), ctx.images.placements.items.len);
+    for (ctx.images.placements.items) |p| {
+        try std.testing.expect(p.img_id != id_b);
+    }
+    try std.testing.expectEqual(@as(usize, 4), ctx.images.images.items.len); // data retained
+    // 6. d=c removes the placement under the cursor only.
+    ctx.cursor_col = 0;
+    ctx.cursor_row = 0;
+    ctx.parse("\x1b_Ga=d,d=c\x1b\\");
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
+    try std.testing.expectEqual(@as(u32, 21), ctx.images.placements.items[0].img_id);
+    // 7. Uppercase N frees unplaced data: only image 21 (still placed) survives.
+    ctx.parse("\x1b_Ga=d,d=N,I=7\x1b\\");
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.images.items.len);
+    try std.testing.expect(ctx.images.findImage(21) != null);
+    try std.testing.expect(ctx.images.findImage(id_b) == null);
 }
 
 test "decset alt-screen swaps grids" {

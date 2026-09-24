@@ -70,7 +70,8 @@ pub const Config = struct {
     font_atlas_size: u16 = 512,
     font_glyph_cap: u16 = 4096,
     font_max_fallbacks: u8 = 4,
-    font_max_combining: u8 = 2,
+    /// Combining slots per cell (kitty placeholders need 3 diacritics).
+    font_max_combining: u8 = 4,
     ligatures: bool = true,
     custom_boxes: bool = true,
     wide_chars: bool = true,
@@ -97,6 +98,9 @@ pub const Config = struct {
     sixel_max_size: u16 = 4096,
     img_pool_init_cap: u16 = 8,
     img_pool_max_cap: u32 = 1024,
+    /// Total stored pixel bytes (w*h*4) before transmit rejects with
+    /// ENOMEM (Ghostty precedent: 64MiB).
+    img_pool_max_bytes: u32 = 64 * 1024 * 1024,
     img_placement_init_cap: u16 = 16,
     img_placement_max_cap: u32 = 4096,
 

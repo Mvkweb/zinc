@@ -119,3 +119,63 @@ test "blitGlyph paints coverage" {
     try std.testing.expect(buf[1 * 4 + 1] != 0xFF000000);
     try std.testing.expectEqual(@as(u32, 0xFF000000), buf[3 * 4 + 3]);
 }
+
+/// Blit an ARGB image (kitty/sixel pool pixels) at (dx, dy), clipped to the
+/// buffer. Fully transparent pixels are skipped; opaque pixels store
+/// directly; partial alpha goes through blendArgb. span = u32s per source
+/// row (== iw for whole images; == img width for sub-slices). Precondition:
+/// iw/ih/span fit i32 (transmit path caps dims at 4096). Returns the drawn
+/// union for damage.
+pub fn blitRgba(
+    buf: []u32,
+    stride: u32,
+    height: u32,
+    img: []const u32,
+    iw: u32,
+    ih: u32,
+    span: u32,
+    dx: i32,
+    dy: i32,
+) Damage {
+    var dmg = Damage{};
+    if (iw == 0 or ih == 0) return dmg;
+    var row: u32 = 0;
+    while (row < ih) : (row += 1) {
+        const yy = dy + @as(i32, @intCast(row));
+        if (yy < 0 or yy >= @as(i32, @intCast(height))) continue;
+        var col: u32 = 0;
+        while (col < iw) : (col += 1) {
+            const xx = dx + @as(i32, @intCast(col));
+            if (xx < 0 or xx >= @as(i32, @intCast(stride))) continue;
+            const px = img[@as(usize, row) * span + col];
+            const a: u8 = @intCast((px >> 24) & 0xFF);
+            if (a == 0) continue;
+            const idx = @as(usize, @intCast(yy)) * stride + @as(usize, @intCast(xx));
+            if (a == 255) {
+                buf[idx] = px;
+            } else {
+                buf[idx] = blendArgb(buf[idx], px & 0xFFFFFF, a);
+            }
+            dmg.add(xx, yy, 1, 1);
+        }
+    }
+    return dmg;
+}
+
+test "blitRgba blends + clips" {
+    // 2x2: opaque red, transparent, half green over black, opaque blue.
+    const img = [_]u32{ 0xFFFF0000, 0x00000000, 0x8000FF00, 0xFF0000FF };
+    var buf: [16]u32 = [_]u32{0xFF000000} ** 16;
+    const dmg = blitRgba(&buf, 4, 4, &img, 2, 2, 2, 1, 1);
+    try std.testing.expect(!dmg.empty);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), buf[1 * 4 + 1]);
+    try std.testing.expectEqual(@as(u32, 0xFF000000), buf[1 * 4 + 2]);
+    try std.testing.expectEqual(@as(u32, 0xFF008000), buf[2 * 4 + 1]);
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), buf[2 * 4 + 2]);
+    // Clipped draw: only img(1,1) lands on buf2(0,0).
+    var buf2: [4]u32 = [_]u32{0xFF000000} ** 4;
+    const d2 = blitRgba(&buf2, 2, 2, &img, 2, 2, 2, -1, -1);
+    try std.testing.expect(!d2.empty);
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), buf2[0]);
+    try std.testing.expectEqual(@as(u32, 0xFF000000), buf2[1]);
+}

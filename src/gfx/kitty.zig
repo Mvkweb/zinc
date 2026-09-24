@@ -4,12 +4,14 @@
 
 const std = @import("std");
 const base64 = @import("../util/base64.zig");
+const inflate_mod = @import("../util/inflate.zig");
 
 pub const Action = enum(u8) {
     transmit = 'T',
     transmit_and_place = 't',
     query = 'q',
     delete = 'd',
+    put = 'p',
     unknown = 0,
 };
 
@@ -37,8 +39,233 @@ pub fn parseAction(c: u8) Action {
         't' => .transmit_and_place,
         'q' => .query,
         'd' => .delete,
+        'p' => .put,
         else => .unknown,
     };
+}
+
+// --- M1: APC control-data parse + direct RGB/RGBA transmit ---
+
+/// Parsed `G<k=v,...>` control section (leading 'G' stripped by caller).
+/// Unknown keys are skipped for forward compatibility; the first malformed
+/// piece lands in parse_err so callers can still attribute replies.
+pub const Control = struct {
+    action: Action = .unknown,
+    format: Format = .rgba,
+    img_w: u32 = 0, // s
+    img_h: u32 = 0, // v
+    image_id: u32 = 0, // i (0 = auto-assign)
+    quiet: u8 = 0, // q: 0 respond, 1 suppress OK, 2 suppress all
+    more: bool = false, // m=1 chunked (M2 reassembly; M1 rejects)
+    medium: u8 = 'd', // t (M1: direct only)
+    compressed: bool = false, // o present (M3 inflate)
+    del: u8 = 0, // d target for a=d (0 = bare: all visible)
+    has_action: bool = false, // 'a' key seen (continuation chunks lack it)
+    off_x: u16 = 0, // X pixel offset (uppercase; lowercase x deletes)
+    off_y: u16 = 0, // Y pixel offset (uppercase; lowercase y deletes)
+    z_index: i32 = 0, // z (<0 under text, <INT32_MIN/2 under cell bg)
+    cursor_move: bool = true, // C=1 disables post-place cursor advance
+    placement_id: u32 = 0, // p (0 = none; duplicates replace)
+    request_num: u32 = 0, // I (0 = none; i+I together is EINVAL)
+    parse_err: ?[]const u8 = null,
+};
+
+fn parseU32(s: []const u8) ?u32 {
+    if (s.len == 0) return null;
+    return std.fmt.parseInt(u32, s, 10) catch null;
+}
+
+/// Parse `a=T,f=32,...` (no leading 'G', no payload). Never fails outright.
+pub fn parseControl(ctrl: []const u8) Control {
+    var c = Control{};
+    var it = std.mem.splitScalar(u8, ctrl, ',');
+    while (it.next()) |tok| {
+        if (tok.len < 3 or tok[1] != '=') {
+            if (c.parse_err == null) c.parse_err = "bad control token";
+            continue;
+        }
+        const key = tok[0];
+        const val = tok[2..];
+        switch (key) {
+            'a' => {
+                c.has_action = true;
+                if (val.len != 1) {
+                    if (c.parse_err == null) c.parse_err = "bad action";
+                } else c.action = parseAction(val[0]);
+            },
+            'f' => {
+                const n = parseU32(val) orelse {
+                    if (c.parse_err == null) c.parse_err = "bad format";
+                    continue;
+                };
+                c.format = switch (n) {
+                    24 => .rgb,
+                    32 => .rgba,
+                    100 => .png,
+                    else => {
+                        if (c.parse_err == null) c.parse_err = "bad format";
+                        continue;
+                    },
+                };
+            },
+            's' => c.img_w = parseU32(val) orelse {
+                if (c.parse_err == null) c.parse_err = "bad dimensions";
+                continue;
+            },
+            'v' => c.img_h = parseU32(val) orelse {
+                if (c.parse_err == null) c.parse_err = "bad dimensions";
+                continue;
+            },
+            'i' => c.image_id = parseU32(val) orelse {
+                if (c.parse_err == null) c.parse_err = "bad image id";
+                continue;
+            },
+            'q' => {
+                const n = parseU32(val) orelse {
+                    if (c.parse_err == null) c.parse_err = "bad quiet flag";
+                    continue;
+                };
+                if (n > 2) {
+                    if (c.parse_err == null) c.parse_err = "bad quiet flag";
+                } else c.quiet = @intCast(n);
+            },
+            'm' => {
+                if (val.len != 1 or (val[0] != '0' and val[0] != '1')) {
+                    if (c.parse_err == null) c.parse_err = "bad more flag";
+                } else c.more = val[0] == '1';
+            },
+            't' => {
+                if (val.len != 1) {
+                    if (c.parse_err == null) c.parse_err = "bad medium";
+                } else c.medium = val[0];
+            },
+            'o' => c.compressed = true,
+            'd' => {
+                if (val.len != 1) {
+                    if (c.parse_err == null) c.parse_err = "bad delete target";
+                } else c.del = val[0];
+            },
+            'X' => {
+                const n = parseU32(val) orelse {
+                    if (c.parse_err == null) c.parse_err = "bad offset";
+                    continue;
+                };
+                if (n > 0xFFFF) {
+                    if (c.parse_err == null) c.parse_err = "bad offset";
+                } else c.off_x = @intCast(n);
+            },
+            'Y' => {
+                const n = parseU32(val) orelse {
+                    if (c.parse_err == null) c.parse_err = "bad offset";
+                    continue;
+                };
+                if (n > 0xFFFF) {
+                    if (c.parse_err == null) c.parse_err = "bad offset";
+                } else c.off_y = @intCast(n);
+            },
+            'z' => {
+                c.z_index = std.fmt.parseInt(i32, val, 10) catch {
+                    if (c.parse_err == null) c.parse_err = "bad z-index";
+                    continue;
+                };
+            },
+            'C' => {
+                if (val.len != 1 or (val[0] != '0' and val[0] != '1')) {
+                    if (c.parse_err == null) c.parse_err = "bad cursor policy";
+                } else c.cursor_move = val[0] == '0';
+            },
+            'p' => c.placement_id = parseU32(val) orelse {
+                if (c.parse_err == null) c.parse_err = "bad placement id";
+                continue;
+            },
+            'I' => c.request_num = parseU32(val) orelse {
+                if (c.parse_err == null) c.parse_err = "bad image number";
+                continue;
+            },
+            else => {}, // c/r/x/y/I/U/... : delete keys + M2c.
+        }
+    }
+    return c;
+}
+
+/// Decode base64 payload into freshly allocated bytes. The decoded length
+/// must match expected exactly: short payloads fail, and trailing garbage
+/// is detected via the oversized temp buffer (base64.decode stops at dst
+/// capacity, so an exact-size buffer could not see the excess).
+pub fn decodeToBytes(gpa: std.mem.Allocator, payload_b64: []const u8, expected: usize) ![]u8 {
+    if (expected > std.math.maxInt(usize) - 4) return error.BadLength;
+    const tmp = try gpa.alloc(u8, expected + 4);
+    defer gpa.free(tmp);
+    const n = decodeChunk(tmp, payload_b64) catch return error.BadBase64;
+    if (n != expected) return error.BadLength;
+    return try gpa.dupe(u8, tmp[0..n]);
+}
+
+/// Decode a full base64 payload up to max_bytes (for PNG/zlib whose decoded
+/// length isn't known upfront). Exact-length callers use decodeToBytes.
+pub fn decodeAllBounded(gpa: std.mem.Allocator, payload_b64: []const u8, max_bytes: usize) ![]u8 {
+    const upper = base64.decodedLen(payload_b64.len);
+    if (upper > max_bytes) return error.TooLarge;
+    const tmp = try gpa.alloc(u8, @max(upper, 1));
+    defer gpa.free(tmp);
+    const n = decodeChunk(tmp, payload_b64) catch return error.BadBase64;
+    return try gpa.dupe(u8, tmp[0..n]);
+}
+
+/// Base64 zlib stream (o=z) -> exact raw bytes. The transport already bounds
+/// the input length; the output must equal expected (OverLimit collapses to
+/// BadLength since the bound IS the expected size here).
+pub fn decodeZlibBounded(gpa: std.mem.Allocator, payload_b64: []const u8, expected: usize) ![]u8 {
+    const comp = try decodeAllBounded(gpa, payload_b64, std.math.maxInt(usize));
+    defer gpa.free(comp);
+    const out = inflate_mod.zlibDecompressBounded(gpa, comp, expected) catch |e| switch (e) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.OverLimit => return error.BadLength,
+        error.BadAdler, error.InvalidData => return error.BadData,
+        error.Unsupported => return error.Unsupported,
+    };
+    errdefer gpa.free(out);
+    if (out.len != expected) return error.BadLength;
+    return out;
+}
+
+/// Swizzle decoded RGB/RGBA bytes into ARGB pool pixels (R<->B lane swap;
+/// RGB expands opaque). Caller guarantees dst.len * bpp == src.len.
+pub fn swizzlePixels(dst: []u32, src: []const u8, format: Format) void {
+    switch (format) {
+        .rgb => {
+            var i: usize = 0;
+            while (i < dst.len) : (i += 1) {
+                dst[i] = 0xFF000000 | (@as(u32, src[3 * i]) << 16) | (@as(u32, src[3 * i + 1]) << 8) | src[3 * i + 2];
+            }
+        },
+        else => { // rgba (+ PNG post-decode, same layout)
+            var i: usize = 0;
+            while (i < dst.len) : (i += 1) {
+                dst[i] = (@as(u32, src[4 * i + 3]) << 24) | (@as(u32, src[4 * i]) << 16) | (@as(u32, src[4 * i + 1]) << 8) | src[4 * i + 2];
+            }
+        },
+    }
+}
+
+/// Success reply: ESC _ G i=<id>;OK ESC \. Caller provides scratch (>=32B).
+pub fn formatOk(out: []u8, id: u32) []u8 {
+    return std.fmt.bufPrint(out, "\x1b_Gi={d};OK\x1b\\", .{id}) catch out[0..0];
+}
+
+/// Placement reply: ESC _ G i=<id>,p=<pid>;OK ESC \.
+pub fn formatOkP(out: []u8, id: u32, pid: u32) []u8 {
+    return std.fmt.bufPrint(out, "\x1b_Gi={d},p={d};OK\x1b\\", .{ id, pid }) catch out[0..0];
+}
+
+/// Assigned-id reply: ESC _ G i=<id>,I=<num>;OK ESC \.
+pub fn formatOkI(out: []u8, id: u32, num: u32) []u8 {
+    return std.fmt.bufPrint(out, "\x1b_Gi={d},I={d};OK\x1b\\", .{ id, num }) catch out[0..0];
+}
+
+/// Error reply: ESC _ G i=<id>;<msg> ESC \. msg must be printable ASCII.
+pub fn formatErr(out: []u8, id: u32, msg: []const u8) []u8 {
+    return std.fmt.bufPrint(out, "\x1b_Gi={d};{s}\x1b\\", .{ id, msg }) catch out[0..0];
 }
 
 /// Decode one base64 chunk into scratch dst. Returns bytes written.
@@ -95,4 +322,71 @@ test "kitty action + scale identity" {
     try std.testing.expectEqual(src[0], dst[0]);
     var buf: [8]u8 = undefined;
     try std.testing.expectEqual(@as(usize, 3), try decodeChunk(&buf, "TWFu"));
+}
+
+test "kitty control parse" {
+    const c = parseControl("a=t,f=32,s=32,v=16,i=7,q=0,m=0");
+    try std.testing.expectEqual(Action.transmit_and_place, c.action);
+    try std.testing.expectEqual(Format.rgba, c.format);
+    try std.testing.expectEqual(@as(u32, 32), c.img_w);
+    try std.testing.expectEqual(@as(u32, 16), c.img_h);
+    try std.testing.expectEqual(@as(u32, 7), c.image_id);
+    try std.testing.expect(c.parse_err == null);
+    // Unknown keys skipped, malformed token recorded once.
+    const c2 = parseControl("a=T,f=24,s=8,v=8,z=5,foo,x");
+    try std.testing.expectEqual(Action.transmit, c2.action);
+    try std.testing.expect(c2.parse_err != null);
+    // Bad int keeps field zeroed.
+    const c3 = parseControl("a=t,f=32,s=x,v=8");
+    try std.testing.expect(c3.parse_err != null);
+    try std.testing.expectEqual(@as(u32, 0), c3.img_w);
+}
+
+test "kitty replies" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("\x1b_Gi=7;OK\x1b\\", formatOk(&buf, 7));
+    try std.testing.expectEqualStrings("\x1b_Gi=0;ENOMEM\x1b\\", formatErr(&buf, 0, "ENOMEM"));
+}
+
+test "kitty rgba decode + swizzle" {
+    // 2x1: red, green. FF0000FF 00FF00FF -> "/wAA/wD/AP8=".
+    const raw = try decodeToBytes(std.testing.allocator, "/wAA/wD/AP8=", 8);
+    defer std.testing.allocator.free(raw);
+    var px: [2]u32 = undefined;
+    swizzlePixels(&px, raw, .rgba);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), px[0]);
+    try std.testing.expectEqual(@as(u32, 0xFF00FF00), px[1]);
+    // Length mismatch fails.
+    try std.testing.expectError(error.BadLength, decodeToBytes(std.testing.allocator, "/wAA/wD/AP8=", 7));
+}
+
+test "kitty geometry keys" {
+    const c = parseControl("a=t,f=32,s=8,v=8,X=3,Y=4,z=-5,C=1,p=2");
+    try std.testing.expectEqual(@as(u16, 3), c.off_x);
+    try std.testing.expectEqual(@as(u16, 4), c.off_y);
+    try std.testing.expectEqual(@as(i32, -5), c.z_index);
+    try std.testing.expect(!c.cursor_move);
+    try std.testing.expectEqual(@as(u32, 2), c.placement_id);
+    try std.testing.expect(c.parse_err == null);
+    const c2 = parseControl("a=t,z=abc");
+    try std.testing.expect(c2.parse_err != null);
+    // Lowercase x/y are delete-cell keys, not offsets: skipped here.
+    const c3 = parseControl("a=t,x=3,y=4");
+    try std.testing.expect(c3.parse_err == null);
+    try std.testing.expectEqual(@as(u16, 0), c3.off_x);
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("\x1b_Gi=7,p=2;OK\x1b\\", formatOkP(&buf, 7, 2));
+}
+
+test "kitty request-id reply" {
+    var buf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("\x1b_Gi=99,I=13;OK\x1b\\", formatOkI(&buf, 99, 13));
+}
+
+test "kitty decode-all bounded" {
+    const raw = try decodeAllBounded(std.testing.allocator, "/wAA/wD/AP8=", 16);
+    defer std.testing.allocator.free(raw);
+    try std.testing.expectEqual(@as(usize, 8), raw.len);
+    try std.testing.expectEqual(@as(u8, 0xFF), raw[0]);
+    try std.testing.expectError(error.TooLarge, decodeAllBounded(std.testing.allocator, "/wAA/wD/AP8=", 7));
 }

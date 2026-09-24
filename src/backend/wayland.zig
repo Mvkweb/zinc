@@ -151,6 +151,7 @@ const hyperlink_mod = @import("../term/hyperlink.zig");
 const cell_mod = @import("../term/cell.zig");
 const software = @import("../render/software.zig");
 const box_drawing = @import("../render/box_drawing.zig");
+const placeholder_mod = @import("../gfx/placeholder.zig");
 const ft_mod = @import("../font/ft.zig");
 const atlas_mod = @import("../font/atlas.zig");
 const utf8_mod = @import("../util/utf8.zig");
@@ -662,6 +663,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Key-repeat timer (soft-fail: no repeat, but a working terminal).
             const tfd = linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true });
             if (linux.errno(tfd) == .SUCCESS) self.repeat_fd = @intCast(tfd);
+            // Kitty cursor-advance math needs real cell pixels (defaults fit
+            // headless tests until this runs).
+            self.ctx.cell_w_px = @intCast(@max(1, self.cell_w));
+            self.ctx.cell_h_px = @intCast(@max(1, self.cell_h));
             self.last_activity_ms = context_mod.nowMs();
             _ = malloc_trim(0);
 
@@ -877,6 +882,78 @@ pub fn App(comptime cfg: config_mod.Config) type {
             return raw & 0xFFFFFF;
         }
 
+        /// M5: blit one unicode-placeholder cell (U+10EEEE) from its pool
+        /// image. Source rect = one cell (cw x ch) at the resolved offset.
+        /// True when painted (caller skips the glyph path); false falls
+        /// through to normal text rendering.
+        fn blitPlaceholder(
+            self: *Self,
+            col: u16,
+            row: u16,
+            x: u32,
+            y: u32,
+            W: u32,
+            H: u32,
+            dmg: *software.Damage,
+        ) bool {
+            if (!cfg.kitty_gfx) return false;
+            const ph = self.ctx.resolvePlaceholder(col, row) orelse return false;
+            const img = self.ctx.images.findImage(ph.img_id) orelse return false;
+            const cwu: u32 = @intCast(@max(1, self.cell_w));
+            const chu: u32 = @intCast(@max(1, self.cell_h));
+            const sx: u32 = @as(u32, ph.col) * cwu;
+            const sy: u32 = @as(u32, ph.row) * chu;
+            if (sx >= img.w or sy >= img.h) return false;
+            const w: u32 = @min(cwu, img.w - sx);
+            const h: u32 = @min(chu, img.h - sy);
+            const src = img.pixels[@as(usize, sy) * @as(usize, img.w) + sx ..];
+            const idmg = software.blitRgba(self.pool_pixels, W, H, src, w, h, img.w, @intCast(x), @intCast(y));
+            dmgMerge(dmg, idmg);
+            return true;
+        }
+
+        /// Blit one z-tier of kitty placements (0 = below cell bg, i.e.
+        /// z < INT32_MIN/2; 1 = below text, z < 0; 2 = above text, z >= 0).
+        /// Placements stay sorted by (z_index, img_id) so same-tier overlap
+        /// draws the lower id first (spec).
+        fn blitImageTier(
+            self: *Self,
+            tier: u8,
+            W: u32,
+            H: u32,
+            px: i32,
+            py: i32,
+            cw: i32,
+            ch: i32,
+            visible_cols: u16,
+            visible_rows: u16,
+            dmg: *software.Damage,
+        ) void {
+            if (!cfg.kitty_gfx) return;
+            const voff: i32 = @intCast(@min(self.ctx.grid.view_offset, self.ctx.grid.sb_len));
+            for (self.ctx.images.placements.items) |pl| {
+                const t: u8 = if (pl.z_index < -1073741824) 0 else if (pl.z_index < 0) 1 else 2;
+                if (t != tier) continue;
+                if (pl.alt_screen != self.ctx.alt_active) continue;
+                const img = self.ctx.images.findImage(pl.img_id) orelse continue;
+                // M4 scroll clipping: skip source rows scrolled off the top.
+                var src: []const u32 = img.pixels;
+                var sh: u32 = img.h;
+                if (pl.clip_top > 0) {
+                    const skip: usize = @min(@as(usize, pl.clip_top), @as(usize, img.h));
+                    src = img.pixels[skip * @as(usize, img.w) ..];
+                    sh = img.h - @as(u32, @intCast(skip));
+                }
+                const vr: i32 = @as(i32, pl.row) + voff;
+                if (vr < 0 or vr >= @as(i32, visible_rows)) continue;
+                if (pl.col >= visible_cols) continue;
+                const dx: i32 = px + @as(i32, pl.col) * cw + pl.x_off;
+                const dy: i32 = py + vr * ch + pl.y_off;
+                const idmg = software.blitRgba(self.pool_pixels, W, H, src, img.w, sh, img.w, dx, dy);
+                dmgMerge(dmg, idmg);
+            }
+        }
+
         fn renderCells(self: *Self) software.Damage {
             var dmg = software.Damage{};
             const W: u32 = @intCast(self.width);
@@ -891,6 +968,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
             const visible_cols = @min(self.ctx.grid.cols, @as(u16, @intCast(@max(0, @divFloor(self.width - px, cw)))));
             const visible_rows = @min(self.ctx.grid.rows, @as(u16, @intCast(@max(0, @divFloor(self.height - py, ch)))));
+            // Tier 0 images (below cell backgrounds).
+            self.blitImageTier(0, W, H, px, py, cw, ch, visible_cols, visible_rows, &dmg);
 
             // Pass 1: non-default cell backgrounds (default bg was filled above).
             var row: u16 = 0;
@@ -922,6 +1001,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 }
             }
 
+            // Tier 1 images (below text, above cell backgrounds).
+            self.blitImageTier(1, W, H, px, py, cw, ch, visible_cols, visible_rows, &dmg);
             // Pass 2: glyphs, combining marks, underlines.
             row = 0;
             while (row < visible_rows) : (row += 1) {
@@ -960,6 +1041,14 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     if (!cell.attr.invisible) {
                         const cp = cellCp(cell.rune);
                         if (cp != ' ' and cp != 0) {
+                            // Kitty unicode placeholder: blit the image
+                            // slice; the diacritic combining marks must not
+                            // render as glyphs over it.
+                            if (cfg.kitty_gfx and cp == placeholder_mod.PLACEHOLDER and
+                                self.blitPlaceholder(col, row, x, y, W, H, &dmg))
+                            {
+                                continue;
+                            }
                             var drawn_box = false;
                             // Unicode Block Elements (0x2580..0x259F: █, ▀, ▄, shades, quadrants):
                             // Render procedurally with 100% cell coverage so adjacent cells connect
@@ -1096,6 +1185,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     }
                 }
             }
+            // Tier 2 images (above text, below cursor).
+            // M2b: placements sit at grid rows and do NOT shift on scroll
+            // (M4) — text scrolls under a static image until then.
+            self.blitImageTier(2, W, H, px, py, cw, ch, visible_cols, visible_rows, &dmg);
             // Block cursor; hollow outline when unfocused; hidden on blink
             // phase, DECSET 25 reset, or while scrolled into history.
             const show_cursor = (!self.cursor_blink or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0;
@@ -1309,6 +1402,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.font_size_pt = clamped_pt;
             self.cell_w = self.ft_face.cell_w;
             self.cell_h = self.ft_face.cell_h;
+            // Kitty cursor-advance math needs real cell pixels.
+            self.ctx.cell_w_px = @intCast(@max(1, self.cell_w));
+            self.ctx.cell_h_px = @intCast(@max(1, self.cell_h));
             self.ascent = self.ft_face.ascent;
 
             self.atlas.clear();
@@ -1430,10 +1526,16 @@ pub fn App(comptime cfg: config_mod.Config) type {
                             break;
                         }
                         tracePty(pty_buf[0..rrc]);
-                        self.ctx.answerQueries(pty_buf[0..rrc]);
+                        // Parse first, answerQueries second: replies must go
+                        // out in byte-arrival order. Capability batches (e.g.
+                        // ratatui-image's probe) end with DSR as a terminator;
+                        // answering it before the state machine's own replies
+                        // (kitty OK, 16t) makes readers stop early and fall
+                        // back to halfblocks.
                         const prev_mouse_mode = self.ctx.mouse_mode;
                         const prev_alt = self.ctx.alt_active;
                         self.ctx.parse(pty_buf[0..rrc]);
+                        self.ctx.answerQueries(pty_buf[0..rrc]);
                         if (self.ctx.mouse_mode != prev_mouse_mode) {
                             if (self.ctx.mouse_mode != .off and cfg.selection and self.sel.active) {
                                 self.sel.clear();

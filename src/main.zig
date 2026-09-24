@@ -360,6 +360,7 @@ test {
     _ = @import("gfx/image_pool.zig");
     _ = @import("gfx/sixel.zig");
     _ = @import("gfx/kitty.zig");
+    _ = @import("gfx/placeholder.zig");
     _ = @import("font/ttf.zig");
     _ = @import("font/ft.zig");
     _ = @import("font/atlas.zig");
@@ -375,5 +376,7 @@ test {
     _ = @import("input/selection.zig");
     _ = @import("util/utf8.zig");
     _ = @import("util/base64.zig");
+    _ = @import("util/inflate.zig");
+    _ = @import("util/png.zig");
     _ = @import("util/scratch.zig");
 }
