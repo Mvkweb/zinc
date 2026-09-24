@@ -116,6 +116,9 @@ pub const Config = struct {
     clipboard: bool = true,
     clipboard_osc52: bool = true,
     clipboard_buf_size: u32 = 4096,
+    /// In-terminal find (Ctrl+Shift+F bottom bar over scrollback + grid).
+    find: bool = true,
+    find_max_matches: u32 = 256,
     osc_init_cap: u32 = 128,
     osc_max_cap: u32 = 16 * 1024 * 1024,
 
@@ -162,6 +165,7 @@ pub const minimal: Config = .{
     .cursor_trail_ms = 0,
     .double_buffer = false,
     .hyperlinks = false,
+    .find = false,
 };
 
 /// Active profile selected by `-Dminimal` / `-Dascii-only`.

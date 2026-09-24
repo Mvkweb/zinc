@@ -152,6 +152,7 @@ const cell_mod = @import("../term/cell.zig");
 const software = @import("../render/software.zig");
 const box_drawing = @import("../render/box_drawing.zig");
 const placeholder_mod = @import("../gfx/placeholder.zig");
+const search_mod = @import("../term/search.zig");
 const ft_mod = @import("../font/ft.zig");
 const atlas_mod = @import("../font/atlas.zig");
 const utf8_mod = @import("../util/utf8.zig");
@@ -261,6 +262,16 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// app itself isn't tracking the mouse (mouse_mode == .off).
         sel: selection_mod.Selection = .{},
         sel_drag: bool = false,
+        /// In-terminal find (Ctrl+Shift+F bottom bar). Query edits rebuild
+        /// matches; the viewport jumps per current match; Esc restores scroll.
+        find_active: bool = false,
+        find_query: [256]u8 = undefined,
+        find_qlen: usize = 0,
+        find_matches: std.ArrayList(search_mod.Match) = .empty,
+        find_idx: usize = 0,
+        find_saved_off: usize = 0,
+        find_vis: [64]search_mod.Match = [_]search_mod.Match{.{ .row = 0, .col = 0, .erow = 0, .ecol = 0 }} ** 64,
+        find_vis_n: usize = 0,
         last_click_time: u32 = 0,
         last_click_col: u16 = 0,
         last_click_row: u16 = 0,
@@ -710,6 +721,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (self.cursor_shape_mgr) |m| c.wl_proxy_destroy(@ptrCast(m));
             if (self.clip_text) |t| self.gpa.free(t);
             if (self.hover_uri) |u| self.gpa.free(u);
+            self.find_matches.deinit(self.gpa);
             if (self.seat) |s| c.wl_proxy_destroy(@ptrCast(s));
             if (self.toplevel) |t| c.wl_proxy_destroy(@ptrCast(t));
             if (self.xdg_surface) |x| c.wl_proxy_destroy(@ptrCast(x));
@@ -912,6 +924,98 @@ pub fn App(comptime cfg: config_mod.Config) type {
             return true;
         }
 
+        /// Find: collect matches overlapping the visible viewport (sorted
+        /// input, early-out past the bottom). Called once per frame.
+        fn collectVisibleFind(self: *Self, v0: usize, v1: usize) void {
+            self.find_vis_n = 0;
+            if (!cfg.find or !self.find_active) return;
+            for (self.find_matches.items) |m| {
+                if (m.row > v1) break;
+                if (m.erow < v0) continue;
+                if (self.find_vis_n >= self.find_vis.len) break;
+                self.find_vis[self.find_vis_n] = m;
+                self.find_vis_n += 1;
+            }
+        }
+
+        fn matchCovers(m: search_mod.Match, abs: usize, col: u16) bool {
+            if (abs < m.row or abs > m.erow) return false;
+            if (m.row == m.erow) return col >= m.col and col <= m.ecol;
+            if (abs == m.row) return col >= m.col;
+            if (abs == m.erow) return col <= m.ecol;
+            return true;
+        }
+
+        /// 0 = none, 1 = current match, 2 = other match.
+        fn findMatchAt(self: *const Self, abs: usize, col: u16) u8 {
+            if (!cfg.find or !self.find_active or self.find_vis_n == 0) return 0;
+            var rank: u8 = 0;
+            var k: usize = 0;
+            while (k < self.find_vis_n) : (k += 1) {
+                const m = self.find_vis[k];
+                if (!matchCovers(m, abs, col)) continue;
+                // Matches are non-overlapping, so start coords identify.
+                if (self.find_idx < self.find_matches.items.len) {
+                    const cur = self.find_matches.items[self.find_idx];
+                    if (m.row == cur.row and m.col == cur.col) return 1;
+                }
+                rank = 2;
+            }
+            return rank;
+        }
+
+        /// Find bar: full-width bottom overlay. Left: prompt + query with
+        /// cursor; right: position + hints. Selection colors, themed.
+        fn drawFindBar(self: *Self, W: u32, H: u32, px: i32, py: i32, cw: i32, ch: i32, visible_cols: u16, visible_rows: u16, dmg: *software.Damage) void {
+            const bar_bg = self.themed(self.selection_bg & 0xFFFFFF, false);
+            const bar_fg = 0xFF000000 | (self.selection_fg & 0xFFFFFF);
+            const y: u32 = @intCast(py + @as(i32, visible_rows - 1) * ch);
+            software.fillRect(self.pool_pixels, W, H, 0, y, W, @intCast(ch), bar_bg, dmg);
+            const q = self.find_query[0..self.find_qlen];
+            const maxq: usize = if (visible_cols > 40) @min(q.len, @as(usize, visible_cols) - 40) else 0;
+            const qshow = q[q.len -| maxq..];
+            var left: [300]u8 = undefined;
+            const ltext = std.fmt.bufPrint(&left, " Find: {s}_", .{qshow}) catch left[0..0];
+            self.drawBarText(ltext, bar_fg, px, y, cw, ch, W, H, dmg);
+            if (visible_cols <= 40) return;
+            var right: [96]u8 = undefined;
+            const n = self.find_matches.items.len;
+            const rtext = if (n == 0)
+                std.fmt.bufPrint(&right, "0/0  enter:next  esc:done ", .{}) catch right[0..0]
+            else
+                std.fmt.bufPrint(&right, "{d}/{d}  enter:next  esc:done ", .{ self.find_idx + 1, n }) catch right[0..0];
+            const rx: i32 = px + @as(i32, visible_cols) * cw - @as(i32, @intCast(rtext.len)) * cw;
+            self.drawBarText(rtext, bar_fg, rx, y, cw, ch, W, H, dmg);
+        }
+
+        fn drawBarText(self: *Self, text: []const u8, fg: u32, x0: i32, y: u32, cw: i32, ch: i32, W: u32, H: u32, dmg: *software.Damage) void {
+            _ = ch;
+            var x = x0;
+            for (text) |b| {
+                const cp: u21 = b; // bar strings are ASCII-only by construction
+                if (self.glyphFor(cp, .regular)) |g| {
+                    const gdmg = software.blitGlyph(
+                        self.pool_pixels,
+                        W,
+                        H,
+                        self.atlas.pixels,
+                        self.atlas.size,
+                        g.x,
+                        g.y,
+                        g.w,
+                        g.h,
+                        g.xoff,
+                        g.yoff,
+                        x,
+                        @as(i32, @intCast(y)) + self.ascent,
+                        fg,
+                    );
+                    dmgMerge(dmg, gdmg);
+                }
+                x += cw;
+            }
+        }
+
         /// Blit one z-tier of kitty placements (0 = below cell bg, i.e.
         /// z < INT32_MIN/2; 1 = below text, z < 0; 2 = above text, z >= 0).
         /// Placements stay sorted by (z_index, img_id) so same-tier overlap
@@ -968,6 +1072,14 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
             const visible_cols = @min(self.ctx.grid.cols, @as(u16, @intCast(@max(0, @divFloor(self.width - px, cw)))));
             const visible_rows = @min(self.ctx.grid.rows, @as(u16, @intCast(@max(0, @divFloor(self.height - py, ch)))));
+            // Find: visible match subset for per-cell highlight checks.
+            if (cfg.find and self.find_active and visible_rows > 0) {
+                const v0 = search_mod.absRow(&self.ctx.grid, 0);
+                const v1 = search_mod.absRow(&self.ctx.grid, visible_rows - 1);
+                self.collectVisibleFind(v0, v1);
+            } else {
+                self.find_vis_n = 0;
+            }
             // Tier 0 images (below cell backgrounds).
             self.blitImageTier(0, W, H, px, py, cw, ch, visible_cols, visible_rows, &dmg);
 
@@ -979,15 +1091,20 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     const cell_ptr = self.ctx.grid.viewCell(col, row) orelse continue;
                     const cell = cell_ptr.*;
                     const is_selected = self.isCellSelected(col, row);
+                    const find_hit = self.findMatchAt(search_mod.absRow(&self.ctx.grid, row), col);
+                    const is_current = find_hit == 1;
+                    const is_other = find_hit == 2;
                     const is_reversed = cell.attr.reverse;
                     const is_def_bg = cell_mod.isDefaultColor(cell.bg);
 
                     // Skip drawing if default background (already filled by bg_all).
-                    if (is_def_bg and !is_reversed and !is_selected) continue;
+                    if (is_def_bg and !is_reversed and !is_selected and !is_current and !is_other) continue;
 
                     var bg_straight: u32 = undefined;
-                    if (is_selected) {
+                    if (is_selected or is_current) {
                         bg_straight = self.selection_bg & 0xFFFFFF;
+                    } else if (is_other) {
+                        bg_straight = software.blendArgb(0xFF000000 | (self.resolveBg(cell.bg) & 0xFFFFFF), self.selection_bg & 0xFFFFFF, 90) & 0xFFFFFF;
                     } else if (is_reversed) {
                         bg_straight = self.resolveFg(cell.fg) & 0xFFFFFF;
                     } else {
@@ -1021,7 +1138,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     // fg stays straight-opaque for the coverage blend. Swap
                     // before converting so reverse video uses bg as fg.
                     var fg_raw: u32 = undefined;
-                    if (self.isCellSelected(col, row)) {
+                    if (self.isCellSelected(col, row) or self.findMatchAt(search_mod.absRow(&self.ctx.grid, row), col) == 1) {
                         fg_raw = self.selection_fg & 0xFFFFFF;
                     } else if (cell.attr.reverse) {
                         fg_raw = self.resolveBg(cell.bg) & 0xFFFFFF;
@@ -1213,6 +1330,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     software.fillRect(self.pool_pixels, W, H, ccx + cwu - ot, ccy, ot, chu, cur, &dmg);
                 }
             }
+            // Find bar: bottom-row overlay while find mode is active.
+            if (cfg.find and self.find_active and visible_rows > 0) {
+                self.drawFindBar(W, H, px, py, cw, ch, visible_cols, visible_rows, &dmg);
+            }
             return dmg;
         }
 
@@ -1357,6 +1478,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (self.pty_fd >= 0) {
                 pty_mod.resizePty(self.pty_fd, cols, rows, @intCast(@min(self.width, 32767)), @intCast(@min(self.height, 32767)));
             }
+            if (cfg.find and self.find_active) self.researchFind();
             self.needs_render = true;
         }
 
@@ -1364,6 +1486,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (cfg.selection and self.sel.active) {
                 self.sel.clear();
             }
+            // Find matches reference the other screen's rows; close out.
+            if (cfg.find and self.find_active) self.closeFind();
             const pad_x = self.currentPadX();
             const pad_y = self.currentPadY();
             const cols: u16 = @intCast(@max(15, @divFloor(self.width - 2 * @as(i32, @intCast(pad_x)), self.cell_w)));
@@ -1618,6 +1742,76 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.repeatSet(0, 0);
         }
 
+        // -- find (Ctrl+Shift+F bottom bar) -----------------------------------
+
+        fn toggleFind(self: *Self) void {
+            if (!cfg.find) return;
+            if (self.find_active) {
+                self.closeFind();
+                return;
+            }
+            self.find_active = true;
+            self.find_qlen = 0;
+            self.find_idx = 0;
+            self.find_saved_off = @min(self.ctx.grid.view_offset, self.ctx.grid.sb_len);
+            self.find_matches.clearRetainingCapacity();
+            self.find_vis_n = 0;
+            self.needs_render = true;
+        }
+
+        fn closeFind(self: *Self) void {
+            if (!self.find_active) return;
+            self.find_active = false;
+            self.find_matches.clearRetainingCapacity();
+            self.find_vis_n = 0;
+            const sb = self.ctx.grid.sb_len;
+            const want = @min(self.find_saved_off, sb);
+            const cur: i64 = @intCast(@min(self.ctx.grid.view_offset, sb));
+            self.ctx.grid.scrollView(@as(i32, @intCast(@as(i64, @intCast(want)) - cur)));
+            self.needs_render = true;
+        }
+
+        /// Rebuild matches for the current query and jump to the first hit.
+        /// Matches freeze while PTY output flows (rebuilt on the next find
+        /// keypress); absolute rows stay valid as scrollback only appends.
+        fn researchFind(self: *Self) void {
+            if (!cfg.find or !self.find_active) return;
+            self.find_vis_n = 0;
+            if (self.find_qlen == 0) {
+                self.find_matches.clearRetainingCapacity();
+                self.needs_render = true;
+                return;
+            }
+            const fresh = search_mod.findAll(self.gpa, &self.ctx.grid, self.find_query[0..self.find_qlen], cfg.find_max_matches) catch {
+                self.needs_render = true;
+                return;
+            };
+            self.find_matches.deinit(self.gpa);
+            self.find_matches = fresh;
+            if (self.find_idx >= self.find_matches.items.len) self.find_idx = 0;
+            self.jumpFind();
+        }
+
+        fn jumpFind(self: *Self) void {
+            if (self.find_idx >= self.find_matches.items.len) {
+                self.needs_render = true;
+                return;
+            }
+            search_mod.ensureVisible(&self.ctx.grid, self.find_matches.items[self.find_idx].row);
+            self.needs_render = true;
+        }
+
+        fn findStep(self: *Self, dir: i32) void {
+            const n = self.find_matches.items.len;
+            if (n == 0) return;
+            if (dir >= 0) {
+                self.find_idx = (self.find_idx + 1) % n;
+            } else {
+                self.find_idx = (self.find_idx + n - 1) % n;
+            }
+            self.jumpFind();
+        }
+
         fn handleSym(self: *Self, sym: u32, keycode: u32) void {
             if (self.xkb_state == null) return;
             const mods = self.currentMods();
@@ -1640,6 +1834,48 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     self.pasteClipboard();
                     return;
                 }
+            }
+
+            // Find toggle: Ctrl+Shift+F opens, closes when open.
+            if (cfg.find and mods.ctrl and mods.shift and (sym == 'F' or sym == 'f')) {
+                self.toggleFind();
+                return;
+            }
+            // Find-mode routing: nav/edit keys consumed; anything else
+            // exits find mode and falls through to normal dispatch.
+            if (cfg.find and self.find_active) {
+                if (sym == K.Escape) {
+                    self.closeFind();
+                    return;
+                }
+                if (sym == K.Return) {
+                    self.findStep(if (mods.shift) -1 else 1);
+                    return;
+                }
+                if (sym == K.Up) {
+                    self.findStep(-1);
+                    return;
+                }
+                if (sym == K.Down) {
+                    self.findStep(1);
+                    return;
+                }
+                if (sym == K.BackSpace) {
+                    if (self.find_qlen > 0) {
+                        self.find_qlen -= 1;
+                        self.researchFind();
+                    }
+                    return;
+                }
+                if (sym >= 0x20 and sym <= 0x7E) {
+                    if (self.find_qlen < self.find_query.len) {
+                        self.find_query[self.find_qlen] = @intCast(sym);
+                        self.find_qlen += 1;
+                        self.researchFind();
+                    }
+                    return;
+                }
+                self.closeFind();
             }
 
             // Font zoom shortcuts: Ctrl + '+'/'='/'KP_Add', Ctrl + '-'/'KP_Subtract', Ctrl + '0'/'KP_0'.
