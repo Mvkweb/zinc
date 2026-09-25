@@ -146,6 +146,25 @@ pub fn openUrl(url: []const u8) void {
     _ = waitpid(pid, null, 0);
 }
 
+/// Spawn argv detached (double-fork, no shell, no zombies). prog is
+/// argv[0]. Used for the configured editor command; openUrl stays for URLs.
+pub fn spawnArgv(prog: [*:0]const u8, argv: [*:null]const ?[*:0]const u8) void {
+    const pid_rc = linux.fork();
+    if (linux.errno(pid_rc) != .SUCCESS) return;
+    const pid: c_int = @intCast(pid_rc);
+    if (pid == 0) {
+        _ = linux.setsid();
+        const g_rc = linux.fork();
+        if (linux.errno(g_rc) != .SUCCESS) linux.exit(1);
+        if (g_rc == 0) {
+            _ = execvpe(prog, argv, environ);
+            linux.exit(127);
+        }
+        linux.exit(0);
+    }
+    _ = waitpid(pid, null, 0);
+}
+
 /// Resize the PTY (keeps kernel + shell in sync with grid).
 pub fn resizePty(fd: i32, cols: u16, rows: u16, px_w: u16, px_h: u16) void {
     var ws = Winsize{ .ws_row = rows, .ws_col = cols, .ws_xpixel = px_w, .ws_ypixel = px_h };

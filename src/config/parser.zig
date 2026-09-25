@@ -23,11 +23,23 @@ pub const RuntimeConfig = struct {
     cursor_blink: ?bool = null,
     cursor_thick_px: ?f32 = null,
     selection_single_cell: ?bool = null,
+    find_match_numbers: ?bool = null,
+    find_number_scale: ?u8 = null,
+    editor_command: ?[]const u8 = null,
+    editor_command_terminal: ?[]const u8 = null,
 
     pub fn deinit(self: *RuntimeConfig, gpa: std.mem.Allocator) void {
         if (self.font_family) |f| {
             gpa.free(f);
             self.font_family = null;
+        }
+        if (self.editor_command) |e| {
+            gpa.free(e);
+            self.editor_command = null;
+        }
+        if (self.editor_command_terminal) |e| {
+            gpa.free(e);
+            self.editor_command_terminal = null;
         }
     }
 };
@@ -88,6 +100,26 @@ pub fn parseCursorStyle(raw: []const u8) ?CursorStyle {
     return null;
 }
 
+/// Strip a trailing ` #comment` (hash outside quotes): lets users annotate
+/// values without breaking quote stripping downstream. A leading `#`
+/// (colors) and quoted hashes are left alone.
+fn stripInlineComment(val: []const u8) []const u8 {
+    var q: u8 = 0;
+    var i: usize = 0;
+    while (i < val.len) {
+        const b = val[i];
+        if (q == 0 and (b == '\'' or b == '"')) {
+            q = b;
+        } else if (q != 0 and b == q) {
+            q = 0;
+        } else if (b == '#' and q == 0 and i > 0 and (val[i - 1] == ' ' or val[i - 1] == '\t')) {
+            return std.mem.trim(u8, val[0..i], " \t");
+        }
+        i += 1;
+    }
+    return val;
+}
+
 fn trimQuotes(val: []const u8) []const u8 {
     var s = std.mem.trim(u8, val, " \t\r\n");
     if (s.len >= 2) {
@@ -107,7 +139,7 @@ pub fn parse(content: []const u8, cfg: *RuntimeConfig, gpa: std.mem.Allocator) v
         }
         const eq_idx = std.mem.indexOfScalar(u8, line, '=') orelse continue;
         const key = std.mem.trim(u8, line[0..eq_idx], " \t");
-        const val = std.mem.trim(u8, line[eq_idx + 1 ..], " \t");
+        const val = stripInlineComment(std.mem.trim(u8, line[eq_idx + 1 ..], " \t"));
         if (key.len == 0) continue;
 
         if (std.ascii.eqlIgnoreCase(key, "font-size") or std.ascii.eqlIgnoreCase(key, "font_size")) {
@@ -150,6 +182,20 @@ pub fn parse(content: []const u8, cfg: *RuntimeConfig, gpa: std.mem.Allocator) v
             } else |_| {}
         } else if (std.ascii.eqlIgnoreCase(key, "selection-single-cell") or std.ascii.eqlIgnoreCase(key, "selection_single_cell")) {
             if (parseBool(val)) |b| cfg.selection_single_cell = b;
+        } else if (std.ascii.eqlIgnoreCase(key, "find-match-numbers") or std.ascii.eqlIgnoreCase(key, "find_match_numbers")) {
+            if (parseBool(val)) |b| cfg.find_match_numbers = b;
+        } else if (std.ascii.eqlIgnoreCase(key, "find-number-scale") or std.ascii.eqlIgnoreCase(key, "find_number_scale")) {
+            if (std.fmt.parseInt(u8, trimQuotes(val), 10)) |s| {
+                if (s >= 1 and s <= 3) cfg.find_number_scale = s;
+            } else |_| {}
+        } else if (std.ascii.eqlIgnoreCase(key, "editor-command") or std.ascii.eqlIgnoreCase(key, "editor_command") or std.ascii.eqlIgnoreCase(key, "editor")) {
+            const cmd = trimQuotes(val);
+            if (cfg.editor_command) |old| gpa.free(old);
+            cfg.editor_command = if (cmd.len > 0) (gpa.dupe(u8, cmd) catch null) else null;
+        } else if (std.ascii.eqlIgnoreCase(key, "editor-command-terminal") or std.ascii.eqlIgnoreCase(key, "editor_command_terminal")) {
+            const cmd = trimQuotes(val);
+            if (cfg.editor_command_terminal) |old| gpa.free(old);
+            cfg.editor_command_terminal = if (cmd.len > 0) (gpa.dupe(u8, cmd) catch null) else null;
         }
     }
 }
@@ -202,6 +248,8 @@ test "parse complete config content" {
         \\cursor-blink = false
         \\cursor-thickness = 2.0
         \\selection-single-cell = true
+        \\find-match-numbers = true
+        \\find-number-scale = 3
     ;
 
     var cfg = RuntimeConfig{};
@@ -223,4 +271,34 @@ test "parse complete config content" {
     try std.testing.expectEqual(@as(?bool, false), cfg.cursor_blink);
     try std.testing.expectEqual(@as(?f32, 2.0), cfg.cursor_thick_px);
     try std.testing.expectEqual(@as(?bool, true), cfg.selection_single_cell);
+    try std.testing.expectEqual(@as(?bool, true), cfg.find_match_numbers);
+    try std.testing.expectEqual(@as(?u8, 3), cfg.find_number_scale);
+}
+
+test "parse find scale clamps + version-agnostic keys" {
+    var cfg = RuntimeConfig{};
+    defer cfg.deinit(std.testing.allocator);
+    parse("find-number-scale = 9\nfind-match-numbers = no\n", &cfg, std.testing.allocator);
+    try std.testing.expect(cfg.find_number_scale == null);
+    try std.testing.expectEqual(@as(?bool, false), cfg.find_match_numbers);
+}
+
+test "parse editor-command" {
+    var cfg = RuntimeConfig{};
+    defer cfg.deinit(std.testing.allocator);
+    parse("editor-command = \"zed {file}:{line}\"\n", &cfg, std.testing.allocator);
+    try std.testing.expectEqualStrings("zed {file}:{line}", cfg.editor_command.?);
+    parse("editor-command = \"\"\n", &cfg, std.testing.allocator);
+    try std.testing.expect(cfg.editor_command == null);
+    parse("editor-command-terminal = \"nano +{line} {file}\"\n", &cfg, std.testing.allocator);
+    try std.testing.expectEqualStrings("nano +{line} {file}", cfg.editor_command_terminal.?);
+}
+
+test "inline comments" {
+    var cfg = RuntimeConfig{};
+    defer cfg.deinit(std.testing.allocator);
+    parse("editor-command-terminal = \"nano +{line} {file}\" # my editor\nbackground = #0b0f11 # dark\nfont-family = \"a # b\"\n", &cfg, std.testing.allocator);
+    try std.testing.expectEqualStrings("nano +{line} {file}", cfg.editor_command_terminal.?);
+    try std.testing.expectEqual(@as(?u32, 0x0B0F11), cfg.bg);
+    try std.testing.expectEqualStrings("a # b", cfg.font_family.?);
 }

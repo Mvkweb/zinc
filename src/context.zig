@@ -52,6 +52,10 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         scroll_top: u16 = 0,
         scroll_bot: u16 = 0,
         osc_buf: std.ArrayList(u8),
+        /// Shell working directory from OSC 7 (empty = unknown). Used to
+        /// resolve relative Ctrl+click file paths.
+        cwd_buf: [4096]u8 = [_]u8{0} ** 4096,
+        cwd_len: usize = 0,
         kitty_b64: std.ArrayList(u8),
         /// Chunked-upload reassembly (m=1): payload accumulates here across
         /// APC dispatches; kitty_ctrl holds the first chunk's control data.
@@ -89,6 +93,9 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         mouse_sgr: bool = false,
         /// Alt-screen state (DECSET 47/1047/1048/1049).
         alt_active: bool = false,
+        /// DECCKM cursor application mode (DECSET 1): arrows/home/end
+        /// report as SS3 (ESC O x) for ncurses apps.
+        decckm: bool = false,
         alt_saved_col: u16 = 0,
         alt_saved_row: u16 = 0,
         alt_saved_wrap: bool = false,
@@ -827,6 +834,14 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     self.pending_wrap = false;
                     self.cursor_col -|= n(params, 0, 1);
                 },
+                'd' => { // VPA: row absolute, column unchanged (ncurses).
+                    self.pending_wrap = false;
+                    self.cursor_row = @min(self.grid.rows - 1, n(params, 0, 1) -| 1);
+                },
+                'e' => { // VPR: row relative down.
+                    self.pending_wrap = false;
+                    self.cursor_row = @min(self.grid.rows - 1, self.cursor_row + n(params, 0, 1));
+                },
                 'E' => {
                     self.pending_wrap = false;
                     self.cursor_col = 0;
@@ -880,6 +895,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     const set = final == 'h';
                     for (params) |p| {
                         if (priv) switch (p) {
+                            1 => self.decckm = set, // DECCKM
                             25 => self.show_cursor = set,
                             47, 1047, 1049 => if (set) self.enterAlt() else self.exitAlt(),
                             1048 => if (set) {
@@ -1039,6 +1055,18 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     } else {
                         self.cur_link = self.setLink(uri);
                     }
+                },
+                .cwd => {
+                    // OSC 7 ; file://host/path — track the shell working
+                    // directory for resolving relative Ctrl+click paths.
+                    var p = parts.payload;
+                    if (std.mem.startsWith(u8, p, "file://")) {
+                        p = p["file://".len..];
+                        if (std.mem.indexOfScalar(u8, p, '/')) |slash| p = p[slash..];
+                    }
+                    const n = @min(p.len, self.cwd_buf.len);
+                    @memcpy(self.cwd_buf[0..n], p[0..n]);
+                    self.cwd_len = n;
                 },
                 .semantic_prompt => {
                     if (parts.payload.len > 0) {
@@ -1386,6 +1414,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             self.in_prompt = false;
             self.prompt_start_row = null;
             self.cur_link = 0;
+            self.decckm = false;
             self.scroll_top = 0;
             self.scroll_bot = self.grid.rows - 1;
         }
@@ -1854,6 +1883,30 @@ test "decset alt-screen swaps grids" {
     try std.testing.expect(!ctx.alt_active);
     try std.testing.expectEqual(@as(u32, 'm'), ctx.grid.cells[0].rune);
     try std.testing.expectEqual(@as(u32, 'n'), ctx.grid.cells[3].rune);
+}
+
+test "decset decckm cursor application mode" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    try std.testing.expect(!ctx.decckm);
+    ctx.parse("\x1b[?1h");
+    try std.testing.expect(ctx.decckm);
+    ctx.parse("\x1b[?1l");
+    try std.testing.expect(!ctx.decckm);
+}
+
+test "csi vpa/vpr row motion" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.cursor_col = 5;
+    ctx.cursor_row = 0;
+    ctx.parse("\x1b[4d");
+    try std.testing.expectEqual(@as(u16, 3), ctx.cursor_row);
+    try std.testing.expectEqual(@as(u16, 5), ctx.cursor_col);
+    ctx.parse("\x1b[e");
+    try std.testing.expectEqual(@as(u16, 4), ctx.cursor_row);
+    ctx.parse("\x1b[999d");
+    try std.testing.expectEqual(ctx.grid.rows - 1, ctx.cursor_row);
 }
 
 test "decset cursor visibility + mouse modes" {

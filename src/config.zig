@@ -116,6 +116,12 @@ pub const Config = struct {
     clipboard: bool = true,
     clipboard_osc52: bool = true,
     clipboard_buf_size: u32 = 4096,
+    /// Editor for Ctrl+click file paths. Empty = automatic: $EDITOR, then
+    /// xdg-open desktop default. Template honors {file}/{line}/{col}.
+    editor_command: []const u8 = "",
+    /// Same for terminal editors (nano/vim): typed into the shell instead
+    /// of spawned detached, so they open in place. GUI editors go above.
+    editor_command_terminal: []const u8 = "",
     /// In-terminal find (Ctrl+Shift+F bottom bar over scrollback + grid).
     find: bool = true,
     find_max_matches: u32 = 256,

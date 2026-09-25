@@ -45,8 +45,9 @@ pub const Mods = packed struct(u4) {
 /// their classic sequences; modified keys use xterm modify encodings
 /// (CSI 1 ; m for arrows/home/end, CSI param ; m for tilde keys, CSI u
 /// for enter/tab/escape) so shells can bind word jumps, word erase,
-/// and Shift+Enter newline continuations.
-pub fn encode(key: Key, mods: Mods, kitty_mode: bool, out: []u8) []u8 {
+/// and Shift+Enter newline continuations. cursor_app (DECCKM) sends
+/// unmodified arrows/home/end as SS3 (ESC O x) for ncurses apps.
+pub fn encode(key: Key, mods: Mods, kitty_mode: bool, cursor_app: bool, out: []u8) []u8 {
     _ = kitty_mode;
     const m: u8 = modParam(mods);
     switch (key) {
@@ -93,7 +94,8 @@ pub fn encode(key: Key, mods: Mods, kitty_mode: bool, out: []u8) []u8 {
                 .end => 'F',
                 else => unreachable,
             };
-            if (m == 1) return std.fmt.bufPrint(out, "\x1b[{c}", .{c}) catch out[0..0];
+            if (m == 1 and !cursor_app) return std.fmt.bufPrint(out, "\x1b[{c}", .{c}) catch out[0..0];
+            if (m == 1) return std.fmt.bufPrint(out, "\x1bO{c}", .{c}) catch out[0..0];
             return std.fmt.bufPrint(out, "\x1b[1;{d}{c}", .{ m, c }) catch out[0..0];
         },
         .page_up, .page_down, .insert, .delete => {
@@ -154,8 +156,14 @@ fn plain(seq: []const u8, out: []u8) []u8 {
 
 test "arrows encode" {
     var buf: [8]u8 = undefined;
-    try std.testing.expectEqualSlices(u8, "\x1b[A", encode(.up, .{}, false, &buf));
-    try std.testing.expectEqualSlices(u8, "\x1b[3~", encode(.delete, .{}, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[A", encode(.up, .{}, false, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[3~", encode(.delete, .{}, false, false, &buf));
+    // DECCKM: unmodified arrows/home/end go SS3; modified stay CSI.
+    try std.testing.expectEqualSlices(u8, "\x1bOA", encode(.up, .{}, false, true, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1bOH", encode(.home, .{}, false, true, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1bOF", encode(.end, .{}, false, true, &buf));
+    const ctrl = Mods{ .ctrl = true };
+    try std.testing.expectEqualSlices(u8, "\x1b[1;5D", encode(.left, ctrl, false, true, &buf));
 }
 
 test "modified keys encode" {
@@ -164,18 +172,18 @@ test "modified keys encode" {
     const shift = Mods{ .shift = true };
     const alt = Mods{ .alt = true };
     // Ctrl+arrows for word jumps.
-    try std.testing.expectEqualSlices(u8, "\x1b[1;5D", encode(.left, ctrl, false, &buf));
-    try std.testing.expectEqualSlices(u8, "\x1b[1;5C", encode(.right, ctrl, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[1;5D", encode(.left, ctrl, false, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[1;5C", encode(.right, ctrl, false, false, &buf));
     // Word erase forward/backward.
-    try std.testing.expectEqualSlices(u8, "\x1b[3;5~", encode(.delete, ctrl, false, &buf));
-    try std.testing.expectEqualSlices(u8, "\x1b\x7f", encode(.backspace, ctrl, false, &buf));
-    try std.testing.expectEqualSlices(u8, "\x1b\x7f", encode(.backspace, alt, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[3;5~", encode(.delete, ctrl, false, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b\x7f", encode(.backspace, ctrl, false, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b\x7f", encode(.backspace, alt, false, false, &buf));
     // Shift+Enter newline continuation, Shift+Tab backtab.
-    try std.testing.expectEqualSlices(u8, "\x1b[13;2u", encode(.enter, shift, false, &buf));
-    try std.testing.expectEqualSlices(u8, "\x1b[Z", encode(.backtab, shift, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[13;2u", encode(.enter, shift, false, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[Z", encode(.backtab, shift, false, false, &buf));
     // Plain keys unchanged.
-    try std.testing.expectEqualSlices(u8, "\r", encode(.enter, .{}, false, &buf));
-    try std.testing.expectEqualSlices(u8, "\t", encode(.tab, .{}, false, &buf));
-    try std.testing.expectEqualSlices(u8, "\x1bOP", encode(.f1, .{}, false, &buf));
-    try std.testing.expectEqualSlices(u8, "\x1b[1;5P", encode(.f1, ctrl, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\r", encode(.enter, .{}, false, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\t", encode(.tab, .{}, false, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1bOP", encode(.f1, .{}, false, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[1;5P", encode(.f1, ctrl, false, false, &buf));
 }

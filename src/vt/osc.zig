@@ -8,6 +8,7 @@ pub const OscOp = enum {
     unknown,
     title, // 0 / 1 / 2
     palette, // 4
+    cwd, // 7 (working directory for relative file links)
     hyperlink, // 8
     progress, // 9;4
     color_fg, // 10
@@ -21,6 +22,7 @@ pub fn classify(code: u32) OscOp {
     return switch (code) {
         0, 1, 2 => .title,
         4 => .palette,
+        7 => .cwd,
         8 => .hyperlink,
         9 => .progress,
         10 => .color_fg,

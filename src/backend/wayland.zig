@@ -153,6 +153,7 @@ const software = @import("../render/software.zig");
 const box_drawing = @import("../render/box_drawing.zig");
 const placeholder_mod = @import("../gfx/placeholder.zig");
 const search_mod = @import("../term/search.zig");
+const filelink_mod = @import("../term/filelink.zig");
 const ft_mod = @import("../font/ft.zig");
 const atlas_mod = @import("../font/atlas.zig");
 const utf8_mod = @import("../util/utf8.zig");
@@ -276,6 +277,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
         find_saved_off: usize = 0,
         find_vis: [64]FindVis = [_]FindVis{.{ .m = .{ .row = 0, .col = 0, .erow = 0, .ecol = 0 }, .idx = 0 }} ** 64,
         find_vis_n: usize = 0,
+        /// Runtime badge knobs (file config overrides comptime defaults).
+        find_numbers: bool = cfg.find_match_numbers,
+        find_num_scale: u8 = cfg.find_number_scale,
         last_click_time: u32 = 0,
         last_click_col: u16 = 0,
         last_click_row: u16 = 0,
@@ -304,6 +308,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
         hover_c1: u16 = 0,
         hover_active: bool = false,
         hover_uri: ?[]u8 = null,
+        /// True when the hover span is a file path (no URI string).
+        hover_is_file: bool = false,
         /// Server-side cursor shapes (wp_cursor_shape_manager_v1).
         cursor_shape_mgr: ?*P.CursorShapeManager = null,
         cursor_shape_dev: ?*P.CursorShapeDevice = null,
@@ -444,6 +450,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .cursor_blink = runtime_cfg.cursor_blink orelse cfg.cursor_blink,
                 .cursor_thick_px = runtime_cfg.cursor_thick_px orelse cfg.cursor_thick_px,
                 .selection_single_cell = runtime_cfg.selection_single_cell orelse cfg.selection_single_cell,
+                .find_numbers = runtime_cfg.find_match_numbers orelse cfg.find_match_numbers,
+                .find_num_scale = runtime_cfg.find_number_scale orelse cfg.find_number_scale,
             };
             errdefer {
                 self.deinit();
@@ -1025,14 +1033,14 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// Only on-screen matches are badged, so it stays clean at any
         /// total count; the bar's i/n already covers position.
         fn drawFindNumbers(self: *Self, W: u32, H: u32, px: i32, py: i32, cw: i32, ch: i32, visible_cols: u16, visible_rows: u16, dmg: *software.Damage) void {
-            if (!cfg.find or !cfg.find_match_numbers or !self.find_active) return;
+            if (!cfg.find or !self.find_numbers or !self.find_active) return;
             if (cw <= 0 or ch <= 0) return;
             const off: usize = @min(self.ctx.grid.view_offset, self.ctx.grid.sb_len);
             const sb: usize = self.ctx.grid.sb_len;
             const base = sb - off; // abs row of visible row 0
             const fg = 0xFF000000 | (self.selection_fg & 0xFFFFFF);
             const pill = self.themed(self.selection_bg & 0xFFFFFF, false);
-            const sc: i32 = @max(1, cfg.find_number_scale);
+            const sc: i32 = @max(1, self.find_num_scale);
             const scu: u8 = @intCast(sc);
             const pad: i32 = sc;
             var k: usize = 0;
@@ -1981,7 +1989,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     self.needs_render = true;
                     return;
                 }
-                self.sendToPty(input_kb.encode(k, mods, false, &out));
+                self.sendToPty(input_kb.encode(k, mods, false, self.ctx.decckm, &out));
                 return;
             }
             // Ctrl+letter -> control byte (shift folded so Ctrl+Shift+Z
@@ -2377,6 +2385,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.gpa.free(u);
                 self.hover_uri = null;
             }
+            self.hover_is_file = false;
             if (self.hover_active) {
                 self.hover_active = false;
                 self.needs_render = true;
@@ -2429,23 +2438,185 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 return;
             }
             if (self.hover_active and self.hover_row == row and col >= self.hover_c0 and col <= self.hover_c1) return;
-            const span = self.linkSpanAt(col, row) orelse {
-                self.clearHover();
+            if (self.linkSpanAt(col, row)) |span| {
+                if (self.linkUriAt(col, row)) |uri| {
+                    if (self.hover_uri) |u| self.gpa.free(u);
+                    self.hover_uri = uri;
+                    self.hover_col = col;
+                    self.hover_row = row;
+                    self.hover_c0 = span.c0;
+                    self.hover_c1 = span.c1;
+                    self.hover_is_file = false;
+                    self.hover_active = true;
+                    self.needs_render = true;
+                    self.refreshCursor();
+                    return;
+                }
+            }
+            // File-path fallback: same underline affordance, no URI string.
+            // Existence is verified at click time, never on hover.
+            if (filelink_mod.spanAt(&self.ctx.grid, row, col)) |fspan| {
+                if (self.hover_uri) |u| self.gpa.free(u);
+                self.hover_uri = null;
+                self.hover_col = col;
+                self.hover_row = row;
+                self.hover_c0 = fspan.c0;
+                self.hover_c1 = fspan.c1;
+                self.hover_is_file = true;
+                self.hover_active = true;
+                self.needs_render = true;
+                self.refreshCursor();
                 return;
-            };
-            const uri = self.linkUriAt(col, row) orelse {
-                self.clearHover();
+            }
+            self.clearHover();
+        }
+
+        /// Open a Ctrl+clicked file token: resolve (absolute, ~/HOME, OSC 7
+        /// cwd, launch-time PWD), verify existence, then open. Silent no-op
+        /// unless something real exists — syntax alone never launches.
+        fn openFileToken(self: *Self, row: u16, span: filelink_mod.Span) void {
+            var tbuf: [1024]u8 = undefined;
+            const tok = filelink_mod.spanText(&self.ctx.grid, row, span, &tbuf);
+            const t = filelink_mod.splitLineCol(tok);
+            if (t.path.len == 0 or t.path.len > 2000) return;
+            var abs: [4096]u8 = undefined;
+            var alen: usize = 0;
+            if (t.path[0] == '/') {
+                alen = t.path.len;
+                @memcpy(abs[0..alen], t.path);
+            } else if (t.path.len > 1 and t.path[0] == '~' and t.path[1] == '/') {
+                const home = std.c.getenv("HOME") orelse return;
+                const hs = std.mem.span(home);
+                if (hs.len == 0 or hs.len + t.path.len - 1 >= abs.len) return;
+                @memcpy(abs[0..hs.len], hs);
+                @memcpy(abs[hs.len..][0 .. t.path.len - 1], t.path[1..]);
+                alen = hs.len + t.path.len - 1;
+            } else {
+                const cwd: []const u8 = if (self.ctx.cwd_len > 0)
+                    self.ctx.cwd_buf[0..self.ctx.cwd_len]
+                else if (std.c.getenv("PWD")) |p| std.mem.span(p) else return;
+                if (cwd.len == 0 or cwd.len + 1 + t.path.len >= abs.len) return;
+                @memcpy(abs[0..cwd.len], cwd);
+                alen = cwd.len;
+                if (abs[alen - 1] != '/') {
+                    abs[alen] = '/';
+                    alen += 1;
+                }
+                @memcpy(abs[alen..][0..t.path.len], t.path);
+                alen += t.path.len;
+            }
+            abs[alen] = 0;
+            const rc = linux.open(abs[0..alen :0].ptr, .{ .ACCMODE = .RDONLY }, 0);
+            if (linux.errno(rc) != .SUCCESS) return;
+            _ = linux.close(@intCast(rc));
+            const ln = if (t.line == 0) 1 else t.line;
+            const cn = if (t.col == 0) 1 else t.col;
+            self.openFile(abs[0..alen], ln, cn);
+        }
+
+        /// Open a verified absolute path. Terminal editors (editor-command-
+        /// terminal) open in place: the command is typed into the shell.
+        /// Otherwise Tier 1: editor-command template (bare program gets the
+        /// file appended). Tier 2: $EDITOR with the file appended. Tier 3:
+        /// xdg-open desktop default. No shell except the in-place tier, and
+        /// there the path is single-quoted (the token charset excludes
+        /// quotes, newlines are rejected).
+        fn openFile(self: *Self, path: []const u8, line: u32, col: u32) void {
+            const term_tpl = if (self.runtime_cfg.editor_command_terminal) |e| e else cfg.editor_command_terminal;
+            if (term_tpl.len > 0 and !self.ctx.alt_active) {
+                for (path) |b| {
+                    if (b == '\n' or b == '\r') return;
+                }
+                var qfile: [4102]u8 = undefined;
+                if (path.len + 3 > qfile.len) return;
+                qfile[0] = '\'';
+                @memcpy(qfile[1..][0..path.len], path);
+                qfile[1 + path.len] = '\'';
+                const qf = qfile[0 .. 2 + path.len];
+                var cmd: [2048]u8 = undefined;
+                const expanded = filelink_mod.expandArg(term_tpl, qf, line, col, &cmd) orelse return;
+                var clen = expanded.len;
+                if (!filelink_mod.hasFileToken(term_tpl)) {
+                    if (clen + 1 + qf.len + 1 > cmd.len) return;
+                    cmd[clen] = ' ';
+                    @memcpy(cmd[clen + 1 ..][0..qf.len], qf);
+                    clen += 1 + qf.len;
+                }
+                if (clen + 1 > cmd.len) return;
+                cmd[clen] = '\n';
+                clen += 1;
+                self.sendToPty(cmd[0..clen]);
                 return;
-            };
-            if (self.hover_uri) |u| self.gpa.free(u);
-            self.hover_uri = uri;
-            self.hover_col = col;
-            self.hover_row = row;
-            self.hover_c0 = span.c0;
-            self.hover_c1 = span.c1;
-            self.hover_active = true;
-            self.needs_render = true;
-            self.refreshCursor();
+            }
+            const tpl_src = if (self.runtime_cfg.editor_command) |e| e else cfg.editor_command;
+            if (tpl_src.len > 0) {
+                var parts: [filelink_mod.max_argv][]const u8 = undefined;
+                const n = filelink_mod.quoteSplit(tpl_src, &parts);
+                if (n == 0) return;
+                var backs: [filelink_mod.max_argv][512]u8 = undefined;
+                var argv: [filelink_mod.max_argv + 1:null]?[*:0]const u8 = undefined;
+                var prog: [*:0]const u8 = undefined;
+                var ok = true;
+                for (parts[0..n], 0..) |p, i| {
+                    const e = filelink_mod.expandArg(p, path, line, col, backs[i][0..511]) orelse {
+                        ok = false;
+                        break;
+                    };
+                    backs[i][e.len] = 0;
+                    const z = backs[i][0..e.len :0];
+                    if (i == 0) prog = z;
+                    argv[i] = z;
+                }
+                if (!ok) return;
+                var argc = n;
+                if (!filelink_mod.hasFileToken(tpl_src)) {
+                    if (argc + 1 >= argv.len or path.len >= backs[argc].len) return;
+                    @memcpy(backs[argc][0..path.len], path);
+                    backs[argc][path.len] = 0;
+                    argv[argc] = backs[argc][0..path.len :0];
+                    argc += 1;
+                }
+                argv[argc] = null;
+                pty_mod.spawnArgv(prog, &argv);
+                return;
+            }
+            if (std.c.getenv("EDITOR")) |ed| {
+                const ed_s = std.mem.span(ed);
+                if (ed_s.len > 0) {
+                    var parts: [filelink_mod.max_argv - 1][]const u8 = undefined;
+                    const n = filelink_mod.quoteSplit(ed_s, &parts);
+                    if (n > 0) {
+                        var backs: [filelink_mod.max_argv][512]u8 = undefined;
+                        var argv: [filelink_mod.max_argv + 1:null]?[*:0]const u8 = undefined;
+                        var prog: [*:0]const u8 = undefined;
+                        var ok = true;
+                        for (parts[0..n], 0..) |p, i| {
+                            if (p.len >= backs[i].len) {
+                                ok = false;
+                                break;
+                            }
+                            @memcpy(backs[i][0..p.len], p);
+                            backs[i][p.len] = 0;
+                            const z = backs[i][0..p.len :0];
+                            if (i == 0) prog = z;
+                            argv[i] = z;
+                        }
+                        if (ok and path.len < backs[n].len) {
+                            @memcpy(backs[n][0..path.len], path);
+                            backs[n][path.len] = 0;
+                            argv[n] = backs[n][0..path.len :0];
+                            argv[n + 1] = null;
+                            pty_mod.spawnArgv(prog, &argv);
+                            return;
+                        }
+                    }
+                }
+            }
+            if (path.len > 2000) return;
+            var ob: [2100]u8 = undefined;
+            @memcpy(ob[0..7], "file://");
+            @memcpy(ob[7..][0..path.len], path);
+            pty_mod.openUrl(ob[0 .. 7 + path.len]);
         }
 
         /// Open an allowlisted URL via xdg-open (no shell involved).
@@ -2595,6 +2766,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
                             if (self.linkUriAt(cc.col, cc.row)) |u| {
                                 defer self.gpa.free(u);
                                 self.openLink(u);
+                                return;
+                            }
+                            // Bare file path under cursor (Ctrl+click).
+                            if (filelink_mod.spanAt(&self.ctx.grid, cc.row, cc.col)) |fspan| {
+                                self.openFileToken(cc.row, fspan);
                                 return;
                             }
                         }
