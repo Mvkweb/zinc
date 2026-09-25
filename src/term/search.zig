@@ -9,6 +9,7 @@ const std = @import("std");
 const utf8_mod = @import("../util/utf8.zig");
 const grid_mod = @import("grid.zig");
 const config_mod = @import("../config.zig");
+const selection_mod = @import("../input/selection.zig");
 
 /// Kitty placeholder cells hold image data, not text: never searchable.
 /// (Duplicated from gfx/placeholder.zig to keep term free of gfx imports.)
@@ -29,8 +30,168 @@ pub fn absRow(grid: anytype, vis_row: u16) usize {
     return sb - off + vis_row;
 }
 
+/// Scroll the minimum to show abs_row (edge-follow for stepwise cursor
+/// motion). Unlike ensureVisible (which centers for jumps), this never
+/// moves the viewport when the row is already visible.
+pub fn ensureVisibleEdge(grid: anytype, abs_row: usize) void {
+    const rows: usize = grid.rows;
+    const sb_len: usize = grid.sb_len;
+    if (rows == 0) return;
+    const total = sb_len + rows;
+    if (abs_row >= total) return;
+    const off: usize = @min(grid.view_offset, sb_len);
+    const top = total - off - rows;
+    const bot = total - 1 - off;
+    if (abs_row >= top and abs_row <= bot) return;
+    var want: usize = 0;
+    if (abs_row < top) {
+        want = off + (top - abs_row);
+    } else {
+        want = off - (abs_row - bot);
+    }
+    if (want > sb_len) want = sb_len;
+    const delta: i64 = @as(i64, @intCast(want)) - @as(i64, @intCast(off));
+    grid.scrollView(@intCast(delta));
+}
+
+/// Grid position for copy-mode word motions.
+pub const Pos = struct { row: usize, col: u16 };
+
+fn absRune(grid: anytype, abs: usize, sb_len: usize, cols: usize, col: usize) ?u32 {
+    if (col >= cols) return null;
+    if (abs < sb_len) {
+        const cap: usize = grid.sb_rows.len;
+        if (cap == 0) return null;
+        const slice = grid.sb_rows[(grid.sb_head + abs) % cap] orelse return null;
+        if (col >= slice.len) return null;
+        const v: u32 = slice[col].rune;
+        return v;
+    }
+    const r = abs - sb_len;
+    if (r >= grid.rows) return null;
+    const v: u32 = grid.cells[r * cols + col].rune;
+    return v;
+}
+
+fn absClass(grid: anytype, abs: usize, sb_len: usize, cols: usize, col: usize) selection_mod.CharClass {
+    const cp = absRune(grid, abs, sb_len, cols, col) orelse return .space;
+    return selection_mod.charClass(cp);
+}
+
+fn isWord(c: selection_mod.CharClass) bool {
+    return c != .space;
+}
+
+/// Advance one cell (false at the end of history).
+fn stepFwd(p: *Pos, cols: usize, total: usize) bool {
+    if (p.col + 1 < cols) {
+        p.col += 1;
+        return true;
+    }
+    if (p.row + 1 >= total) return false;
+    p.row += 1;
+    p.col = 0;
+    return true;
+}
+
+/// Retreat one cell (false at the start of history).
+fn stepBack(p: *Pos, cols: usize) bool {
+    if (p.col > 0) {
+        p.col -= 1;
+        return true;
+    }
+    if (p.row == 0) return false;
+    p.row -= 1;
+    p.col = @intCast(cols - 1);
+    return true;
+}
+
+/// Vim `w`: start of the next word-ish run (words + punctuation runs,
+// spaces skipped). Stays put at the end of history.
+pub fn wordForward(grid: anytype, row: usize, col: u16) Pos {
+    const cols: usize = grid.cols;
+    const sb_len: usize = grid.sb_len;
+    const total = sb_len + @as(usize, grid.rows);
+    var p = Pos{ .row = row, .col = col };
+    if (total == 0 or cols == 0) return p;
+    if (isWord(absClass(grid, p.row, sb_len, cols, p.col))) {
+        while (isWord(absClass(grid, p.row, sb_len, cols, p.col))) {
+            if (!stepFwd(&p, cols, total)) return p;
+        }
+    }
+    while (absClass(grid, p.row, sb_len, cols, p.col) == .space) {
+        if (!stepFwd(&p, cols, total)) return p;
+    }
+    return p;
+}
+
+/// Vim `e`: end of the current (or next) word-ish run.
+pub fn wordEnd(grid: anytype, row: usize, col: u16) Pos {
+    const cols: usize = grid.cols;
+    const sb_len: usize = grid.sb_len;
+    const total = sb_len + @as(usize, grid.rows);
+    var p = Pos{ .row = row, .col = col };
+    if (total == 0 or cols == 0) return p;
+    var q = p;
+    if (isWord(absClass(grid, p.row, sb_len, cols, p.col)) and stepFwd(&q, cols, total) and
+        isWord(absClass(grid, q.row, sb_len, cols, q.col)))
+    {
+        // Mid-run: advance to this run's end.
+        p = q;
+        while (true) {
+            var n = p;
+            if (!stepFwd(&n, cols, total)) return p;
+            if (!isWord(absClass(grid, n.row, sb_len, cols, n.col))) return p;
+            p = n;
+        }
+    }
+    // At run end / on space: go to the next run's end.
+    if (!stepFwd(&p, cols, total)) return p;
+    while (absClass(grid, p.row, sb_len, cols, p.col) == .space) {
+        if (!stepFwd(&p, cols, total)) return p;
+    }
+    while (true) {
+        var n = p;
+        if (!stepFwd(&n, cols, total)) return p;
+        if (!isWord(absClass(grid, n.row, sb_len, cols, n.col))) return p;
+        p = n;
+    }
+}
+
+/// Vim `b`: start of the current (or previous) word-ish run.
+pub fn wordBack(grid: anytype, row: usize, col: u16) Pos {
+    const cols: usize = grid.cols;
+    const sb_len: usize = grid.sb_len;
+    const total = sb_len + @as(usize, grid.rows);
+    var p = Pos{ .row = row, .col = col };
+    if (total == 0 or cols == 0) return p;
+    var q = p;
+    if (isWord(absClass(grid, p.row, sb_len, cols, p.col)) and stepBack(&q, cols) and
+        isWord(absClass(grid, q.row, sb_len, cols, q.col)))
+    {
+        // Mid-run: retreat to this run's start.
+        p = q;
+        while (true) {
+            var n = p;
+            if (!stepBack(&n, cols)) return p;
+            if (!isWord(absClass(grid, n.row, sb_len, cols, n.col))) return p;
+            p = n;
+        }
+    }
+    // At run start / on space: go to the previous run's start.
+    if (!stepBack(&p, cols)) return p;
+    while (absClass(grid, p.row, sb_len, cols, p.col) == .space) {
+        if (!stepBack(&p, cols)) return p;
+    }
+    while (true) {
+        var n = p;
+        if (!stepBack(&n, cols)) return p;
+        if (!isWord(absClass(grid, n.row, sb_len, cols, n.col))) return p;
+        p = n;
+    }
+}
 /// Scroll just enough to show abs_row, preferring it ~middle of the
-/// viewport. No-op when already visible or out of range.
+/// viewport. No-op when visible or out of range.
 pub fn ensureVisible(grid: anytype, abs_row: usize) void {
     const rows: usize = grid.rows;
     const sb_len: usize = grid.sb_len;
@@ -303,4 +464,56 @@ test "ensureVisible centers matches" {
     try std.testing.expectEqual(@as(usize, 0), g.view_offset);
     ensureVisible(&g, 4);
     try std.testing.expectEqual(@as(usize, 0), g.view_offset);
+}
+
+test "ensureVisibleEdge scrolls minimally" {
+    const C = config_mod.Config{ .cols = 8, .rows = 4, .scrollback_cap = 8 };
+    var g = try grid_mod.Grid(C).init(std.testing.allocator, 8, 4);
+    defer g.deinit();
+    putStr(&g, 8, 0, 0, 0, "r0", false);
+    putStr(&g, 8, 1, 0, 0, "r1", false);
+    putStr(&g, 8, 2, 0, 0, "r2", false);
+    putStr(&g, 8, 3, 0, 0, "r3", false);
+    g.scrollUp(true);
+    g.scrollUp(true);
+    // total = 6, live view shows abs [2,5].
+    ensureVisibleEdge(&g, 3); // visible: no-op
+    try std.testing.expectEqual(@as(usize, 0), g.view_offset);
+    ensureVisibleEdge(&g, 1); // one above: shift by exactly 1
+    try std.testing.expectEqual(@as(usize, 1), g.view_offset);
+    ensureVisibleEdge(&g, 5); // below bottom: back to 0, not centered
+    try std.testing.expectEqual(@as(usize, 0), g.view_offset);
+    ensureVisibleEdge(&g, 0); // top: shift by exactly 2
+    try std.testing.expectEqual(@as(usize, 2), g.view_offset);
+}
+
+test "word motions w/e/b" {
+    const C = config_mod.Config{ .cols = 16, .rows = 4, .scrollback_cap = 8 };
+    var g = try grid_mod.Grid(C).init(std.testing.allocator, 16, 4);
+    defer g.deinit();
+    putStr(&g, 16, 0, 0, 0, "foo bar", false);
+    putStr(&g, 16, 1, 0, 0, "  baz qux", false);
+    // w: start of next run.
+    var p = wordForward(&g, 0, 0);
+    try std.testing.expectEqual(@as(usize, 0), p.row);
+    try std.testing.expectEqual(@as(u16, 4), p.col);
+    p = wordForward(&g, 0, 4);
+    try std.testing.expectEqual(@as(usize, 1), p.row);
+    try std.testing.expectEqual(@as(u16, 2), p.col);
+    // e: end of current/next run.
+    p = wordEnd(&g, 0, 0);
+    try std.testing.expectEqual(@as(u16, 2), p.col);
+    p = wordEnd(&g, 0, 3);
+    try std.testing.expectEqual(@as(u16, 6), p.col);
+    p = wordEnd(&g, 0, 6);
+    try std.testing.expectEqual(@as(usize, 1), p.row);
+    try std.testing.expectEqual(@as(u16, 4), p.col);
+    // b: start of current/previous run.
+    p = wordBack(&g, 0, 6);
+    try std.testing.expectEqual(@as(u16, 4), p.col);
+    p = wordBack(&g, 0, 4);
+    try std.testing.expectEqual(@as(u16, 0), p.col);
+    p = wordBack(&g, 1, 2);
+    try std.testing.expectEqual(@as(usize, 0), p.row);
+    try std.testing.expectEqual(@as(u16, 4), p.col);
 }

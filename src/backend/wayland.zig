@@ -182,6 +182,7 @@ const XKB_STATE_MODS_EFFECTIVE: c_int = 8;
 // Relevant keysyms (xkbcommon-keysyms values, stable ABI).
 const K = struct {
     const Return: u32 = 0xff0d;
+    const Space: u32 = 0x20;
     const Tab: u32 = 0xff09;
     const Escape: u32 = 0xff1b;
     const BackSpace: u32 = 0xff08;
@@ -277,6 +278,14 @@ pub fn App(comptime cfg: config_mod.Config) type {
         find_saved_off: usize = 0,
         find_vis: [64]FindVis = [_]FindVis{.{ .m = .{ .row = 0, .col = 0, .erow = 0, .ecol = 0 }, .idx = 0 }} ** 64,
         find_vis_n: usize = 0,
+        /// Keyboard copy mode (Ctrl+Shift+Space): absolute-row copy cursor
+        /// over scrollback + grid, v selects, y/Enter yanks via selection.
+        copy_active: bool = false,
+        copy_arow: usize = 0,
+        copy_acol: u16 = 0,
+        copy_anchor_arow: usize = 0,
+        copy_anchor_acol: u16 = 0,
+        copy_selecting: bool = false,
         /// Runtime badge knobs (file config overrides comptime defaults).
         find_numbers: bool = cfg.find_match_numbers,
         find_num_scale: u8 = cfg.find_number_scale,
@@ -1375,7 +1384,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             // Block cursor; hollow outline when unfocused; hidden on blink
             // phase, DECSET 25 reset, or while scrolled into history.
-            const show_cursor = (!self.cursor_blink or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0;
+            const show_cursor = (!self.cursor_blink or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0 and !self.copy_active;
             if (show_cursor and self.ctx.cursor_col < visible_cols and self.ctx.cursor_row < visible_rows) {
                 const ccx: u32 = @intCast(px + @as(i32, self.ctx.cursor_col) * cw);
                 const ccy: u32 = @intCast(py + @as(i32, self.ctx.cursor_row) * ch);
@@ -1396,6 +1405,43 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     software.fillRect(self.pool_pixels, W, H, ccx, ccy, ot, chu, cur, &dmg);
                     software.fillRect(self.pool_pixels, W, H, ccx + cwu - ot, ccy, ot, chu, cur, &dmg);
                 }
+            }
+            // Copy cursor: solid block in cursor color + COPY tag. The
+            // normal cursor stays hidden while copy mode owns the screen.
+            if (cfg.copy_mode and self.copy_active) {
+                const coff: usize = @min(self.ctx.grid.view_offset, self.ctx.grid.sb_len);
+                const csb: usize = self.ctx.grid.sb_len;
+                if (self.copy_arow >= csb - coff) {
+                    const sr = self.copy_arow - (csb - coff);
+                    if (sr < visible_rows and self.copy_acol < visible_cols) {
+                        const ccx: u32 = @intCast(px + @as(i32, self.copy_acol) * cw);
+                        const ccy: u32 = @intCast(py + @as(i32, @intCast(sr)) * ch);
+                        const cur = self.themed(self.ctx.cursor_color, false);
+                        const cwu: u32 = @intCast(cw);
+                        const chu: u32 = @intCast(ch);
+                        // Occupied cell: hollow outline so the character
+                        // stays readable; empty cell: solid block.
+                        const occ = if (self.ctx.grid.viewCell(self.copy_acol, @intCast(sr))) |cell| blk: {
+                            const cp = cellCp(cell.rune);
+                            break :blk cp != ' ' and cp != 0;
+                        } else false;
+                        if (occ) {
+                            const ot: u32 = @min(@as(u32, @intCast(@max(1, @divFloor(cw, 8)))), chu);
+                            software.fillRect(self.pool_pixels, W, H, ccx, ccy, cwu, ot, cur, &dmg);
+                            software.fillRect(self.pool_pixels, W, H, ccx, ccy + chu - ot, cwu, ot, cur, &dmg);
+                            software.fillRect(self.pool_pixels, W, H, ccx, ccy, ot, chu, cur, &dmg);
+                            software.fillRect(self.pool_pixels, W, H, ccx + cwu - ot, ccy, ot, chu, cur, &dmg);
+                        } else {
+                            software.fillRect(self.pool_pixels, W, H, ccx, ccy, cwu, chu, cur, &dmg);
+                        }
+                    }
+                }
+                const tag_bg = self.themed(self.selection_bg & 0xFFFFFF, false);
+                const tag_fg = 0xFF000000 | (self.selection_fg & 0xFFFFFF);
+                const tw: u32 = @intCast(6 * cw);
+                const tx: u32 = @intCast(px + @as(i32, visible_cols) * cw - @as(i32, 6 * cw));
+                software.fillRect(self.pool_pixels, W, H, tx, @intCast(py), tw, @intCast(ch), tag_bg, &dmg);
+                self.drawBarText(" COPY ", tag_fg, px + @as(i32, visible_cols) * cw - @as(i32, 6 * cw), @intCast(py), cw, ch, W, H, &dmg);
             }
             // Find bar: bottom-row overlay while find mode is active.
             if (cfg.find and self.find_active and visible_rows > 0) {
@@ -1555,6 +1601,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             // Find matches reference the other screen's rows; close out.
             if (cfg.find and self.find_active) self.closeFind();
+            if (cfg.copy_mode and self.copy_active) self.exitCopyMode();
             const pad_x = self.currentPadX();
             const pad_y = self.currentPadY();
             const cols: u16 = @intCast(@max(15, @divFloor(self.width - 2 * @as(i32, @intCast(pad_x)), self.cell_w)));
@@ -1813,6 +1860,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         fn toggleFind(self: *Self) void {
             if (!cfg.find) return;
+            if (cfg.copy_mode and self.copy_active) self.exitCopyMode();
             if (self.find_active) {
                 self.closeFind();
                 return;
@@ -1879,6 +1927,102 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.jumpFind();
         }
 
+        // -- copy mode (Ctrl+Shift+Space, tmux-style) ------------------------
+
+        fn toggleCopyMode(self: *Self) void {
+            if (!cfg.copy_mode) return;
+            if (self.copy_active) {
+                self.exitCopyMode();
+                return;
+            }
+            if (cfg.find and self.find_active) self.closeFind();
+            self.copy_active = true;
+            self.copy_selecting = false;
+            self.sel.clear();
+            // Start at the terminal cursor (what you were looking at),
+            // mapped to absolute rows.
+            const off: usize = @min(self.ctx.grid.view_offset, self.ctx.grid.sb_len);
+            self.placeCopyCursor(self.ctx.grid.sb_len - off + self.ctx.cursor_row, self.ctx.cursor_col);
+        }
+
+        fn exitCopyMode(self: *Self) void {
+            if (!self.copy_active) return;
+            self.copy_active = false;
+            self.copy_selecting = false;
+            self.sel.clear();
+            self.needs_render = true;
+        }
+
+        fn placeCopyCursor(self: *Self, arow: usize, acol: u16) void {
+            const rows = self.ctx.grid.rows;
+            const cols = self.ctx.grid.cols;
+            const total = self.ctx.grid.sb_len + rows;
+            if (total == 0) return;
+            self.copy_arow = @min(arow, total - 1);
+            self.copy_acol = if (cols == 0) 0 else @min(acol, cols - 1);
+            search_mod.ensureVisibleEdge(&self.ctx.grid, self.copy_arow);
+            self.syncCopySel();
+            self.needs_render = true;
+        }
+
+        /// Move the copy cursor by (dr, dc), scrolling the viewport after it.
+        fn moveCopyCursor(self: *Self, dr: i64, dc: i32) void {
+            const total: i64 = @intCast(self.ctx.grid.sb_len + self.ctx.grid.rows);
+            if (total <= 0) return;
+            const r: i64 = @intCast(self.copy_arow);
+            const nr = @max(0, @min(r + dr, total - 1));
+            const cc: i32 = self.copy_acol;
+            const maxc: i32 = @as(i32, self.ctx.grid.cols) -| 1;
+            const nc = @max(0, @min(cc + dc, maxc));
+            self.placeCopyCursor(@intCast(nr), @intCast(nc));
+        }
+
+        /// Mirror anchor/cursor into sel for highlight + yank.
+        fn syncCopySel(self: *Self) void {
+            if (!self.copy_selecting) {
+                self.sel.clear();
+                return;
+            }
+            const off: usize = @min(self.ctx.grid.view_offset, self.ctx.grid.sb_len);
+            const base: usize = self.ctx.grid.sb_len - off;
+            const rows = self.ctx.grid.rows;
+            self.sel.anchor_col = self.copy_anchor_acol;
+            self.sel.anchor_row = screenRow(self.copy_anchor_arow, base, rows);
+            self.sel.focus_col = self.copy_acol;
+            self.sel.focus_row = screenRow(self.copy_arow, base, rows);
+            self.sel.mode = .cell;
+            self.sel.active = true;
+        }
+
+        fn screenRow(abs: usize, base: usize, rows: u16) u16 {
+            if (abs < base) return 0;
+            const s = abs - base;
+            if (rows == 0 or s >= rows) return if (rows == 0) 0 else rows - 1;
+            return @intCast(s);
+        }
+
+        /// Yank the selection. Enter exits afterwards (tmux
+        /// copy-selection-and-cancel); y stays in mode (copy-selection),
+        /// keeping the highlight so you can keep working.
+        fn yankCopy(self: *Self, exit_after: bool) void {
+            if (!self.copy_active) return;
+            // No (or empty) selection: Alacritty parity is exit-without-yank.
+            const empty = !self.copy_selecting or
+                (self.copy_anchor_arow == self.copy_arow and self.copy_anchor_acol == self.copy_acol);
+            if (!empty) {
+                self.syncCopySel();
+                self.copySelection();
+            }
+            if (exit_after) {
+                self.exitCopyMode();
+            } else {
+                // Stay in mode at the same cursor, selection dropped.
+                self.copy_selecting = false;
+                self.syncCopySel();
+                self.needs_render = true;
+            }
+        }
+
         fn handleSym(self: *Self, sym: u32, keycode: u32) void {
             if (self.xkb_state == null) return;
             const mods = self.currentMods();
@@ -1907,6 +2051,121 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (cfg.find and mods.ctrl and mods.shift and (sym == 'F' or sym == 'f')) {
                 self.toggleFind();
                 return;
+            }
+            // Copy mode toggle: Ctrl+Shift+Space (plain Ctrl+Space keeps
+            // sending NUL to the PTY).
+            if (cfg.copy_mode and mods.ctrl and mods.shift and sym == K.Space) {
+                self.toggleCopyMode();
+                return;
+            }
+            // Copy-mode routing: nav/edit/yank consumed; Esc/q exits;
+            // anything else exits and falls through to normal dispatch.
+            if (cfg.copy_mode and self.copy_active) {
+                if (sym == K.Escape or sym == 'q' or sym == 'Q') {
+                    // Two-stage exit: first drops the selection and stays,
+                    // second leaves copy mode.
+                    if (self.copy_selecting) {
+                        self.copy_selecting = false;
+                        self.syncCopySel();
+                        self.needs_render = true;
+                    } else {
+                        self.exitCopyMode();
+                    }
+                    return;
+                }
+                if (sym == K.Return) {
+                    self.yankCopy(true);
+                    return;
+                }
+                if (sym == K.Up or sym == 'k' or sym == 'K') {
+                    self.moveCopyCursor(-1, 0);
+                    return;
+                }
+                if (sym == K.Down or sym == 'j' or sym == 'J') {
+                    self.moveCopyCursor(1, 0);
+                    return;
+                }
+                if (sym == K.Left or sym == 'h' or sym == 'H') {
+                    if (mods.ctrl) {
+                        const p = search_mod.wordBack(&self.ctx.grid, self.copy_arow, self.copy_acol);
+                        self.placeCopyCursor(p.row, p.col);
+                    } else {
+                        self.moveCopyCursor(0, -1);
+                    }
+                    return;
+                }
+                if (sym == K.Right or sym == 'l' or sym == 'L') {
+                    if (mods.ctrl) {
+                        const p = search_mod.wordEnd(&self.ctx.grid, self.copy_arow, self.copy_acol);
+                        self.placeCopyCursor(p.row, p.col);
+                    } else {
+                        self.moveCopyCursor(0, 1);
+                    }
+                    return;
+                }
+                if (sym == K.Page_Up) {
+                    self.moveCopyCursor(-@as(i64, self.ctx.grid.rows), 0);
+                    return;
+                }
+                if (sym == K.Page_Down) {
+                    self.moveCopyCursor(@as(i64, self.ctx.grid.rows), 0);
+                    return;
+                }
+                if (sym == K.Home) {
+                    self.copy_acol = 0;
+                    self.syncCopySel();
+                    self.needs_render = true;
+                    return;
+                }
+                if (sym == K.End) {
+                    self.copy_acol = self.ctx.grid.cols -| 1;
+                    self.syncCopySel();
+                    self.needs_render = true;
+                    return;
+                }
+                if (sym == 'g') {
+                    self.placeCopyCursor(0, 0);
+                    return;
+                }
+                if (sym == 'G') {
+                    const total = self.ctx.grid.sb_len + self.ctx.grid.rows;
+                    if (total > 0) self.placeCopyCursor(total - 1, 0);
+                    return;
+                }
+                if (sym == 'v' or sym == 'V') {
+                    // Vim-like toggle: second v drops back to cursor-only.
+                    if (self.copy_selecting) {
+                        self.copy_selecting = false;
+                        self.syncCopySel();
+                    } else {
+                        self.copy_selecting = true;
+                        self.copy_anchor_arow = self.copy_arow;
+                        self.copy_anchor_acol = self.copy_acol;
+                        self.syncCopySel();
+                    }
+                    self.needs_render = true;
+                    return;
+                }
+                if (sym == 'y' or sym == 'Y') {
+                    self.yankCopy(false);
+                    return;
+                }
+                if (sym == 'w' or sym == 'W') {
+                    const p = search_mod.wordForward(&self.ctx.grid, self.copy_arow, self.copy_acol);
+                    self.placeCopyCursor(p.row, p.col);
+                    return;
+                }
+                if (sym == 'e' or sym == 'E') {
+                    const p = search_mod.wordEnd(&self.ctx.grid, self.copy_arow, self.copy_acol);
+                    self.placeCopyCursor(p.row, p.col);
+                    return;
+                }
+                if (sym == 'b' or sym == 'B') {
+                    const p = search_mod.wordBack(&self.ctx.grid, self.copy_arow, self.copy_acol);
+                    self.placeCopyCursor(p.row, p.col);
+                    return;
+                }
+                self.exitCopyMode();
             }
             // Find-mode routing: nav/edit keys consumed; anything else
             // exits find mode and falls through to normal dispatch.
@@ -2760,6 +3019,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             switch (button) {
                 0x110 => { // left: Ctrl+click opens links; else multi-click / drag-select
                     if (!cfg.selection) return;
+                    if (cfg.copy_mode and self.copy_active and state == 1) self.exitCopyMode();
                     const cc = self.ptrCell(self.ptr_sx, self.ptr_sy);
                     if (state == 1) {
                         if (mods.ctrl) {

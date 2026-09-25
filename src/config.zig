@@ -125,6 +125,8 @@ pub const Config = struct {
     /// In-terminal find (Ctrl+Shift+F bottom bar over scrollback + grid).
     find: bool = true,
     find_max_matches: u32 = 256,
+    /// Keyboard copy mode (Ctrl+Shift+Space, tmux-style).
+    copy_mode: bool = true,
     /// Index badges on visible find matches (labels only).
     find_match_numbers: bool = false,
     /// Badge digit pixel scale (1 = 3x5 micro, 2 = 6x10, 3 = 9x15).
@@ -176,6 +178,7 @@ pub const minimal: Config = .{
     .double_buffer = false,
     .hyperlinks = false,
     .find = false,
+    .copy_mode = false,
 };
 
 /// Active profile selected by `-Dminimal` / `-Dascii-only`.

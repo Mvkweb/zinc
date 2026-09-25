@@ -52,6 +52,11 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         scroll_top: u16 = 0,
         scroll_bot: u16 = 0,
         osc_buf: std.ArrayList(u8),
+        /// Split multibyte tail carried into the next parse() call. A char
+        /// straddling two PTY reads must not become U+FFFD tofu.
+        utf8_carry: [4]u8 = [_]u8{0} ** 4,
+        utf8_carry_len: u8 = 0,
+        utf8_carry_need: u8 = 0,
         /// Shell working directory from OSC 7 (empty = unknown). Used to
         /// resolve relative Ctrl+click file paths.
         cwd_buf: [4096]u8 = [_]u8{0} ** 4096,
@@ -714,6 +719,17 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 self.blink_last_ms = nowMs();
             }
             var i: usize = 0;
+            // Complete a multibyte char split across the previous chunk.
+            while (self.utf8_carry_len > 0 and i < data.len and self.utf8_carry_len < self.utf8_carry_need) {
+                self.utf8_carry[self.utf8_carry_len] = data[i];
+                self.utf8_carry_len += 1;
+                i += 1;
+            }
+            if (self.utf8_carry_len > 0 and self.utf8_carry_len >= self.utf8_carry_need) {
+                var cidx: usize = 0;
+                self.putCodepoint(utf8_mod.decode(self.utf8_carry[0..self.utf8_carry_len], &cidx));
+                self.utf8_carry_len = 0;
+            }
             while (i < data.len) {
                 const b = data[i];
                 const st = self.parser.state;
@@ -738,8 +754,19 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     i += 1;
                     continue;
                 }
-                // Multibyte UTF-8 in ground state prints directly.
+                // Multibyte UTF-8 in ground state prints directly. An
+                // incomplete tail is stashed for the next chunk instead of
+                // emitting a replacement char (transient tofu on splits).
                 if (self.parser.state == .ground and b >= 0x80) {
+                    const need: usize = std.unicode.utf8ByteSequenceLength(b) catch 1;
+                    if (i + need > data.len) {
+                        const n = data.len - i;
+                        @memcpy(self.utf8_carry[0..n], data[i..]);
+                        self.utf8_carry_len = @intCast(n);
+                        self.utf8_carry_need = @intCast(need);
+                        i = data.len;
+                        continue;
+                    }
                     var idx = i;
                     const cp = utf8_mod.decode(data, &idx);
                     self.putCodepoint(cp);
@@ -1415,6 +1442,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             self.prompt_start_row = null;
             self.cur_link = 0;
             self.decckm = false;
+            self.utf8_carry_len = 0;
             self.scroll_top = 0;
             self.scroll_bot = self.grid.rows - 1;
         }
@@ -1907,6 +1935,17 @@ test "csi vpa/vpr row motion" {
     try std.testing.expectEqual(@as(u16, 4), ctx.cursor_row);
     ctx.parse("\x1b[999d");
     try std.testing.expectEqual(ctx.grid.rows - 1, ctx.cursor_row);
+}
+
+test "split multibyte across parse calls" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    // U+2500 (─) is E2 94 80. A chunk split must not become U+FFFD tofu.
+    ctx.parse("\xE2\x94");
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[0].rune);
+    ctx.parse("\x80X");
+    try std.testing.expectEqual(@as(u21, 0x2500), ctx.grid.cells[0].rune);
+    try std.testing.expectEqual(@as(u21, 'X'), ctx.grid.cells[1].rune);
 }
 
 test "decset cursor visibility + mouse modes" {

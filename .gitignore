@@ -8,6 +8,9 @@ references/
 # Agent configuration
 AGENTS.md
 
+# Local feature notes (unpublished roadmap docs)
+FEATURES.md
+
 # Editor and OS temporaries
 *.swp
 *~
