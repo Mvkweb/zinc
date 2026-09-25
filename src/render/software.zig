@@ -59,6 +59,25 @@ pub fn fillRect(buf: []u32, stride: u32, height: u32, x: u32, y: u32, w: u32, h:
     if (dmg) |d| d.add(@intCast(x), @intCast(y), @intCast(w), @intCast(h));
 }
 
+/// Alpha-blended rect over existing pixels (cursor trail ghosts). Signed
+/// coords like blitGlyph: out-of-bounds pixels are skipped, never wrapped.
+pub fn fillRectBlend(buf: []u32, stride: u32, height: u32, x: i32, y: i32, w: u32, h: u32, color: u32, alpha: u8, dmg: ?*Damage) void {
+    if (alpha == 0) return;
+    var row: u32 = 0;
+    while (row < h) : (row += 1) {
+        const yy = y + @as(i32, @intCast(row));
+        if (yy < 0 or yy >= height) continue;
+        var col: u32 = 0;
+        while (col < w) : (col += 1) {
+            const xx = x + @as(i32, @intCast(col));
+            if (xx < 0 or xx >= stride) continue;
+            const idx = @as(usize, @intCast(yy)) * stride + @as(usize, @intCast(xx));
+            buf[idx] = blendArgb(buf[idx], color, alpha);
+            if (dmg) |d| d.add(xx, yy, 1, 1);
+        }
+    }
+}
+
 test "damage union + blend" {
     var d = Damage{};
     d.add(0, 0, 10, 10);
@@ -68,6 +87,16 @@ test "damage union + blend" {
     var buf: [16]u32 = [_]u32{0} ** 16;
     fillRect(&buf, 4, 4, 0, 0, 2, 2, 0xFF112233, null);
     try std.testing.expectEqual(@as(u32, 0xFF112233), buf[0]);
+}
+
+test "fillRectBlend fades over pixels, skips OOB" {
+    var buf: [16]u32 = [_]u32{0xFF000000} ** 16;
+    fillRectBlend(&buf, 4, 4, 1, 1, 2, 2, 0xFFFFFFFF, 128, null);
+    try std.testing.expectEqual(@as(u32, 0xFF000000), buf[0]);
+    try std.testing.expect(buf[1 * 4 + 1] != 0xFF000000 and buf[1 * 4 + 1] != 0xFFFFFFFF);
+    // Negative origin clips instead of wrapping.
+    fillRectBlend(&buf, 4, 4, -1, -1, 2, 2, 0xFFFFFFFF, 255, null);
+    try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), buf[0]);
 }
 
 /// Blit an 8-bit coverage glyph from the atlas onto XRGB pixels.

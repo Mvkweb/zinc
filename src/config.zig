@@ -51,9 +51,15 @@ pub const Config = struct {
     animate_screen: bool = false,
     anim_dur_ms: f32 = 250.0,
     smooth_scroll: bool = true,
+    /// Pixel-glide duration for scrollback jumps (wheel, PgUp/Dn).
+    smooth_scroll_ms: u16 = 150,
     scroll_decay: f32 = 0.05,
     cursor_trail_ms: u16 = 0,
     cursor_trail_decay: f32 = 0.01,
+    /// Cursor glide: the visible cursor flows to its cell instead of
+    /// teleporting (exponential ease-out, ~glide_ms to settle).
+    cursor_glide: bool = true,
+    cursor_glide_ms: u16 = 120,
 
     // Font. Size is points at font_dpi (foot parity: size=12 with
     // dpi-aware=no renders 12pt @ 96dpi = 16px, never 12px).
@@ -148,6 +154,8 @@ pub const Config = struct {
                 @compileError("animate_screen requires alt_screen + double_buffer");
             if (self.cursor_trail_ms > 0 and !self.double_buffer)
                 @compileError("cursor trail requires double_buffer");
+            if (self.cursor_glide and !self.double_buffer)
+                @compileError("cursor glide requires double_buffer");
             if (self.selection and !self.mouse)
                 @compileError("selection requires mouse");
             if (self.clipboard_osc52 and !self.clipboard)
@@ -174,6 +182,7 @@ pub const minimal: Config = .{
     .font_bleed = false,
     .animate_screen = false,
     .smooth_scroll = false,
+    .cursor_glide = false,
     .cursor_trail_ms = 0,
     .double_buffer = false,
     .hyperlinks = false,

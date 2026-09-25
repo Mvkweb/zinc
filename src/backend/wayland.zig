@@ -151,6 +151,7 @@ const hyperlink_mod = @import("../term/hyperlink.zig");
 const cell_mod = @import("../term/cell.zig");
 const software = @import("../render/software.zig");
 const box_drawing = @import("../render/box_drawing.zig");
+const flow_mod = @import("../render/flow.zig");
 const placeholder_mod = @import("../gfx/placeholder.zig");
 const search_mod = @import("../term/search.zig");
 const filelink_mod = @import("../term/filelink.zig");
@@ -289,6 +290,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// Runtime badge knobs (file config overrides comptime defaults).
         find_numbers: bool = cfg.find_match_numbers,
         find_num_scale: u8 = cfg.find_number_scale,
+        /// Flow animation knobs (file config overrides comptime defaults).
+        glide: bool = cfg.cursor_glide,
+        glide_ms: u16 = cfg.cursor_glide_ms,
+        trail_ms: u16 = cfg.cursor_trail_ms,
+        smooth_scroll: bool = cfg.smooth_scroll,
+        smooth_scroll_ms: u16 = cfg.smooth_scroll_ms,
+        flow: flow_mod.Flow = .{},
         last_click_time: u32 = 0,
         last_click_col: u16 = 0,
         last_click_row: u16 = 0,
@@ -461,6 +469,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .selection_single_cell = runtime_cfg.selection_single_cell orelse cfg.selection_single_cell,
                 .find_numbers = runtime_cfg.find_match_numbers orelse cfg.find_match_numbers,
                 .find_num_scale = runtime_cfg.find_number_scale orelse cfg.find_number_scale,
+                .glide = runtime_cfg.cursor_glide orelse cfg.cursor_glide,
+                .glide_ms = runtime_cfg.cursor_glide_ms orelse cfg.cursor_glide_ms,
+                .trail_ms = runtime_cfg.cursor_trail_ms orelse cfg.cursor_trail_ms,
+                .smooth_scroll = runtime_cfg.smooth_scroll orelse cfg.smooth_scroll,
+                .smooth_scroll_ms = runtime_cfg.smooth_scroll_ms orelse cfg.smooth_scroll_ms,
             };
             errdefer {
                 self.deinit();
@@ -1060,7 +1073,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 const vis = v.m.erow - base;
                 if (vis >= visible_rows) continue;
                 const cx: i32 = px + @as(i32, v.m.ecol) * cw;
-                const cy: i32 = py + @as(i32, @intCast(vis)) * ch;
+                const cy: i32 = py + @as(i32, @intCast(vis)) * ch + self.flow.scrollShiftPx(ch);
                 // Digit block width, then a padded pill straddling the
                 // cell's right edge so the badge sits clearly outside the
                 // match text instead of on top of it.
@@ -1144,6 +1157,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
             const visible_cols = @min(self.ctx.grid.cols, @as(u16, @intCast(@max(0, @divFloor(self.width - px, cw)))));
             const visible_rows = @min(self.ctx.grid.rows, @as(u16, @intCast(@max(0, @divFloor(self.height - py, ch)))));
+            // Flow: pixel shift while the scrollback offset is still gliding
+            // to its target (0 at rest). Text passes shift with it; image
+            // tiers and bottom overlays stay pinned.
+            const fyshift: i32 = self.flow.scrollShiftPx(ch);
+            const row_end: u16 = if (fyshift != 0) visible_rows +| 1 else visible_rows;
             // Find: visible match subset for per-cell highlight checks.
             if (cfg.find and self.find_active and visible_rows > 0) {
                 const v0 = search_mod.absRow(&self.ctx.grid, 0);
@@ -1157,7 +1175,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
             // Pass 1: non-default cell backgrounds (default bg was filled above).
             var row: u16 = 0;
-            while (row < visible_rows) : (row += 1) {
+            while (row < row_end) : (row += 1) {
                 var col: u16 = 0;
                 while (col < visible_cols) : (col += 1) {
                     const cell_ptr = self.ctx.grid.viewCell(col, row) orelse continue;
@@ -1185,7 +1203,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
                     const bg = self.themed(bg_straight, false);
                     const x: u32 = @intCast(px + @as(i32, col) * cw);
-                    const y: u32 = @intCast(py + @as(i32, row) * ch);
+                    // Glide strip: rows fully off-screen are skipped (the
+                    // edge row arrives properly with the harden pass).
+                    const sy1: i32 = py + @as(i32, row) * ch + fyshift;
+                    if (sy1 < 0 or sy1 >= @as(i32, @intCast(H))) continue;
+                    const y: u32 = @intCast(sy1);
                     software.fillRect(self.pool_pixels, W, H, x, y, @intCast(cw), @intCast(ch), bg, null);
                 }
             }
@@ -1194,7 +1216,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.blitImageTier(1, W, H, px, py, cw, ch, visible_cols, visible_rows, &dmg);
             // Pass 2: glyphs, combining marks, underlines.
             row = 0;
-            while (row < visible_rows) : (row += 1) {
+            while (row < row_end) : (row += 1) {
                 // Ctrl+hover hyperlink span on this row (if any).
                 const link_hover = cfg.hyperlinks and self.hover_active and row == self.hover_row and self.ctrlHeld();
                 var col: u16 = 0;
@@ -1225,7 +1247,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         fg = 0xFF000000 | (r << 16) | (g << 8) | b;
                     }
                     const x: u32 = @intCast(px + @as(i32, col) * cw);
-                    const y: u32 = @intCast(py + @as(i32, row) * ch);
+                    const sy2: i32 = py + @as(i32, row) * ch + fyshift;
+                    if (sy2 < 0 or sy2 >= @as(i32, @intCast(H))) continue;
+                    const y: u32 = @intCast(sy2);
 
                     if (!cell.attr.invisible) {
                         const cp = cellCp(cell.rune);
@@ -1382,28 +1406,61 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (cfg.find and self.find_active) {
                 self.drawFindNumbers(W, H, px, py, cw, ch, visible_cols, visible_rows, &dmg);
             }
+            // Cursor trail: fading departure cells under the live cursor.
+            // Drawn first so the gliding cursor paints on top.
+            if (self.trail_ms > 0 and self.flow.trail_n > 0) {
+                const tcol = self.themed(self.ctx.cursor_color, false);
+                const tt: u32 = @intCast(@max(1, @as(i32, @intFromFloat(@ceil(self.cursor_thick_px)))));
+                var ti: usize = 0;
+                while (ti < self.flow.trail_n) : (ti += 1) {
+                    const te = self.flow.trail[ti];
+                    const ta = self.flow.trailAlpha(ti, self.trail_ms);
+                    if (ta == 0) continue;
+                    if (te.col >= visible_cols or te.row >= visible_rows) continue;
+                    const tx: i32 = px + @as(i32, te.col) * cw;
+                    const ty: i32 = py + @as(i32, te.row) * ch + fyshift;
+                    switch (self.cursor_style) {
+                        .block => software.fillRectBlend(self.pool_pixels, W, H, tx, ty, @intCast(cw), @intCast(ch), tcol, ta, &dmg),
+                        .bar => software.fillRectBlend(self.pool_pixels, W, H, tx, ty, @intCast(@min(tt, @as(u32, @intCast(cw)))), @intCast(ch), tcol, ta, &dmg),
+                        .underline => software.fillRectBlend(self.pool_pixels, W, H, tx, ty + ch - @as(i32, @intCast(tt)), @intCast(cw), tt, tcol, ta, &dmg),
+                    }
+                }
+            }
             // Block cursor; hollow outline when unfocused; hidden on blink
             // phase, DECSET 25 reset, or while scrolled into history.
             const show_cursor = (!self.cursor_blink or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0 and !self.copy_active;
             if (show_cursor and self.ctx.cursor_col < visible_cols and self.ctx.cursor_row < visible_rows) {
-                const ccx: u32 = @intCast(px + @as(i32, self.ctx.cursor_col) * cw);
-                const ccy: u32 = @intCast(py + @as(i32, self.ctx.cursor_row) * ch);
+                // Glide: interpolated position, stretched toward the target
+                // while far from rest (clamped to one cell per axis).
+                const gp = self.flow.cursorPx();
+                const ccx: i32 = px + gp.x;
+                const ccy: i32 = py + gp.y + fyshift;
                 const cur = self.themed(self.ctx.cursor_color, false);
-                const cwu: u32 = @intCast(cw);
-                const chu: u32 = @intCast(ch);
-                const t: u32 = @intCast(@max(1, @as(i32, @intFromFloat(@ceil(self.cursor_thick_px)))));
+                const cwu: i32 = cw;
+                const chu: i32 = ch;
+                const t: i32 = @max(1, @as(i32, @intFromFloat(@ceil(self.cursor_thick_px))));
+                const tgtx: i32 = @as(i32, self.ctx.cursor_col) * cw;
+                const tgty: i32 = @as(i32, self.ctx.cursor_row) * ch;
+                const sdx: i32 = @min(cw, @as(i32, @intFromFloat(@round(@abs(@as(f32, @floatFromInt(tgtx - gp.x)) / 2.0)))));
+                const sdy: i32 = @min(ch, @as(i32, @intFromFloat(@round(@abs(@as(f32, @floatFromInt(tgty - gp.y)) / 2.0)))));
+                const sx0: i32 = if (tgtx < gp.x) -sdx else 0;
+                const sy0: i32 = if (tgty < gp.y) -sdy else 0;
                 if (self.ctx.focused) {
                     switch (self.cursor_style) {
-                        .block => software.fillRect(self.pool_pixels, W, H, ccx, ccy, cwu, chu, cur, &dmg),
-                        .bar => software.fillRect(self.pool_pixels, W, H, ccx, ccy, @min(t, cwu), chu, cur, &dmg),
-                        .underline => software.fillRect(self.pool_pixels, W, H, ccx, ccy + chu - t, cwu, t, cur, &dmg),
+                        .block => software.fillRect(self.pool_pixels, W, H, @intCast(@max(0, ccx + sx0)), @intCast(@max(0, ccy + sy0)), @intCast(cwu + sdx), @intCast(chu + sdy), cur, &dmg),
+                        .bar => software.fillRect(self.pool_pixels, W, H, @intCast(@max(0, ccx + sx0)), @intCast(@max(0, ccy + sy0)), @intCast(@min(t, cwu) + sdx), @intCast(chu + sdy), cur, &dmg),
+                        .underline => software.fillRect(self.pool_pixels, W, H, @intCast(@max(0, ccx + sx0)), @intCast(@max(0, ccy + chu - t + sy0)), @intCast(cwu + sdx), @intCast(t + sdy), cur, &dmg),
                     }
                 } else {
                     const ot: u32 = @intCast(@max(1, @divFloor(cw, 8)));
-                    software.fillRect(self.pool_pixels, W, H, ccx, ccy, cwu, ot, cur, &dmg);
-                    software.fillRect(self.pool_pixels, W, H, ccx, ccy + chu - ot, cwu, ot, cur, &dmg);
-                    software.fillRect(self.pool_pixels, W, H, ccx, ccy, ot, chu, cur, &dmg);
-                    software.fillRect(self.pool_pixels, W, H, ccx + cwu - ot, ccy, ot, chu, cur, &dmg);
+                    const ox: u32 = @intCast(@max(0, ccx + sx0));
+                    const oy: u32 = @intCast(@max(0, ccy + sy0));
+                    const ow: u32 = @intCast(cwu + sdx);
+                    const oh: u32 = @intCast(chu + sdy);
+                    software.fillRect(self.pool_pixels, W, H, ox, oy, ow, ot, cur, &dmg);
+                    software.fillRect(self.pool_pixels, W, H, ox, oy + oh - ot, ow, ot, cur, &dmg);
+                    software.fillRect(self.pool_pixels, W, H, ox, oy, ot, oh, cur, &dmg);
+                    software.fillRect(self.pool_pixels, W, H, ox + ow - ot, oy, ot, oh, cur, &dmg);
                 }
             }
             // Copy cursor: solid block in cursor color + COPY tag. The
@@ -1415,7 +1472,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     const sr = self.copy_arow - (csb - coff);
                     if (sr < visible_rows and self.copy_acol < visible_cols) {
                         const ccx: u32 = @intCast(px + @as(i32, self.copy_acol) * cw);
-                        const ccy: u32 = @intCast(py + @as(i32, @intCast(sr)) * ch);
+                        const ccy: u32 = @intCast(@max(@as(i32, 0), py + @as(i32, @intCast(sr)) * ch + fyshift));
                         const cur = self.themed(self.ctx.cursor_color, false);
                         const cwu: u32 = @intCast(cw);
                         const chu: u32 = @intCast(ch);
@@ -1668,9 +1725,18 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.handleResize(p.w, p.h);
             }
             self.recreatePool() catch return;
+            // Flow: advance animations to now. An unsettled flow forces
+            // full frames (the cursor-only fast path can't cover motion)
+            // and re-arms needs_render until everything converges — frames
+            // stay paced by compositor frame callbacks, so 144Hz flows at
+            // 144Hz and idle stays at zero frames.
+            const flow_now = context_mod.nowMs();
+            const voff: usize = @min(self.ctx.grid.view_offset, self.ctx.grid.sb_len);
+            const flow_visible = (!self.cursor_blink or self.ctx.blink_visible) and self.ctx.show_cursor and voff == 0 and !self.copy_active;
+            self.flow.step(flow_now, self.ctx.cursor_col, self.ctx.cursor_row, voff, flow_visible, self.cell_w, self.cell_h, self.glide, self.glide_ms, self.trail_ms, self.smooth_scroll, self.smooth_scroll_ms);
             const is_prof = std.c.getenv("ZINC_PROFILE") != null;
             const t0: i64 = if (is_prof) context_mod.nowMs() else 0;
-            const is_cursor_only = self.cursor_only_render and self.pending_resize == null and self.resize_settle_ms == 0;
+            const is_cursor_only = self.cursor_only_render and self.pending_resize == null and self.resize_settle_ms == 0 and self.flow.settled();
             self.cursor_only_render = false;
             const dmg = if (is_cursor_only) self.renderCursorCell() else self.renderCells();
             const t1: i64 = if (is_prof) context_mod.nowMs() else 0;
@@ -1705,7 +1771,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_COMMIT);
             _ = c.wl_display_flush(self.display);
             self.frame_pending = true;
-            self.needs_render = false;
+            self.needs_render = !self.flow.settled();
         }
 
         // -- main loop ------------------------------------------------------

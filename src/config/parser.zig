@@ -23,6 +23,11 @@ pub const RuntimeConfig = struct {
     cursor_blink: ?bool = null,
     cursor_thick_px: ?f32 = null,
     selection_single_cell: ?bool = null,
+    cursor_glide: ?bool = null,
+    cursor_glide_ms: ?u16 = null,
+    cursor_trail_ms: ?u16 = null,
+    smooth_scroll: ?bool = null,
+    smooth_scroll_ms: ?u16 = null,
     find_match_numbers: ?bool = null,
     find_number_scale: ?u8 = null,
     editor_command: ?[]const u8 = null,
@@ -182,6 +187,22 @@ pub fn parse(content: []const u8, cfg: *RuntimeConfig, gpa: std.mem.Allocator) v
             } else |_| {}
         } else if (std.ascii.eqlIgnoreCase(key, "selection-single-cell") or std.ascii.eqlIgnoreCase(key, "selection_single_cell")) {
             if (parseBool(val)) |b| cfg.selection_single_cell = b;
+        } else if (std.ascii.eqlIgnoreCase(key, "cursor-glide") or std.ascii.eqlIgnoreCase(key, "cursor_glide")) {
+            if (parseBool(val)) |b| cfg.cursor_glide = b;
+        } else if (std.ascii.eqlIgnoreCase(key, "cursor-glide-ms") or std.ascii.eqlIgnoreCase(key, "cursor_glide_ms")) {
+            if (std.fmt.parseInt(u16, trimQuotes(val), 10)) |m| {
+                if (m <= 1000) cfg.cursor_glide_ms = m;
+            } else |_| {}
+        } else if (std.ascii.eqlIgnoreCase(key, "cursor-trail-ms") or std.ascii.eqlIgnoreCase(key, "cursor_trail_ms")) {
+            if (std.fmt.parseInt(u16, trimQuotes(val), 10)) |m| {
+                if (m <= 2000) cfg.cursor_trail_ms = m;
+            } else |_| {}
+        } else if (std.ascii.eqlIgnoreCase(key, "smooth-scroll") or std.ascii.eqlIgnoreCase(key, "smooth_scroll")) {
+            if (parseBool(val)) |b| cfg.smooth_scroll = b;
+        } else if (std.ascii.eqlIgnoreCase(key, "smooth-scroll-ms") or std.ascii.eqlIgnoreCase(key, "smooth_scroll_ms")) {
+            if (std.fmt.parseInt(u16, trimQuotes(val), 10)) |m| {
+                if (m <= 1000) cfg.smooth_scroll_ms = m;
+            } else |_| {}
         } else if (std.ascii.eqlIgnoreCase(key, "find-match-numbers") or std.ascii.eqlIgnoreCase(key, "find_match_numbers")) {
             if (parseBool(val)) |b| cfg.find_match_numbers = b;
         } else if (std.ascii.eqlIgnoreCase(key, "find-number-scale") or std.ascii.eqlIgnoreCase(key, "find_number_scale")) {
@@ -250,6 +271,11 @@ test "parse complete config content" {
         \\selection-single-cell = true
         \\find-match-numbers = true
         \\find-number-scale = 3
+        \\cursor-glide = false
+        \\cursor-glide-ms = 90
+        \\cursor-trail-ms = 250
+        \\smooth-scroll = false
+        \\smooth-scroll-ms = 200
     ;
 
     var cfg = RuntimeConfig{};
@@ -273,6 +299,11 @@ test "parse complete config content" {
     try std.testing.expectEqual(@as(?bool, true), cfg.selection_single_cell);
     try std.testing.expectEqual(@as(?bool, true), cfg.find_match_numbers);
     try std.testing.expectEqual(@as(?u8, 3), cfg.find_number_scale);
+    try std.testing.expectEqual(@as(?bool, false), cfg.cursor_glide);
+    try std.testing.expectEqual(@as(?u16, 90), cfg.cursor_glide_ms);
+    try std.testing.expectEqual(@as(?u16, 250), cfg.cursor_trail_ms);
+    try std.testing.expectEqual(@as(?bool, false), cfg.smooth_scroll);
+    try std.testing.expectEqual(@as(?u16, 200), cfg.smooth_scroll_ms);
 }
 
 test "parse find scale clamps + version-agnostic keys" {
