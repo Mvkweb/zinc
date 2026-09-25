@@ -119,6 +119,10 @@ pub const Config = struct {
     /// In-terminal find (Ctrl+Shift+F bottom bar over scrollback + grid).
     find: bool = true,
     find_max_matches: u32 = 256,
+    /// Index badges on visible find matches (labels only).
+    find_match_numbers: bool = false,
+    /// Badge digit pixel scale (1 = 3x5 micro, 2 = 6x10, 3 = 9x15).
+    find_number_scale: u8 = 2,
     osc_init_cap: u32 = 128,
     osc_max_cap: u32 = 16 * 1024 * 1024,
 

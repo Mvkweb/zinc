@@ -214,6 +214,10 @@ pub const AppError = error{
 };
 
 pub fn App(comptime cfg: config_mod.Config) type {
+    const FindVis = struct {
+        m: search_mod.Match,
+        idx: usize,
+    };
     return struct {
         gpa: std.mem.Allocator,
         io: std.Io,
@@ -270,7 +274,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
         find_matches: std.ArrayList(search_mod.Match) = .empty,
         find_idx: usize = 0,
         find_saved_off: usize = 0,
-        find_vis: [64]search_mod.Match = [_]search_mod.Match{.{ .row = 0, .col = 0, .erow = 0, .ecol = 0 }} ** 64,
+        find_vis: [64]FindVis = [_]FindVis{.{ .m = .{ .row = 0, .col = 0, .erow = 0, .ecol = 0 }, .idx = 0 }} ** 64,
         find_vis_n: usize = 0,
         last_click_time: u32 = 0,
         last_click_col: u16 = 0,
@@ -929,11 +933,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
         fn collectVisibleFind(self: *Self, v0: usize, v1: usize) void {
             self.find_vis_n = 0;
             if (!cfg.find or !self.find_active) return;
-            for (self.find_matches.items) |m| {
+            for (self.find_matches.items, 0..) |m, i| {
                 if (m.row > v1) break;
                 if (m.erow < v0) continue;
                 if (self.find_vis_n >= self.find_vis.len) break;
-                self.find_vis[self.find_vis_n] = m;
+                self.find_vis[self.find_vis_n] = .{ .m = m, .idx = i };
                 self.find_vis_n += 1;
             }
         }
@@ -952,7 +956,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             var rank: u8 = 0;
             var k: usize = 0;
             while (k < self.find_vis_n) : (k += 1) {
-                const m = self.find_vis[k];
+                const m = self.find_vis[k].m;
                 if (!matchCovers(m, abs, col)) continue;
                 // Matches are non-overlapping, so start coords identify.
                 if (self.find_idx < self.find_matches.items.len) {
@@ -1013,6 +1017,57 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     dmgMerge(dmg, gdmg);
                 }
                 x += cw;
+            }
+        }
+
+        /// Find number badges: 1-based index as 3x5 micro digits on every
+        /// visible match (labels only, toggle with find_match_numbers).
+        /// Only on-screen matches are badged, so it stays clean at any
+        /// total count; the bar's i/n already covers position.
+        fn drawFindNumbers(self: *Self, W: u32, H: u32, px: i32, py: i32, cw: i32, ch: i32, visible_cols: u16, visible_rows: u16, dmg: *software.Damage) void {
+            if (!cfg.find or !cfg.find_match_numbers or !self.find_active) return;
+            if (cw <= 0 or ch <= 0) return;
+            const off: usize = @min(self.ctx.grid.view_offset, self.ctx.grid.sb_len);
+            const sb: usize = self.ctx.grid.sb_len;
+            const base = sb - off; // abs row of visible row 0
+            const fg = 0xFF000000 | (self.selection_fg & 0xFFFFFF);
+            const pill = self.themed(self.selection_bg & 0xFFFFFF, false);
+            const sc: i32 = @max(1, cfg.find_number_scale);
+            const scu: u8 = @intCast(sc);
+            const pad: i32 = sc;
+            var k: usize = 0;
+            while (k < self.find_vis_n) : (k += 1) {
+                const v = self.find_vis[k];
+                if (v.m.ecol >= visible_cols) continue;
+                if (v.m.erow < base) continue;
+                const vis = v.m.erow - base;
+                if (vis >= visible_rows) continue;
+                const cx: i32 = px + @as(i32, v.m.ecol) * cw;
+                const cy: i32 = py + @as(i32, @intCast(vis)) * ch;
+                // Digit block width, then a padded pill straddling the
+                // cell's right edge so the badge sits clearly outside the
+                // match text instead of on top of it.
+                var nd: usize = 0;
+                var tmp: usize = v.idx + 1;
+                while (tmp > 0) {
+                    nd += 1;
+                    tmp /= 10;
+                }
+                const dw: i32 = @as(i32, @intCast(nd)) * 4 * sc - sc;
+                const right = cx + cw + 2;
+                const bx = right - dw - pad;
+                const by = cy + 1 - pad;
+                software.fillRect(self.pool_pixels, W, H, @intCast(@max(0, bx)), @intCast(@max(0, by)), @intCast(dw + pad * 2), @intCast(5 * sc + pad * 2), pill, dmg);
+                var num: usize = v.idx + 1;
+                var ex = bx + pad + dw;
+                const ey = by + pad;
+                while (num > 0) {
+                    const d: u8 = @intCast(num % 10);
+                    ex -= 4 * sc; // 3px digit + 1px gap, scaled
+                    const dd = software.drawMicroDigit(self.pool_pixels, W, H, ex, ey, d, fg, scu);
+                    dmgMerge(dmg, dd);
+                    num /= 10;
+                }
             }
         }
 
@@ -1306,6 +1361,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // M2b: placements sit at grid rows and do NOT shift on scroll
             // (M4) — text scrolls under a static image until then.
             self.blitImageTier(2, W, H, px, py, cw, ch, visible_cols, visible_rows, &dmg);
+            // Find number badges (above text, below cursor).
+            if (cfg.find and self.find_active) {
+                self.drawFindNumbers(W, H, px, py, cw, ch, visible_cols, visible_rows, &dmg);
+            }
             // Block cursor; hollow outline when unfocused; hidden on blink
             // phase, DECSET 25 reset, or while scrolled into history.
             const show_cursor = (!self.cursor_blink or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0;
