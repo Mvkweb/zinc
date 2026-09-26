@@ -865,6 +865,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// Apply alpha: only the default bg gets translucency (foot alpha-mode=matching).
         /// Stored premultiplied (foot/pixman ARGB8888 convention): RGB is
         /// scaled by alpha so the compositor doesn't over-contribute light.
+        /// Apps decide their own backgrounds: a transparent TUI theme
+        /// leaves cells on the terminal bg (translucent, like foot with
+        /// alpha), an opaque theme paints every cell itself. The terminal
+        /// never overrides either.
         fn themed(self: *Self, color: u32, is_default_bg: bool) u32 {
             const a: u32 = if (is_default_bg) self.bg_opacity else 0xFF;
             const r = ((color >> 16) & 0xFF) * a / 255;
@@ -1407,8 +1411,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.drawFindNumbers(W, H, px, py, cw, ch, visible_cols, visible_rows, &dmg);
             }
             // Cursor trail: fading departure cells under the live cursor.
-            // Drawn first so the gliding cursor paints on top.
-            if (self.trail_ms > 0 and self.flow.trail_n > 0) {
+            // Drawn first so the gliding cursor paints on top. Shares the
+            // cursor's visibility: no ghosts while hidden.
+            const show_cursor = (!(self.ctx.decscusr_blink orelse self.cursor_blink) or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0 and !self.copy_active;
+            if (show_cursor and self.trail_ms > 0 and self.flow.trail_n > 0) {
                 const tcol = self.themed(self.ctx.cursor_color, false);
                 const tt: u32 = @intCast(@max(1, @as(i32, @intFromFloat(@ceil(self.cursor_thick_px)))));
                 var ti: usize = 0;
@@ -1419,7 +1425,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     if (te.col >= visible_cols or te.row >= visible_rows) continue;
                     const tx: i32 = px + @as(i32, te.col) * cw;
                     const ty: i32 = py + @as(i32, te.row) * ch + fyshift;
-                    switch (self.cursor_style) {
+                    switch (self.ctx.decscusr_style orelse self.cursor_style) {
                         .block => software.fillRectBlend(self.pool_pixels, W, H, tx, ty, @intCast(cw), @intCast(ch), tcol, ta, &dmg),
                         .bar => software.fillRectBlend(self.pool_pixels, W, H, tx, ty, @intCast(@min(tt, @as(u32, @intCast(cw)))), @intCast(ch), tcol, ta, &dmg),
                         .underline => software.fillRectBlend(self.pool_pixels, W, H, tx, ty + ch - @as(i32, @intCast(tt)), @intCast(cw), tt, tcol, ta, &dmg),
@@ -1428,7 +1434,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             // Block cursor; hollow outline when unfocused; hidden on blink
             // phase, DECSET 25 reset, or while scrolled into history.
-            const show_cursor = (!self.cursor_blink or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0 and !self.copy_active;
             if (show_cursor and self.ctx.cursor_col < visible_cols and self.ctx.cursor_row < visible_rows) {
                 // Glide: interpolated position, stretched toward the target
                 // while far from rest (clamped to one cell per axis).
@@ -1446,7 +1451,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 const sx0: i32 = if (tgtx < gp.x) -sdx else 0;
                 const sy0: i32 = if (tgty < gp.y) -sdy else 0;
                 if (self.ctx.focused) {
-                    switch (self.cursor_style) {
+                    switch (self.ctx.decscusr_style orelse self.cursor_style) {
                         .block => software.fillRect(self.pool_pixels, W, H, @intCast(@max(0, ccx + sx0)), @intCast(@max(0, ccy + sy0)), @intCast(cwu + sdx), @intCast(chu + sdy), cur, &dmg),
                         .bar => software.fillRect(self.pool_pixels, W, H, @intCast(@max(0, ccx + sx0)), @intCast(@max(0, ccy + sy0)), @intCast(@min(t, cwu) + sdx), @intCast(chu + sdy), cur, &dmg),
                         .underline => software.fillRect(self.pool_pixels, W, H, @intCast(@max(0, ccx + sx0)), @intCast(@max(0, ccy + chu - t + sy0)), @intCast(cwu + sdx), @intCast(t + sdy), cur, &dmg),
@@ -1595,12 +1600,12 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
 
             // 3. Draw cursor overlay if visible
-            const show_cursor = (!self.cursor_blink or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0;
+            const show_cursor = (!(self.ctx.decscusr_blink orelse self.cursor_blink) or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0;
             if (show_cursor) {
                 const cur = self.themed(self.ctx.cursor_color, false);
                 const t: u32 = @intCast(@max(1, @as(i32, @intFromFloat(@ceil(self.cursor_thick_px)))));
                 if (self.ctx.focused) {
-                    switch (self.cursor_style) {
+                    switch (self.ctx.decscusr_style orelse self.cursor_style) {
                         .block => software.fillRect(self.pool_pixels, W, H, ccx, ccy, cwu, chu, cur, &dmg),
                         .bar => software.fillRect(self.pool_pixels, W, H, ccx, ccy, @min(t, cwu), chu, cur, &dmg),
                         .underline => software.fillRect(self.pool_pixels, W, H, ccx, ccy + chu - t, cwu, t, cur, &dmg),
@@ -1732,8 +1737,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // 144Hz and idle stays at zero frames.
             const flow_now = context_mod.nowMs();
             const voff: usize = @min(self.ctx.grid.view_offset, self.ctx.grid.sb_len);
-            const flow_visible = (!self.cursor_blink or self.ctx.blink_visible) and self.ctx.show_cursor and voff == 0 and !self.copy_active;
-            self.flow.step(flow_now, self.ctx.cursor_col, self.ctx.cursor_row, voff, flow_visible, self.cell_w, self.cell_h, self.glide, self.glide_ms, self.trail_ms, self.smooth_scroll, self.smooth_scroll_ms);
+            // Blink only hides the draw; history/copy hiding snaps the
+            // physics so no stale glide replays on reappear.
+            const view_live = voff == 0 and !self.copy_active;
+            const flow_visible = (!(self.ctx.decscusr_blink orelse self.cursor_blink) or self.ctx.blink_visible) and self.ctx.show_cursor and view_live;
+            self.flow.step(flow_now, self.ctx.cursor_col, self.ctx.cursor_row, voff, flow_visible, !view_live, self.cell_w, self.cell_h, self.glide, self.glide_ms, self.trail_ms, self.smooth_scroll, self.smooth_scroll_ms);
             const is_prof = std.c.getenv("ZINC_PROFILE") != null;
             const t0: i64 = if (is_prof) context_mod.nowMs() else 0;
             const is_cursor_only = self.cursor_only_render and self.pending_resize == null and self.resize_settle_ms == 0 and self.flow.settled();

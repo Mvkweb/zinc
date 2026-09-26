@@ -101,6 +101,10 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// DECCKM cursor application mode (DECSET 1): arrows/home/end
         /// report as SS3 (ESC O x) for ncurses apps.
         decckm: bool = false,
+        /// DECSCUSR cursor style override (CSI Ps SP q, nvim mode shapes).
+        /// Null = configured default. Blink overridden alongside.
+        decscusr_style: ?config_mod.CursorStyle = null,
+        decscusr_blink: ?bool = null,
         alt_saved_col: u16 = 0,
         alt_saved_row: u16 = 0,
         alt_saved_wrap: bool = false,
@@ -901,7 +905,40 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     self.cursor_row = @min(self.saved_row, self.grid.rows -| 1);
                     self.pending_wrap = self.saved_wrap and self.saved_col < self.grid.cols and self.saved_row < self.grid.rows;
                 },
-                'q' => {}, // DECSCUSR cursor style (phase 4: dynamic cursor)
+                'q' => { // DECSCUSR: 0 restores default; 1/2 block,
+                    // 3/4 underline, 5/6 bar (odd = blink, even = steady).
+                    switch (n(params, 0, 0)) {
+                        0 => {
+                            self.decscusr_style = null;
+                            self.decscusr_blink = null;
+                        },
+                        1 => {
+                            self.decscusr_style = .block;
+                            self.decscusr_blink = true;
+                        },
+                        2 => {
+                            self.decscusr_style = .block;
+                            self.decscusr_blink = false;
+                        },
+                        3 => {
+                            self.decscusr_style = .underline;
+                            self.decscusr_blink = true;
+                        },
+                        4 => {
+                            self.decscusr_style = .underline;
+                            self.decscusr_blink = false;
+                        },
+                        5 => {
+                            self.decscusr_style = .bar;
+                            self.decscusr_blink = true;
+                        },
+                        6 => {
+                            self.decscusr_style = .bar;
+                            self.decscusr_blink = false;
+                        },
+                        else => {},
+                    }
+                },
                 'r' => { // DECSTBM scroll region
                     const top = n(params, 0, 1) -| 1;
                     const bot = n(params, 1, self.grid.rows) -| 1;
@@ -918,6 +955,12 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                         if (msg) |m| self.emit(m);
                     }
                 },
+                'S' => self.scrollRegionUpN(n(params, 0, 1)), // SU
+                'T' => self.scrollRegionDownN(n(params, 0, 1)), // SD
+                'L' => self.insertLines(n(params, 0, 1)), // IL
+                'M' => self.deleteLines(n(params, 0, 1)), // DL
+                'X' => self.eraseChars(n(params, 0, 1)), // ECH
+                'P' => self.deleteChars(n(params, 0, 1)), // DCH
                 'h', 'l' => {
                     const set = final == 'h';
                     for (params) |p| {
@@ -1283,6 +1326,14 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             };
         }
 
+        /// Blank cell for erase ops (BCE): space with the current pen
+        /// background, everything else default. Our TERM claims bce, so
+        /// EL/ED/scroll/IL/DL fills use the pen bg, never defaults.
+        fn penBlank(self: *const Self) @TypeOf(self.grid.cells[0]) {
+            const CellT = @TypeOf(self.grid.cells[0]);
+            return CellT{ .bg = self.resolveColor(self.pen.bg) };
+        }
+
         fn defaultAnsi() [16]u32 {
             // foot default palette (Zenburn-derived).
             return .{
@@ -1369,34 +1420,101 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 @memcpy(self.grid.cells[dst..][0..self.grid.cols], self.grid.cells[src..][0..self.grid.cols]);
             }
             const last = @as(usize, self.scroll_bot) * self.grid.cols;
-            const CellT = @TypeOf(self.grid.cells[0]);
-            const blank = CellT{};
+            const blank = self.penBlank();
             @memset(self.grid.cells[last..][0..self.grid.cols], blank);
             self.shiftPlacements(self.scroll_top, self.scroll_bot, true);
         }
 
         fn reverseIndex(self: *Self) void {
             self.pending_wrap = false;
-            const CellT = @TypeOf(self.grid.cells[0]);
-            const blank = CellT{};
             if (self.cursor_row == self.scroll_top) {
-                // scroll region down
-                var r = self.scroll_bot;
-                while (r > self.scroll_top) : (r -= 1) {
-                    const dst = @as(usize, r) * self.grid.cols;
-                    const src = @as(usize, r - 1) * self.grid.cols;
-                    @memcpy(self.grid.cells[dst..][0..self.grid.cols], self.grid.cells[src..][0..self.grid.cols]);
-                }
-                @memset(self.grid.cells[@as(usize, self.scroll_top) * self.grid.cols ..][0..self.grid.cols], blank);
-                self.shiftPlacements(self.scroll_top, self.scroll_bot, false);
+                self.scrollRegionDown();
             } else if (self.cursor_row > 0) {
                 self.cursor_row -= 1;
             }
         }
 
-        fn eraseDisplay(self: *Self, mode: u16) void {
+        /// SU (CSI n S): scroll the scroll region up by n, like n
+        /// linefeeds that leave the cursor where it is. Full-region lines
+        /// enter scrollback; sub-region lines fall off the top.
+        fn scrollRegionUpN(self: *Self, count: u16) void {
+            const h: u16 = self.scroll_bot -| self.scroll_top +| 1;
+            const saved_row = self.cursor_row;
+            var n = @min(count, h);
+            while (n > 0) : (n -= 1) self.scrollRegionUp();
+            self.cursor_row = saved_row;
+        }
+
+        /// SD (CSI n T): scroll the scroll region down by n (cursor
+        /// stays). Never touches scrollback; lines past the bottom die.
+        fn scrollRegionDownN(self: *Self, count: u16) void {
+            const h: u16 = self.scroll_bot -| self.scroll_top +| 1;
+            var n = @min(count, h);
+            while (n > 0) : (n -= 1) self.scrollRegionDown();
+        }
+
+        /// One row of region scroll-down (shared by reverse-index and SD).
+        fn scrollRegionDown(self: *Self) void {
+            const blank = self.penBlank();
+            var r = self.scroll_bot;
+            while (r > self.scroll_top) : (r -= 1) {
+                const dst = @as(usize, r) * self.grid.cols;
+                const src = @as(usize, r - 1) * self.grid.cols;
+                @memcpy(self.grid.cells[dst..][0..self.grid.cols], self.grid.cells[src..][0..self.grid.cols]);
+            }
+            @memset(self.grid.cells[@as(usize, self.scroll_top) * self.grid.cols ..][0..self.grid.cols], blank);
+            self.shiftPlacements(self.scroll_top, self.scroll_bot, false);
+        }
+
+        /// IL (CSI n L): insert n blank lines at the cursor row (cursor
+        /// stays). Rows shift down inside the scroll region; rows past
+        /// the bottom die. Above-region rows never move. Single backwards
+        /// range copy: correct for every overlap by construction (@memcpy
+        /// panics on aliasing rows).
+        fn insertLines(self: *Self, count: u16) void {
+            if (count == 0 or self.cursor_row > self.scroll_bot) return;
             const CellT = @TypeOf(self.grid.cells[0]);
-            const blank = CellT{};
+            const cols: usize = self.grid.cols;
+            const top: usize = @max(self.cursor_row, self.scroll_top);
+            const bot: usize = self.scroll_bot;
+            const h: usize = bot -| top +| 1;
+            const n: usize = @min(@as(usize, count), h);
+            if (n < h) {
+                const len = (h - n) * cols;
+                std.mem.copyBackwards(CellT, self.grid.cells[(top + n) * cols ..][0..len], self.grid.cells[top * cols ..][0..len]);
+            }
+            @memset(self.grid.cells[top * cols ..][0 .. n * cols], self.penBlank());
+            const tu: u16 = @intCast(top);
+            const bu: u16 = @intCast(bot);
+            var k: usize = 0;
+            while (k < n) : (k += 1) self.shiftPlacements(tu, bu, false);
+        }
+
+        /// DL (CSI n M): delete n lines at the cursor row (cursor stays).
+        /// Rows shift up inside the scroll region; blanks fill the bottom.
+        /// Single forwards range copy: correct for every overlap by
+        /// construction (@memcpy panics on aliasing rows).
+        fn deleteLines(self: *Self, count: u16) void {
+            if (count == 0 or self.cursor_row > self.scroll_bot) return;
+            const CellT = @TypeOf(self.grid.cells[0]);
+            const cols: usize = self.grid.cols;
+            const top: usize = @max(self.cursor_row, self.scroll_top);
+            const bot: usize = self.scroll_bot;
+            const h: usize = bot -| top +| 1;
+            const n: usize = @min(@as(usize, count), h);
+            if (n < h) {
+                const len = (h - n) * cols;
+                std.mem.copyForwards(CellT, self.grid.cells[top * cols ..][0..len], self.grid.cells[(top + n) * cols ..][0..len]);
+            }
+            @memset(self.grid.cells[(bot - n + 1) * cols ..][0 .. n * cols], self.penBlank());
+            const tu: u16 = @intCast(top);
+            const bu: u16 = @intCast(bot);
+            var k: usize = 0;
+            while (k < n) : (k += 1) self.shiftPlacements(tu, bu, true);
+        }
+
+        fn eraseDisplay(self: *Self, mode: u16) void {
+            const blank = self.penBlank();
             switch (mode) {
                 0 => { // cursor -> end
                     const start = self.grid.index(self.cursor_col, self.cursor_row);
@@ -1418,8 +1536,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         }
 
         fn eraseLine(self: *Self, mode: u16) void {
-            const CellT = @TypeOf(self.grid.cells[0]);
-            const blank = CellT{};
+            const blank = self.penBlank();
             const row_off = @as(usize, self.cursor_row) * self.grid.cols;
             switch (mode) {
                 0 => @memset(self.grid.cells[row_off + self.cursor_col ..][0 .. self.grid.cols - self.cursor_col], blank),
@@ -1427,6 +1544,32 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 2 => @memset(self.grid.cells[row_off..][0..self.grid.cols], blank),
                 else => {},
             }
+        }
+
+        /// ECH (CSI n X): erase n chars at/after the cursor (cursor stays).
+        /// Vacated cells take the pen background (BCE).
+        fn eraseChars(self: *Self, count: u16) void {
+            const cols: usize = self.grid.cols;
+            const start: usize = @as(usize, self.cursor_row) * cols + self.cursor_col;
+            const max: usize = (@as(usize, self.cursor_row) + 1) * cols;
+            const n: usize = @min(@as(usize, count), max -| start);
+            @memset(self.grid.cells[start..][0..n], self.penBlank());
+        }
+
+        /// DCH (CSI n P): delete n chars at the cursor, shifting the rest
+        /// of the row left (cursor stays). Vacated cells take pen bg.
+        /// Single forwards range copy: overlap-safe by construction.
+        fn deleteChars(self: *Self, count: u16) void {
+            if (count == 0) return;
+            const CellT = @TypeOf(self.grid.cells[0]);
+            const cols: usize = self.grid.cols;
+            const row_off: usize = @as(usize, self.cursor_row) * cols;
+            const tail: usize = cols -| self.cursor_col;
+            const n: usize = @min(@as(usize, count), tail);
+            if (n < tail) {
+                std.mem.copyForwards(CellT, self.grid.cells[row_off + self.cursor_col ..][0 .. tail - n], self.grid.cells[row_off + self.cursor_col + n ..][0 .. tail - n]);
+            }
+            @memset(self.grid.cells[row_off + cols - n ..][0..n], self.penBlank());
         }
 
         fn reset(self: *Self) void {
@@ -1442,6 +1585,8 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             self.prompt_start_row = null;
             self.cur_link = 0;
             self.decckm = false;
+            self.decscusr_style = null;
+            self.decscusr_blink = null;
             self.utf8_carry_len = 0;
             self.scroll_top = 0;
             self.scroll_bot = self.grid.rows - 1;
@@ -1960,6 +2105,156 @@ test "decset cursor visibility + mouse modes" {
     try std.testing.expectEqual(mouse_mod.MouseMode.button_event, ctx.mouse_mode);
     ctx.parse("\x1b[?1002l");
     try std.testing.expectEqual(mouse_mod.MouseMode.off, ctx.mouse_mode);
+}
+
+test "decscusr cursor style override" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    try std.testing.expect(ctx.decscusr_style == null);
+    try std.testing.expect(ctx.decscusr_blink == null);
+    ctx.parse("\x1b[2 q"); // steady block (nvim normal mode)
+    try std.testing.expectEqual(config_mod.CursorStyle.block, ctx.decscusr_style.?);
+    try std.testing.expectEqual(false, ctx.decscusr_blink.?);
+    ctx.parse("\x1b[5 q"); // blinking bar (nvim insert mode)
+    try std.testing.expectEqual(config_mod.CursorStyle.bar, ctx.decscusr_style.?);
+    try std.testing.expectEqual(true, ctx.decscusr_blink.?);
+    ctx.parse("\x1b[4 q"); // steady underline
+    try std.testing.expectEqual(config_mod.CursorStyle.underline, ctx.decscusr_style.?);
+    try std.testing.expectEqual(false, ctx.decscusr_blink.?);
+    ctx.parse("\x1b[9 q"); // unknown: ignored, keeps previous
+    try std.testing.expectEqual(config_mod.CursorStyle.underline, ctx.decscusr_style.?);
+    ctx.parse("\x1b[0 q"); // 0 restores configured defaults
+    try std.testing.expect(ctx.decscusr_style == null);
+    try std.testing.expect(ctx.decscusr_blink == null);
+    ctx.parse("\x1b[1 q");
+    try std.testing.expect(ctx.decscusr_style != null);
+    ctx.parse("\x1bc"); // RIS resets the override too
+    try std.testing.expect(ctx.decscusr_style == null);
+    try std.testing.expect(ctx.decscusr_blink == null);
+}
+
+test "su/sd scroll the scroll region, cursor stays" {
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("0\r\n1\r\n2\r\n3");
+    ctx.parse("\x1b[2;3r"); // region = rows 1..2 (1-based)
+    ctx.parse("\x1b[S"); // SU: row 1 takes old row 2, row 2 blanks
+    try std.testing.expectEqual(@as(u32, '0'), ctx.grid.cells[0 * 8].rune);
+    try std.testing.expectEqual(@as(u32, '2'), ctx.grid.cells[1 * 8].rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[2 * 8].rune);
+    try std.testing.expectEqual(@as(u32, '3'), ctx.grid.cells[3 * 8].rune);
+    // SU never moves the cursor (was row 3, col 1).
+    try std.testing.expectEqual(@as(u16, 3), ctx.cursor_row);
+    try std.testing.expectEqual(@as(u16, 1), ctx.cursor_col);
+    // Sub-region scrolls never touch scrollback.
+    try std.testing.expectEqual(@as(usize, 0), ctx.grid.sb_len);
+    ctx.parse("\x1b[T"); // SD: row 1 blanks, row 2 takes old row 1
+    try std.testing.expectEqual(@as(u32, '0'), ctx.grid.cells[0 * 8].rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[1 * 8].rune);
+    try std.testing.expectEqual(@as(u32, '2'), ctx.grid.cells[2 * 8].rune);
+    try std.testing.expectEqual(@as(u32, '3'), ctx.grid.cells[3 * 8].rune);
+}
+
+test "su on full region feeds scrollback" {
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("0\r\n1\r\n2\r\n3");
+    ctx.parse("\x1b[S");
+    try std.testing.expectEqual(@as(usize, 1), ctx.grid.sb_len);
+    try std.testing.expectEqual(@as(u32, '1'), ctx.grid.cells[0 * 8].rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[3 * 8].rune);
+    try std.testing.expectEqual(@as(u16, 3), ctx.cursor_row);
+}
+
+test "il inserts blank lines in region" {
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("0\r\n1\r\n2\r\n3");
+    ctx.parse("\x1b[2;1H"); // cursor to row 1
+    ctx.parse("\x1b[2L"); // insert 2: old row 1 lands on row 3
+    try std.testing.expectEqual(@as(u32, '0'), ctx.grid.cells[0 * 8].rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[1 * 8].rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[2 * 8].rune);
+    try std.testing.expectEqual(@as(u32, '1'), ctx.grid.cells[3 * 8].rune);
+    try std.testing.expectEqual(@as(u16, 1), ctx.cursor_row);
+    ctx.parse("\x1b[9L"); // over-count clamps: everything below blanks
+    try std.testing.expectEqual(@as(u32, '0'), ctx.grid.cells[0 * 8].rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[1 * 8].rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[3 * 8].rune);
+}
+
+test "dl deletes lines in region" {
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("0\r\n1\r\n2\r\n3");
+    ctx.parse("\x1b[2;1H"); // cursor to row 1
+    ctx.parse("\x1b[2M"); // delete 2: row 1 takes old row 3
+    try std.testing.expectEqual(@as(u32, '0'), ctx.grid.cells[0 * 8].rune);
+    try std.testing.expectEqual(@as(u32, '3'), ctx.grid.cells[1 * 8].rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[2 * 8].rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[3 * 8].rune);
+    try std.testing.expectEqual(@as(u16, 1), ctx.cursor_row);
+}
+
+test "el fills pen background (bce)" {
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("\x1b[44mXY"); // blue-bg pen, two cells on row 0
+    const want_bg = ctx.grid.cells[0].bg;
+    try std.testing.expect(!cell_mod.isDefaultColor(want_bg));
+    ctx.parse("\x1b[1;1H"); // home
+    ctx.parse("\x1b[K"); // EL0: clear to end of row
+    // Cleared cells are blank but keep the pen bg, not defaults.
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[0].rune);
+    try std.testing.expectEqual(want_bg, ctx.grid.cells[0].bg);
+    try std.testing.expectEqual(want_bg, ctx.grid.cells[7].bg);
+    // Untouched rows stay default.
+    try std.testing.expect(cell_mod.isDefaultColor(ctx.grid.cells[8].bg));
+}
+
+test "ed2 fills pen background" {
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("\x1b[41mA\x1b[2;1H"); // red-bg pen, A on row 0, cursor row 1
+    const want_bg = ctx.grid.cells[0].bg;
+    try std.testing.expect(!cell_mod.isDefaultColor(want_bg));
+    ctx.parse("\x1b[2J");
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[0].rune);
+    try std.testing.expectEqual(want_bg, ctx.grid.cells[0].bg);
+    try std.testing.expectEqual(want_bg, ctx.grid.cells[15].bg);
+    try std.testing.expectEqual(want_bg, ctx.grid.cells[31].bg);
+}
+
+test "il blank lines carry pen background" {
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("\x1b[42m0\r\n1"); // green-bg pen, rows 0-1
+    ctx.parse("\x1b[2;1H"); // cursor to row 1
+    ctx.parse("\x1b[L"); // insert 1: row 1 blanks with green bg
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[1 * 8].rune);
+    try std.testing.expectEqual(ctx.grid.cells[0].bg, ctx.grid.cells[1 * 8].bg);
+}
+
+test "ech/dch erase with pen background" {
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("abcdef"); // row 0, default pen
+    ctx.parse("\x1b[1;3H"); // col 2
+    ctx.parse("\x1b[41m"); // red-bg pen, no text yet
+    ctx.parse("\x1b[2X"); // erase cols 2-3 with red bg
+    const want_bg = ctx.grid.cells[2].bg;
+    try std.testing.expect(!cell_mod.isDefaultColor(want_bg));
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[2].rune);
+    try std.testing.expectEqual(@as(u32, 'e'), ctx.grid.cells[4].rune);
+    try std.testing.expect(cell_mod.isDefaultColor(ctx.grid.cells[4].bg));
+    ctx.parse("\x1b[1;1H"); // col 0
+    ctx.parse("\x1b[2P"); // delete a,b: row shifts left, red blanks fill in
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[0].rune);
+    try std.testing.expectEqual(want_bg, ctx.grid.cells[0].bg);
+    try std.testing.expectEqual(@as(u32, 'e'), ctx.grid.cells[2].rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[4].rune);
+    try std.testing.expect(cell_mod.isDefaultColor(ctx.grid.cells[4].bg));
+    try std.testing.expectEqual(want_bg, ctx.grid.cells[6].bg);
 }
 
 test "tick toggles blink after rate" {
