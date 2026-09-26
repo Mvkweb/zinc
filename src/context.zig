@@ -1243,6 +1243,13 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
         }
 
+        /// Stored rune to codepoint (saturates invalid, sfte parity).
+        fn cellCp(rune: anytype) u21 {
+            const v: u32 = rune;
+            if (v > 0x10FFFF or (v >= 0xD800 and v <= 0xDFFF)) return utf8_mod.REPLACEMENT;
+            return @intCast(v);
+        }
+
         fn putCodepoint(self: *Self, cp: u21) void {
             if (self.pending_wrap or self.cursor_col >= self.grid.cols) {
                 // Deferred soft-wrap: the previous print filled the last
@@ -1273,6 +1280,42 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 }
                 mark_cell.dirty = true;
                 return;
+            }
+            // VS16 / ZWJ after emoji: zero-width variant/joiner — attach
+            // as a combining mark on the emoji lead instead of advancing.
+            // (Full grapheme clustering is out of scope; ZWJ sequences
+            // take multiple cells, foot parity.)
+            if ((cp == 0xFE0F or cp == 0x200D) and self.cursor_col > 0) {
+                const prev = self.grid.at(self.cursor_col - 1, self.cursor_row);
+                const lead = if (self.cursor_col > 1) self.grid.at(self.cursor_col - 2, self.cursor_row) else prev;
+                const base = if (utf8_mod.isEmoji(cellCp(prev.rune))) prev else if (utf8_mod.isEmoji(cellCp(lead.rune))) lead else null;
+                if (base) |b| {
+                    if (b.combining_count < cfg.font_max_combining) {
+                        b.combining[b.combining_count] = cp;
+                        b.combining_count += 1;
+                    }
+                    b.dirty = true;
+                    return;
+                }
+            }
+            // Overwriting a follower kills its wide lead (else the new
+            // char hides under the prev-wide render skip). Resting right
+            // after a wide char sees a blank follower, never a wide lead,
+            // so normal typing is unaffected.
+            if (self.cursor_col > 0) {
+                const prev = self.grid.at(self.cursor_col - 1, self.cursor_row);
+                if (utf8_mod.isWide(cellCp(prev.rune))) prev.* = self.penBlank();
+            }
+            // Wide chars (CJK, emoji) need two cells; wrap first when the
+            // pair won't fit (foot parity). Degenerate 1-col grids fall
+            // back to narrow.
+            const wide = utf8_mod.isWide(cp) and self.grid.cols >= 2;
+            if (wide and self.cursor_col + 1 >= self.grid.cols) {
+                self.pending_wrap = false;
+                const last = self.grid.at(self.grid.cols - 1, self.cursor_row);
+                last.wrapped = true;
+                self.cursor_col = 0;
+                self.linefeed();
             }
             const cell = self.grid.at(self.cursor_col, self.cursor_row);
             cell.setRune(cp);
@@ -1309,7 +1352,21 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 cell.link_idx = 0;
             }
             cell.dirty = true;
-            if (self.cursor_col + 1 < self.grid.cols) {
+            if (wide) {
+                // Blank follower with pen bg; render/selection/reflow
+                // skip it via the prev-wide rule.
+                if (self.cursor_col + 1 < self.grid.cols) {
+                    const fol = self.grid.at(self.cursor_col + 1, self.cursor_row);
+                    fol.* = self.penBlank();
+                    fol.dirty = true;
+                }
+                if (self.cursor_col + 2 < self.grid.cols) {
+                    self.cursor_col += 2;
+                } else {
+                    // Sit on the last column with the wrap pending.
+                    self.pending_wrap = true;
+                }
+            } else if (self.cursor_col + 1 < self.grid.cols) {
                 self.cursor_col += 1;
             } else {
                 // Sit on the last column with the wrap pending.
@@ -2388,4 +2445,58 @@ test "pending wrap cancelled by cursor motion" {
     ctx.onWrite(Sink.cb, &sink);
     ctx.answerQueries("\x1b[6n");
     try std.testing.expectEqualStrings("\x1b[1;4R", sink.buf[0..sink.len]);
+}
+
+test "wide chars take follower cells" {
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("a\xF0\x9F\x98\xB1b"); // a 😱 b
+    // Lead + blank follower; the char after still shows (cursor rode +2).
+    try std.testing.expectEqual(@as(u32, 'a'), ctx.grid.cells[0].rune);
+    try std.testing.expectEqual(@as(u32, 0x1F631), ctx.grid.cells[1].rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[2].rune);
+    try std.testing.expectEqual(@as(u32, 'b'), ctx.grid.cells[3].rune);
+    try std.testing.expectEqual(@as(u16, 4), ctx.cursor_col);
+    // CJK takes followers too.
+    ctx.parse("\r\n");
+    ctx.parse("a\xE4\xB8\xADb"); // a 中 b
+    try std.testing.expectEqual(@as(u32, 0x4E2D), ctx.grid.cells[8 + 1].rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[8 + 2].rune);
+    try std.testing.expectEqual(@as(u32, 'b'), ctx.grid.cells[8 + 3].rune);
+}
+
+test "narrow overwrite clears wide lead" {
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("a\xF0\x9F\x98\xB1b");
+    ctx.parse("\x1b[1;3H"); // onto the follower (col 2)
+    ctx.parse("X");
+    // Lead blanked (else X hides under the prev-wide skip), X shows.
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[1].rune);
+    try std.testing.expectEqual(@as(u32, 'X'), ctx.grid.cells[2].rune);
+    try std.testing.expectEqual(@as(u16, 3), ctx.cursor_col);
+}
+
+test "vs16 after emoji is zero-width" {
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("a\xF0\x9F\x98\xB1\xEF\xB8\x8F"); // a 😱 VS16
+    // No advance past the follower; mark attached to the lead.
+    try std.testing.expectEqual(@as(u16, 3), ctx.cursor_col);
+    try std.testing.expectEqual(@as(u8, 1), ctx.grid.cells[1].combining_count);
+    try std.testing.expectEqual(@as(u32, 0xFE0F), ctx.grid.cells[1].combining[0]);
+}
+
+test "wide wraps when pair won't fit" {
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("1234567"); // cols 0-6, cursor on last col
+    ctx.parse("\xF0\x9F\x98\xB1");
+    // Pair doesn't fit: col 7 keeps blank + wrap flag, emoji leads row 1.
+    try std.testing.expectEqual(@as(u32, '7'), ctx.grid.cells[6].rune);
+    try std.testing.expect(ctx.grid.cells[7].wrapped);
+    try std.testing.expectEqual(@as(u32, 0x1F631), ctx.grid.cells[8].rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[9].rune);
+    try std.testing.expectEqual(@as(u16, 2), ctx.cursor_col);
+    try std.testing.expectEqual(@as(u16, 1), ctx.cursor_row);
 }

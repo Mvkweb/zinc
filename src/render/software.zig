@@ -44,6 +44,29 @@ pub fn blendArgb(dst: u32, src_argb: u32, alpha: u8) u32 {
     return (out_a << 24) | ((dr * ia + sr * a) / 255 << 16) | ((dg * ia + sg * a) / 255 << 8) | ((db * ia + sb * a) / 255);
 }
 
+/// Premultiplied src-over: src RGB already scaled by alpha (FreeType
+/// BGRA color bitmaps and pixman a8r8g8b8 share this convention, and
+/// foot composites them the same way). Unlike blendArgb, src channels
+/// must NOT be scaled again, or colors come out too dark.
+pub fn blendPremult(dst: u32, src_premult: u32) u32 {
+    const sa: u32 = (src_premult >> 24) & 0xFF;
+    if (sa == 0) return dst;
+    if (sa == 255) return src_premult;
+    const ia: u32 = 255 - sa;
+    const da: u32 = (dst >> 24) & 0xFF;
+    const out_a: u32 = sa + da * ia / 255;
+    const dr: u32 = (dst >> 16) & 0xFF;
+    const dg: u32 = (dst >> 8) & 0xFF;
+    const db: u32 = dst & 0xFF;
+    const sr: u32 = (src_premult >> 16) & 0xFF;
+    const sg: u32 = (src_premult >> 8) & 0xFF;
+    const sb: u32 = src_premult & 0xFF;
+    const or_: u32 = @min(255, sr + dr * ia / 255);
+    const og: u32 = @min(255, sg + dg * ia / 255);
+    const ob: u32 = @min(255, sb + db * ia / 255);
+    return (out_a << 24) | (or_ << 16) | (og << 8) | ob;
+}
+
 pub fn fillRect(buf: []u32, stride: u32, height: u32, x: u32, y: u32, w: u32, h: u32, color: u32, dmg: ?*Damage) void {
     var row: u32 = 0;
     while (row < h) : (row += 1) {
@@ -139,6 +162,46 @@ pub fn blitGlyph(
     return dmg;
 }
 
+/// Blit a premultiplied BGRA bitmap (color emoji) onto XRGB pixels.
+/// Signed coords like blitGlyph: out-of-bounds pixels are skipped, never
+/// wrapped. Fully transparent source pixels are skipped (no-op blend).
+/// Returns the drawn bounding box (for damage tracking).
+pub fn blitColorGlyph(
+    buf: []u32,
+    stride: u32,
+    height: u32,
+    atlas_px: []const u32,
+    atlas_stride: u32,
+    ax: u16,
+    ay: u16,
+    gw: u16,
+    gh: u16,
+    xoff: i16,
+    yoff: i16,
+    dx: i32,
+    dy_baseline: i32,
+) Damage {
+    var dmg = Damage{};
+    if (gw == 0 or gh == 0) return dmg;
+    var row: u16 = 0;
+    while (row < gh) : (row += 1) {
+        const yy = dy_baseline - yoff + row;
+        if (yy < 0 or yy >= height) continue;
+        var col: u16 = 0;
+        while (col < gw) : (col += 1) {
+            const xx = dx + xoff + col;
+            if (xx < 0 or xx >= stride) continue;
+            const src = atlas_px[(@as(usize, ay) + row) * atlas_stride + ax + col];
+            const a: u8 = @intCast((src >> 24) & 0xFF);
+            if (a == 0) continue;
+            const idx = @as(usize, @intCast(yy)) * stride + @as(usize, @intCast(xx));
+            buf[idx] = blendPremult(buf[idx], src);
+            dmg.add(xx, yy, 1, 1);
+        }
+    }
+    return dmg;
+}
+
 test "blitGlyph paints coverage" {
     // 2x2 atlas, full coverage block at (0,0).
     const atlas_px = [_]u8{ 255, 255, 255, 255 };
@@ -147,6 +210,24 @@ test "blitGlyph paints coverage" {
     try std.testing.expect(!dmg.empty);
     try std.testing.expect(buf[1 * 4 + 1] != 0xFF000000);
     try std.testing.expectEqual(@as(u32, 0xFF000000), buf[3 * 4 + 3]);
+}
+
+test "blitColorGlyph blends premultiplied BGRA, skips transparent + OOB" {
+    // 2x2 atlas: opaque red, transparent, premult half green, opaque blue.
+    const atlas_px = [_]u32{ 0xFFFF0000, 0x00000000, 0x80008000, 0xFF0000FF };
+    var buf: [16]u32 = [_]u32{0xFF000000} ** 16;
+    const dmg = blitColorGlyph(&buf, 4, 4, &atlas_px, 2, 0, 0, 2, 2, 0, 2, 1, 2);
+    try std.testing.expect(!dmg.empty);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), buf[0 * 4 + 1]);
+    try std.testing.expectEqual(@as(u32, 0xFF000000), buf[0 * 4 + 2]); // transparent skipped
+    try std.testing.expectEqual(@as(u32, 0xFF008000), buf[1 * 4 + 1]); // premult: no double-darkening
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), buf[1 * 4 + 2]);
+    try std.testing.expectEqual(@as(u32, 0xFF000000), buf[3 * 4 + 3]);
+    // Negative x clips instead of wrapping (col 0 skipped, col 1 lands).
+    const dmg2 = blitColorGlyph(&buf, 4, 4, &atlas_px, 2, 0, 0, 2, 2, 0, 2, -1, 2);
+    try std.testing.expect(!dmg2.empty);
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), buf[1 * 4 + 0]);
+    try std.testing.expectEqual(@as(u32, 0xFF000000), buf[0 * 4 + 3]);
 }
 
 /// Blit an ARGB image (kitty/sixel pool pixels) at (dx, dy), clipped to the

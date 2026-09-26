@@ -39,7 +39,9 @@ pub fn encode(cp: u21, out: *[4]u8) []u8 {
 }
 
 pub fn isWide(cp: u21) bool {
-    // East Asian Wide/Fullwidth approximation for cell width 2.
+    // East Asian Wide/Fullwidth approximation for cell width 2, plus
+    // emoji blocks (1F000-1FAFF, color or mono). Text-presentation
+    // symbols (2600-27BF, e.g. ★ U+2605) stay 1 cell per Unicode default.
     return (cp >= 0x1100 and cp <= 0x115F) or
         (cp >= 0x2E80 and cp <= 0x303E) or
         (cp >= 0x3041 and cp <= 0x33FF) or
@@ -50,7 +52,14 @@ pub fn isWide(cp: u21) bool {
         (cp >= 0xFE30 and cp <= 0xFE4F) or
         (cp >= 0xFF00 and cp <= 0xFF60) or
         (cp >= 0xFFE0 and cp <= 0xFFE6) or
+        (cp >= 0x1F000 and cp <= 0x1FAFF) or
         (cp >= 0x20000 and cp <= 0x3FFFD);
+}
+
+/// Emoji-range test (color-emoji bake gate + wide-cell rule share it).
+/// Matches isWide's emoji arm: 1F000-1FAFF, 2 cells, color when available.
+pub fn isEmoji(cp: u21) bool {
+    return cp >= 0x1F000 and cp <= 0x1FAFF;
 }
 
 pub fn isCombining(cp: u21) bool {
@@ -78,7 +87,13 @@ test "utf8 decode ascii + multibyte + invalid" {
 
 test "wide/box/combining classes" {
     try std.testing.expect(isWide(0x4E2D));
+    try std.testing.expect(isWide(0x1F631)); // 😱 color emoji: 2 cells
+    try std.testing.expect(!isWide(0x2605)); // ★ text presentation: 1 cell
     try std.testing.expect(!isWide('x'));
+    try std.testing.expect(isEmoji(0x1F631));
+    try std.testing.expect(isEmoji(0x1F1FA));
+    try std.testing.expect(!isEmoji(0x2605));
+    try std.testing.expect(!isEmoji('x'));
     try std.testing.expect(isBoxDraw(0x2500));
     try std.testing.expect(isCombining(0x0301));
 }

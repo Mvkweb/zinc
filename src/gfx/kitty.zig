@@ -297,6 +297,68 @@ pub fn scaleRgba(src: []const u32, sw: u32, sh: u32, dst: []u32, dw: u32, dh: u3
     }
 }
 
+/// Bicubic (B-spline) scale RGBA src (sw*sh) into dst (dw*dh).
+/// Bake-time quality step for emoji strikes (foot smooths color glyphs
+/// the same way): softer than sharpening kernels, no ringing, zero
+/// render-time cost (the result is cached in the atlas). Operates on
+/// premultiplied channels, matching the rest of the pipeline.
+pub fn scaleRgbaCubic(src: []const u32, sw: u32, sh: u32, dst: []u32, dw: u32, dh: u32) void {
+    if (sw == 0 or sh == 0 or dw == 0 or dh == 0) return;
+    var y: u32 = 0;
+    while (y < dh) : (y += 1) {
+        const sy: f32 = @as(f32, @floatFromInt(y)) * @as(f32, @floatFromInt(sh)) / @as(f32, @floatFromInt(dh));
+        const syi: i32 = @intFromFloat(@floor(sy));
+        const wy = cubicWeights(sy - @floor(sy));
+        var x: u32 = 0;
+        while (x < dw) : (x += 1) {
+            const sx: f32 = @as(f32, @floatFromInt(x)) * @as(f32, @floatFromInt(sw)) / @as(f32, @floatFromInt(dw));
+            const sxi: i32 = @intFromFloat(@floor(sx));
+            const wx = cubicWeights(sx - @floor(sx));
+            var acc = [_]f32{ 0, 0, 0, 0 }; // a, r, g, b
+            var jy: u32 = 0;
+            while (jy < 4) : (jy += 1) {
+                const yy: u32 = @intCast(@max(0, @min(@as(i32, @intCast(sh)) - 1, syi + @as(i32, @intCast(jy)) - 1)));
+                var jx: u32 = 0;
+                while (jx < 4) : (jx += 1) {
+                    const xx: u32 = @intCast(@max(0, @min(@as(i32, @intCast(sw)) - 1, sxi + @as(i32, @intCast(jx)) - 1)));
+                    const p = src[@as(usize, yy) * sw + xx];
+                    const w = wx[jx] * wy[jy];
+                    acc[0] += @as(f32, @floatFromInt((p >> 24) & 0xFF)) * w;
+                    acc[1] += @as(f32, @floatFromInt((p >> 16) & 0xFF)) * w;
+                    acc[2] += @as(f32, @floatFromInt((p >> 8) & 0xFF)) * w;
+                    acc[3] += @as(f32, @floatFromInt(p & 0xFF)) * w;
+                }
+            }
+            dst[@as(usize, y) * dw + x] = packCubic(acc);
+        }
+    }
+}
+
+/// Pack filtered f32 channels (clamped, rounded) into ARGB.
+fn packCubic(acc: [4]f32) u32 {
+    const a: u32 = @intFromFloat(@round(std.math.clamp(acc[0], 0, 255)));
+    const r: u32 = @intFromFloat(@round(std.math.clamp(acc[1], 0, 255)));
+    const g: u32 = @intFromFloat(@round(std.math.clamp(acc[2], 0, 255)));
+    const b: u32 = @intFromFloat(@round(std.math.clamp(acc[3], 0, 255)));
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+/// Uniform cubic B-spline weights for fractional offset t in [0, 1].
+/// All-positive (no ringing) and summing to 1: the soft foot/pixman look
+/// for color glyphs, as opposed to sharpening kernels (Catmull-Rom).
+/// Approximation, not interpolation: integer taps blend neighbors, so
+/// exact-tap tests use tolerances below.
+fn cubicWeights(t: f32) [4]f32 {
+    const t2 = t * t;
+    const t3 = t2 * t;
+    return .{
+        (1 - t) * (1 - t) * (1 - t) / 6.0,
+        (3 * t3 - 6 * t2 + 4) / 6.0,
+        (-3 * t3 + 3 * t2 + 3 * t + 1) / 6.0,
+        t3 / 6.0,
+    };
+}
+
 fn lerpChannel(a: u32, b: u32, c: u32, d: u32, fx: f32, fy: f32) u32 {
     const fa = @as(f32, @floatFromInt(a));
     const fb = @as(f32, @floatFromInt(b));
@@ -389,4 +451,129 @@ test "kitty decode-all bounded" {
     try std.testing.expectEqual(@as(usize, 8), raw.len);
     try std.testing.expectEqual(@as(u8, 0xFF), raw[0]);
     try std.testing.expectError(error.TooLarge, decodeAllBounded(std.testing.allocator, "/wAA/wD/AP8=", 7));
+}
+
+test "cubic scale preserves constants + subsamples exactly" {
+    // Constant image reproduces (weights sum to 1).
+    var src: [64]u32 = [_]u32{0xFF182838} ** 64;
+    var dst: [16]u32 = [_]u32{0} ** 16;
+    scaleRgbaCubic(&src, 8, 8, &dst, 4, 4);
+    for (dst) |p| {
+        try std.testing.expect(@abs(@as(i32, @intCast((p >> 24) & 0xFF)) - 0xFF) <= 1);
+        try std.testing.expect(@abs(@as(i32, @intCast((p >> 16) & 0xFF)) - 0x18) <= 1);
+        try std.testing.expect(@abs(@as(i32, @intCast((p >> 8) & 0xFF)) - 0x28) <= 1);
+        try std.testing.expect(@abs(@as(i32, @intCast(p & 0xFF)) - 0x38) <= 1);
+    }
+    // 8x8 horizontal ramp hits exact taps at 4x4 (integer sample points).
+    var ramp: [64]u32 = undefined;
+    var i: usize = 0;
+    while (i < 64) : (i += 1) {
+        const v: u32 = @as(u32, @intCast((i % 8) * 32));
+        ramp[i] = 0xFF000000 | (v << 16);
+    }
+    var small: [16]u32 = [_]u32{0} ** 16;
+    scaleRgbaCubic(&ramp, 8, 8, &small, 4, 4);
+    // Interior taps stay exact (B-spline reproduces linears); the edge
+    // softens (approximation, not interpolation — that is the point).
+    try std.testing.expect(@abs(@as(i32, @intCast((small[0] >> 16) & 0xFF)) - 5) <= 2);
+    try std.testing.expectEqual(@as(u32, 0xFF400000), small[1]);
+    try std.testing.expectEqual(@as(u32, 0xFF800000), small[2]);
+    try std.testing.expectEqual(@as(u32, 0xFFC00000), small[3]);
+    // Fractional ratios must also reproduce constants (weights sum to 1
+    // at every t; a broken kernel darkens/ripples here instead).
+    var tiny: [9]u32 = [_]u32{0} ** 9;
+    scaleRgbaCubic(&src, 8, 8, &tiny, 3, 3);
+    for (tiny) |p| {
+        try std.testing.expect(@abs(@as(i32, @intCast((p >> 24) & 0xFF)) - 0xFF) <= 2);
+        try std.testing.expect(@abs(@as(i32, @intCast((p >> 16) & 0xFF)) - 0x18) <= 2);
+        try std.testing.expect(@abs(@as(i32, @intCast((p >> 8) & 0xFF)) - 0x28) <= 2);
+        try std.testing.expect(@abs(@as(i32, @intCast(p & 0xFF)) - 0x38) <= 2);
+    }
+}
+
+/// Mipmap downscale: 2x2 box-average halving steps until near target,
+/// then a cubic finish. A fixed-support filter undersamples past ~2x
+/// (taps span fewer source pixels than each output pixel covers), which
+/// aliases; halving first gives every tap valid coverage. Bake-time only
+/// (emoji strikes); scratch needs room for two working planes of sw*sh.
+pub fn scaleRgbaMipmap(src: []const u32, sw: u32, sh: u32, dst: []u32, dw: u32, dh: u32, scratch: []u32) void {
+    if (sw == 0 or sh == 0 or dw == 0 or dh == 0) return;
+    const plane: usize = @as(usize, sw) * sh;
+    if (src.len < plane or @as(usize, dst.len) < @as(usize, dw) * dh or scratch.len < plane * 2) {
+        scaleRgbaCubic(src, sw, sh, dst, dw, dh);
+        return;
+    }
+    var a = scratch[0..plane];
+    var b = scratch[plane .. plane * 2];
+    @memcpy(a, src[0..plane]);
+    var w = sw;
+    var h = sh;
+    var flip = false;
+    while (w >= dw * 2 and h >= dh * 2 and w > 1 and h > 1) {
+        const nw = w / 2;
+        const nh = h / 2;
+        if (flip) {
+            boxHalve(b[0 .. @as(usize, w) * h], w, h, a[0 .. @as(usize, nw) * nh], nw, nh);
+        } else {
+            boxHalve(a[0 .. @as(usize, w) * h], w, h, b[0 .. @as(usize, nw) * nh], nw, nh);
+        }
+        flip = !flip;
+        w = nw;
+        h = nh;
+    }
+    const cur = if (flip) b[0 .. @as(usize, w) * h] else a[0 .. @as(usize, w) * h];
+    scaleRgbaCubic(cur, w, h, dst, dw, dh);
+}
+
+/// One 2x2 box-average halve step (proper prefilter for downscaling).
+/// Operates directly on premultiplied channels.
+fn boxHalve(src: []const u32, sw: u32, sh: u32, dst: []u32, dw: u32, dh: u32) void {
+    var y: u32 = 0;
+    while (y < dh) : (y += 1) {
+        var x: u32 = 0;
+        while (x < dw) : (x += 1) {
+            const sx0: u32 = @min(x * 2, sw - 1);
+            const sx1: u32 = @min(sx0 + 1, sw - 1);
+            const sy0: u32 = @min(y * 2, sh - 1);
+            const sy1: u32 = @min(sy0 + 1, sh - 1);
+            const p00 = src[@as(usize, sy0) * sw + sx0];
+            const p10 = src[@as(usize, sy0) * sw + sx1];
+            const p01 = src[@as(usize, sy1) * sw + sx0];
+            const p11 = src[@as(usize, sy1) * sw + sx1];
+            dst[@as(usize, y) * dw + x] = avg4(p00, p10, p01, p11);
+        }
+    }
+}
+
+fn avg4(p00: u32, p10: u32, p01: u32, p11: u32) u32 {
+    const a: u32 = ((((p00 >> 24) & 0xFF) + ((p10 >> 24) & 0xFF) + ((p01 >> 24) & 0xFF) + ((p11 >> 24) & 0xFF)) + 2) / 4;
+    const r: u32 = ((((p00 >> 16) & 0xFF) + ((p10 >> 16) & 0xFF) + ((p01 >> 16) & 0xFF) + ((p11 >> 16) & 0xFF)) + 2) / 4;
+    const g: u32 = ((((p00 >> 8) & 0xFF) + ((p10 >> 8) & 0xFF) + ((p01 >> 8) & 0xFF) + ((p11 >> 8) & 0xFF)) + 2) / 4;
+    const b: u32 = ((((p00) & 0xFF) + ((p10) & 0xFF) + ((p01) & 0xFF) + ((p11) & 0xFF)) + 2) / 4;
+    return (a << 24) | (r << 16) | (g << 8) | b;
+}
+
+test "mipmap box-halve averages + constant chain" {
+    // 4x4 checker halves to flat mid-gray, then to 1px.
+    var src: [16]u32 = undefined;
+    var i: usize = 0;
+    while (i < 16) : (i += 1) {
+        const x = i % 4;
+        const y = i / 4;
+        src[i] = if ((x + y) % 2 == 0) 0xFFFFFFFF else 0xFF000000;
+    }
+    var half: [4]u32 = [_]u32{0} ** 4;
+    boxHalve(&src, 4, 4, &half, 2, 2);
+    for (half) |p| try std.testing.expectEqual(@as(u32, 0xFF808080), p);
+    // Constant image survives the full chain exactly.
+    var flat: [64]u32 = [_]u32{0xFF182838} ** 64;
+    var tiny: [4]u32 = [_]u32{0} ** 4;
+    var scratch: [128]u32 = [_]u32{0} ** 128;
+    scaleRgbaMipmap(&flat, 8, 8, &tiny, 2, 2, &scratch);
+    for (tiny) |p| {
+        try std.testing.expect(@abs(@as(i32, @intCast((p >> 24) & 0xFF)) - 0xFF) <= 1);
+        try std.testing.expect(@abs(@as(i32, @intCast((p >> 16) & 0xFF)) - 0x18) <= 1);
+        try std.testing.expect(@abs(@as(i32, @intCast((p >> 8) & 0xFF)) - 0x28) <= 1);
+        try std.testing.expect(@abs(@as(i32, @intCast(p & 0xFF)) - 0x38) <= 1);
+    }
 }

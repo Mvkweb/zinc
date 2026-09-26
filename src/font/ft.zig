@@ -8,6 +8,10 @@
 const std = @import("std");
 const c = @import("c");
 const atlas_mod = @import("atlas.zig");
+// Bilinear downscale for color-emoji strikes (kitty image path, tested).
+const kitty_mod = @import("../gfx/kitty.zig");
+// Shared emoji-range rule (bake gate matches the wide-cell rule).
+const utf8_mod = @import("../util/utf8.zig");
 
 pub const Error = error{
     NoFont,
@@ -121,6 +125,29 @@ const GENERIC_CANDIDATES = [_][]const u8{
 const GENERIC_HOME_SUFFIXES = [_][]const u8{
     "/.local/share/fonts/JetBrainsMono-Regular.ttf",
     "/.fonts/JetBrainsMono-Regular.ttf",
+};
+
+/// Color emoji candidates (CBDT/COLR). NotoColorEmoji.ttf is what Linux
+/// desktops ship; families cover the rest via fontconfig.
+const EMOJI_CANDIDATES = [_][]const u8{
+    "/usr/share/fonts/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/TTF/NotoColorEmoji.ttf",
+    "/usr/share/fonts/truetype/noto/NotoColorEmoji.ttf",
+    "/usr/share/fonts/opentype/noto/NotoColorEmoji.ttf",
+};
+
+const EMOJI_HOME_SUFFIXES = [_][]const u8{
+    "/.local/share/fonts/NotoColorEmoji.ttf",
+    "/.fonts/NotoColorEmoji.ttf",
+};
+
+const EMOJI_FAMILIES = [_][]const u8{
+    // Generic alias first (foot parity: fc-match emoji resolves it).
+    "emoji",
+    "Noto Color Emoji",
+    "Twemoji Mozilla",
+    "Apple Color Emoji",
+    "Segoe UI Emoji",
 };
 
 /// Fontconfig C API wrapper for font discovery, variant resolution, and fallback sorting.
@@ -319,6 +346,11 @@ pub const Face = struct {
     italic_tried: bool = false,
     bold_italic_tried: bool = false,
     fallback_tried: [3]bool = [_]bool{false} ** 3,
+    /// Color emoji face, lazy-loaded on first emoji bake. Null = absent
+    /// or unwanted; emoji_enabled=false (minimal profile) skips loading.
+    emoji_face: ?c.FT_Face = null,
+    emoji_tried: bool = false,
+    emoji_enabled: bool = true,
 
     pub fn ensureBold(self: *Face) ?c.FT_Face {
         if (self.bold != null or self.bold_tried) return self.bold;
@@ -371,6 +403,17 @@ pub const Face = struct {
             else => {},
         }
         return self.fallbacks[slot];
+    }
+
+    /// Lazily load the color emoji face (once; null when absent or
+    /// disabled). Zero cost until the first emoji bake attempt.
+    pub fn ensureEmoji(self: *Face) ?c.FT_Face {
+        if (!self.emoji_enabled) return null;
+        if (self.emoji_face != null or self.emoji_tried) return self.emoji_face;
+        self.emoji_tried = true;
+        const ppath = self.ppath_buf[0..self.ppath_len];
+        self.emoji_face = loadEmoji(self.lib, self.px, ppath);
+        return self.emoji_face;
     }
 
     pub fn init(gpa: std.mem.Allocator, io: std.Io, px: u16, config_path: []const u8, nerd_path: []const u8) Error!Face {
@@ -665,6 +708,110 @@ pub const Face = struct {
     const SCAN_ROOTS = [_][]const u8{ "/.local/share/fonts", "/.fonts" };
     const SCAN_MAX_DEPTH = 4;
 
+    /// Emoji face: ZINC_FONT_EMOJI env > well-known paths > $HOME fonts >
+    /// fontconfig families. Acceptance = resolves U+1F631 (proves a
+    /// non-BMP charmap; a BMP-only table would tofu every emoji).
+    fn loadEmoji(lib: c.FT_Library, px: u16, primary_path: []const u8) ?c.FT_Face {
+        if (std.c.getenv("ZINC_FONT_EMOJI")) |p| {
+            if (loadEmojiFace(lib, px, std.mem.span(p))) |f| return f;
+        }
+        for (EMOJI_CANDIDATES) |cand| {
+            if (std.mem.eql(u8, cand, primary_path)) continue;
+            if (loadEmojiFace(lib, px, cand)) |f| {
+                std.debug.print("[zinc] font emoji: {s}\n", .{cand});
+                return f;
+            }
+        }
+        if (std.c.getenv("HOME")) |h| {
+            const home = std.mem.span(h);
+            for (EMOJI_HOME_SUFFIXES) |suf| {
+                var buf: [512]u8 = undefined;
+                if (home.len + suf.len + 1 > buf.len) continue;
+                @memcpy(buf[0..home.len], home);
+                @memcpy(buf[home.len..][0..suf.len], suf);
+                const full = buf[0 .. home.len + suf.len];
+                if (std.mem.eql(u8, full, primary_path)) continue;
+                if (loadEmojiFace(lib, px, full)) |f| {
+                    std.debug.print("[zinc] font emoji: {s}\n", .{full});
+                    return f;
+                }
+            }
+        }
+        for (EMOJI_FAMILIES) |fam| {
+            var fc_buf: [1024]u8 = undefined;
+            if (fc.match(fam, null, null, false, &fc_buf)) |m| {
+                if (std.mem.eql(u8, m.path, primary_path)) continue;
+                if (loadEmojiFace(lib, px, m.path)) |f| {
+                    std.debug.print("[zinc] font emoji: {s}\n", .{m.path});
+                    return f;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Size an emoji face: fixed-strike (CBDT) faces need FT_Select_Size
+    /// (FT_Set_Pixel_Sizes fails on them); scalable faces (COLR) take
+    /// pixel sizes. Prefers the smallest strike at/above target, else
+    /// the largest available (downscaling stays sharp).
+    fn sizeEmojiFace(face: c.FT_Face, px: u16) bool {
+        if (face.*.num_fixed_sizes == 0) {
+            // No strike table visible: try strike 0 by convention (served
+            // even when the count reads empty), else pixel sizes.
+            if (c.FT_Select_Size(face, 0) == 0) return true;
+            return c.FT_Set_Pixel_Sizes(face, 0, @intCast(px)) == 0;
+        }
+        const want: c_long = px;
+        var best: c_int = -1;
+        var best_ppem: c_long = 0;
+        var i: c_int = 0;
+        while (i < face.*.num_fixed_sizes) : (i += 1) {
+            const ppem: c_long = face.*.available_sizes[@intCast(i)].y_ppem;
+            if (ppem >= want and (best < 0 or ppem < best_ppem)) {
+                best = i;
+                best_ppem = ppem;
+            }
+        }
+        if (best < 0) {
+            i = 0;
+            while (i < face.*.num_fixed_sizes) : (i += 1) {
+                const ppem: c_long = face.*.available_sizes[@intCast(i)].y_ppem;
+                if (best < 0 or ppem > best_ppem) {
+                    best = i;
+                    best_ppem = ppem;
+                }
+            }
+        }
+        if (best < 0) return false;
+        return c.FT_Select_Size(face, best) == 0;
+    }
+
+    /// Raw emoji load: any glyph count, but must resolve non-BMP. Walks
+    /// charmaps for a capable table when the default can't (a BMP-only
+    /// format-4 default would map every emoji to .notdef).
+    fn loadEmojiFace(lib: c.FT_Library, px: u16, path: []const u8) ?c.FT_Face {
+        var path_buf: [512]u8 = undefined;
+        if (path.len + 1 > path_buf.len) return null;
+        @memcpy(path_buf[0..path.len], path);
+        path_buf[path.len] = 0;
+        var face: c.FT_Face = undefined;
+        if (c.FT_New_Face(lib, @ptrCast(&path_buf), 0, &face) != 0) return null;
+        if (!sizeEmojiFace(face, px)) {
+            _ = c.FT_Done_Face(face);
+            return null;
+        }
+        _ = c.FT_Select_Charmap(face, c.FT_ENCODING_UNICODE);
+        if (c.FT_Get_Char_Index(face, 0x1F631) != 0) return face;
+        var i: c_int = 0;
+        while (i < face.*.num_charmaps) : (i += 1) {
+            const cm = face.*.charmaps[@intCast(i)];
+            if (c.FT_Set_Charmap(face, cm) != 0) continue;
+            if (c.FT_Get_Char_Index(face, 0x1F631) != 0) return face;
+        }
+        _ = c.FT_Done_Face(face);
+        return null;
+    }
+
     fn hasFontExt(name: []const u8) bool {
         const exts = [_][]const u8{ ".ttf", ".otf", ".ttc", ".TTF", ".OTF" };
         for (exts) |e| {
@@ -787,6 +934,7 @@ pub const Face = struct {
         for (self.fallbacks) |fb| {
             if (fb) |f| _ = c.FT_Set_Pixel_Sizes(f, 0, @intCast(px));
         }
+        if (self.emoji_face) |f| _ = sizeEmojiFace(f, px);
         try self.updateMetrics();
     }
 
@@ -813,6 +961,7 @@ pub const Face = struct {
         for (self.fallbacks) |fb| {
             if (fb) |f| _ = c.FT_Done_Face(f);
         }
+        if (self.emoji_face) |f| _ = c.FT_Done_Face(f);
         _ = c.FT_Done_Face(self.face);
         _ = c.FT_Done_FreeType(self.lib);
     }
@@ -820,7 +969,20 @@ pub const Face = struct {
     /// Bake one codepoint+style into the atlas. Style face first, then
     /// regular, then fallback faces (char index 0 = missing everywhere).
     /// Returns blank metrics instead of .notdef for missing glyphs.
-    pub fn bake(self: *Face, atlas: *atlas_mod.Atlas, cp: u21, style: Style) Error!atlas_mod.Baked {
+    /// Emoji-range codepoints try the color face first (dedicated store);
+    /// any color failure falls through to the monochrome chain below.
+    pub fn bake(self: *Face, atlas: *atlas_mod.Atlas, color_atlas: ?*atlas_mod.ColorAtlas, cp: u21, style: Style) Error!atlas_mod.Baked {
+        if (self.emoji_enabled and utf8_mod.isEmoji(cp)) {
+            if (self.ensureEmoji()) |ef| {
+                if (c.FT_Get_Char_Index(ef, @intCast(cp)) != 0) {
+                    if (color_atlas) |ca| {
+                        if (self.bakeColor(ca, ef, cp)) |b| return b else |err| {
+                            if (err == error.AtlasFull) return err;
+                        }
+                    }
+                }
+            }
+        }
         var style_face: ?c.FT_Face = null;
         switch (style) {
             .regular => style_face = self.face,
@@ -918,6 +1080,83 @@ pub const Face = struct {
             .yoff = @intCast(@max(-128, @min(127, slot.*.bitmap_top))),
             .advance = @intCast(@max(0, @min(adv, 255))),
             .font_slot = slot_n,
+        };
+    }
+
+    /// Bake one emoji codepoint from the color face into the RGBA store.
+    /// CBDT and COLR both decode to BGRA under FT_LOAD_COLOR; the strike
+    /// is cubically downscaled into the 2-cell box and centered (bake-time
+    /// only, foot parity). AtlasFull propagates (caller wipes both
+    /// atlases); anything else falls back to the monochrome chain
+    /// (blank, as today).
+    fn bakeColor(self: *Face, color_atlas: *atlas_mod.ColorAtlas, face: c.FT_Face, cp: u21) Error!atlas_mod.Baked {
+        // FT_LOAD_COLOR is bit 20 (NOT 0x20, which is FORCE_AUTOHINT and
+        // yields a grayscale conversion instead of BGRA).
+        const FT_LOAD_COLOR: i32 = 0x100000;
+        const idx = c.FT_Get_Char_Index(face, @intCast(cp));
+        if (idx == 0) return error.RenderFailed;
+        if (c.FT_Load_Glyph(face, idx, FT_LOAD_COLOR) != 0) return error.RenderFailed;
+        const slot = face.*.glyph;
+        const bmp = slot.*.bitmap;
+        if (bmp.pixel_mode != 7) return error.RenderFailed; // FT_PIXEL_MODE_BGRA
+        const sw: u32 = bmp.width;
+        const sh: u32 = bmp.rows;
+        // Absurd strikes fail safe (blank, as today).
+        if (sw == 0 or sh == 0 or sw > 512 or sh > 512) return error.RenderFailed;
+        const pitch: isize = bmp.pitch;
+        // Fit-inside scale into the 2-cell box.
+        const box_w: u32 = @as(u32, self.cell_w) * 2;
+        const box_h: u32 = self.cell_h;
+        if (box_w == 0 or box_h == 0 or box_w > 512 or box_h > 512) return error.RenderFailed;
+        const dw: u32 = @max(1, @min(box_w, sw * box_h / sh));
+        const dh: u32 = @max(1, @min(box_h, sh * box_w / sw));
+        // Heap temps sized to the strike (OOM maps to blank, as today).
+        const gpa = self.gpa orelse return error.RenderFailed;
+        const src_tmp = gpa.alloc(u32, @as(usize, sw) * sh) catch return error.RenderFailed;
+        defer gpa.free(src_tmp);
+        const dst_tmp = gpa.alloc(u32, @as(usize, dw) * dh) catch return error.RenderFailed;
+        defer gpa.free(dst_tmp);
+        // Repack rows first: pitch may differ from w*4, and a u32 view
+        // needs tight, aligned rows.
+        var sy: u32 = 0;
+        while (sy < sh) : (sy += 1) {
+            const off: usize = if (pitch >= 0)
+                @as(usize, sy) * @as(usize, @intCast(pitch))
+            else
+                @as(usize, sh - 1 - sy) * @as(usize, @intCast(-pitch));
+            const srow = bmp.buffer[off..][0 .. sw * 4];
+            @memcpy(std.mem.sliceAsBytes(src_tmp[sy * sw ..][0..sw]), srow);
+        }
+        // Mipmap chain needs two working planes of the strike footprint.
+        const scratch = gpa.alloc(u32, @as(usize, sw) * sh * 2) catch return error.RenderFailed;
+        defer gpa.free(scratch);
+        kitty_mod.scaleRgbaMipmap(src_tmp[0 .. sw * sh], sw, sh, dst_tmp[0 .. dw * dh], dw, dh, scratch);
+        const pos = color_atlas.pack(@intCast(dw), @intCast(dh)) orelse return error.AtlasFull;
+        var dy: u32 = 0;
+        while (dy < dh) : (dy += 1) {
+            const doff = (@as(usize, pos.y) + dy) * atlas_mod.ColorAtlas.SIZE + pos.x;
+            @memcpy(color_atlas.pixels[doff..][0..dw], dst_tmp[dy * dw ..][0..dw]);
+        }
+        // Scaled bitmap_left, then centered in the 2-cell box. yoff is
+        // measured from the baseline like coverage glyphs: centering the
+        // bitmap in the cell gives ascent - (cell_h - dh) / 2.
+        const dwi: i32 = @intCast(dw);
+        const dhi: i32 = @intCast(dh);
+        const left: i32 = @divTrunc(@as(i32, slot.*.bitmap_left) * dwi, @as(i32, @intCast(sw)));
+        const xoff: i32 = left + @divTrunc(@as(i32, self.cell_w) * 2 - dwi, 2);
+        const yoff: i32 = self.ascent - @divTrunc(@as(i32, self.cell_h) - dhi, 2);
+        return .{
+            .x = 0,
+            .y = 0,
+            .w = @intCast(dw),
+            .h = @intCast(dh),
+            .xoff = @intCast(@max(-128, @min(127, xoff))),
+            .yoff = @intCast(@max(-128, @min(127, yoff))),
+            .advance = @as(u8, @intCast(@min(@as(u32, self.cell_w) * 2, 255))),
+            .font_slot = 0,
+            .color = true,
+            .cx = pos.x,
+            .cy = pos.y,
         };
     }
 };

@@ -228,6 +228,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         ft_face: ft_mod.Face,
         atlas: atlas_mod.Atlas,
+        /// Twin RGBA store for color emoji (empty unless cfg.emoji).
+        color_atlas: atlas_mod.ColorAtlas = .{},
         glyphs: std.AutoHashMap(u32, atlas_mod.Baked),
         cell_w: i32,
         cell_h: i32,
@@ -442,6 +444,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 ctx.deinit();
                 return error.FontFailed;
             };
+            // Color emoji twin: allocated only when enabled; empty means
+            // the bake color path stays shut (minimal builds pay nothing).
+            var color_atlas = atlas_mod.ColorAtlas{};
+            if (cfg.emoji) {
+                color_atlas = atlas_mod.ColorAtlas.init(gpa) catch atlas_mod.ColorAtlas{};
+            }
+            ft_face.emoji_enabled = cfg.emoji;
 
             self.* = Self{
                 .gpa = gpa,
@@ -449,6 +458,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .ctx = ctx,
                 .ft_face = ft_face,
                 .atlas = atlas,
+                .color_atlas = color_atlas,
                 .glyphs = std.AutoHashMap(u32, atlas_mod.Baked).init(gpa),
                 .cell_w = ft_face.cell_w,
                 .cell_h = ft_face.cell_h,
@@ -766,6 +776,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (self.xkb_ctx) |x| xkb_context_unref(x);
             self.glyphs.deinit();
             self.atlas.deinit(self.gpa);
+            self.color_atlas.deinit(self.gpa);
             self.ft_face.deinit();
             self.runtime_cfg.deinit(self.gpa);
             if (self.display) |d| _ = c.wl_display_disconnect(d);
@@ -887,13 +898,15 @@ pub fn App(comptime cfg: config_mod.Config) type {
         fn glyphFor(self: *Self, cp: u21, style: ft_mod.Style) ?atlas_mod.Baked {
             const key: u32 = @as(u32, cp) * 4 + @intFromEnum(style);
             if (self.glyphs.get(key)) |b| return b;
-            const baked = self.ft_face.bake(&self.atlas, cp, style) catch |err| blk: {
+            const ca: ?*atlas_mod.ColorAtlas = if (cfg.emoji) &self.color_atlas else null;
+            const baked = self.ft_face.bake(&self.atlas, ca, cp, style) catch |err| blk: {
                 if (err != error.AtlasFull) return null;
                 // Atlas full: wipe and rebake (all rows already dirty).
                 self.atlas.clear();
+                self.color_atlas.clear();
                 self.glyphs.clearRetainingCapacity();
                 self.ctx.grid.markAllDirty();
-                break :blk self.ft_face.bake(&self.atlas, cp, style) catch return null;
+                break :blk self.ft_face.bake(&self.atlas, ca, cp, style) catch return null;
             };
             self.glyphs.put(key, baked) catch {};
             return baked;
@@ -1024,6 +1037,49 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 std.fmt.bufPrint(&right, "{d}/{d}  enter:next  esc:done ", .{ self.find_idx + 1, n }) catch right[0..0];
             const rx: i32 = px + @as(i32, visible_cols) * cw - @as(i32, @intCast(rtext.len)) * cw;
             self.drawBarText(rtext, bar_fg, rx, y, cw, ch, W, H, dmg);
+        }
+
+        /// Blit one baked cell glyph: color emoji go through the RGBA
+        /// store with their own colors, everything else through coverage
+        /// tinted by fg. A set color flag implies a live color atlas entry
+        /// (the bake path only returns color with a store to put it in).
+        fn blitCellGlyph(self: *Self, g: atlas_mod.Baked, x: u32, y: u32, fg: u32, W: u32, H: u32, dmg: *software.Damage) void {
+            if (g.color) {
+                const gdmg = software.blitColorGlyph(
+                    self.pool_pixels,
+                    W,
+                    H,
+                    self.color_atlas.pixels,
+                    atlas_mod.ColorAtlas.SIZE,
+                    g.cx,
+                    g.cy,
+                    g.w,
+                    g.h,
+                    g.xoff,
+                    g.yoff,
+                    @intCast(x),
+                    @as(i32, @intCast(y)) + self.ascent,
+                );
+                dmgMerge(dmg, gdmg);
+                return;
+            }
+            const gdmg = software.blitGlyph(
+                self.pool_pixels,
+                W,
+                H,
+                self.atlas.pixels,
+                self.atlas.size,
+                g.x,
+                g.y,
+                g.w,
+                g.h,
+                g.xoff,
+                g.yoff,
+                @intCast(x),
+                @as(i32, @intCast(y)) + self.ascent,
+                fg,
+            );
+            dmgMerge(dmg, gdmg);
         }
 
         fn drawBarText(self: *Self, text: []const u8, fg: u32, x0: i32, y: u32, cw: i32, ch: i32, W: u32, H: u32, dmg: *software.Damage) void {
@@ -1283,23 +1339,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                                 else
                                     .regular;
                                 if (self.glyphFor(cp, style)) |g| {
-                                    const gdmg = software.blitGlyph(
-                                        self.pool_pixels,
-                                        W,
-                                        H,
-                                        self.atlas.pixels,
-                                        self.atlas.size,
-                                        g.x,
-                                        g.y,
-                                        g.w,
-                                        g.h,
-                                        g.xoff,
-                                        g.yoff,
-                                        @intCast(x),
-                                        @as(i32, @intCast(y)) + self.ascent,
-                                        fg,
-                                    );
-                                    dmgMerge(&dmg, gdmg);
+                                    self.blitCellGlyph(g, x, y, fg, W, H, &dmg);
                                 } else if (box_drawing.isBoxDrawingOrBlock(cp)) {
                                     _ = box_drawing.draw(self.pool_pixels, W, H, x, y, cw, ch, cp, fg, &dmg);
                                 }
@@ -1307,23 +1347,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                                 while (ci < cell.combining_count) : (ci += 1) {
                                     const ccp = cellCp(cell.combining[ci]);
                                     if (self.glyphFor(ccp, style)) |g| {
-                                        const gdmg = software.blitGlyph(
-                                            self.pool_pixels,
-                                            W,
-                                            H,
-                                            self.atlas.pixels,
-                                            self.atlas.size,
-                                            g.x,
-                                            g.y,
-                                            g.w,
-                                            g.h,
-                                            g.xoff,
-                                            g.yoff,
-                                            @intCast(x),
-                                            @as(i32, @intCast(y)) + self.ascent,
-                                            fg,
-                                        );
-                                        dmgMerge(&dmg, gdmg);
+                                        self.blitCellGlyph(g, x, y, fg, W, H, &dmg);
                                     }
                                 }
                             }
@@ -1578,23 +1602,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     else
                         .regular;
                     if (self.glyphFor(cp, style)) |g| {
-                        const gdmg = software.blitGlyph(
-                            self.pool_pixels,
-                            W,
-                            H,
-                            self.atlas.pixels,
-                            self.atlas.size,
-                            g.x,
-                            g.y,
-                            g.w,
-                            g.h,
-                            g.xoff,
-                            g.yoff,
-                            @intCast(ccx),
-                            @as(i32, @intCast(ccy)) + self.ascent,
-                            fg_color,
-                        );
-                        dmgMerge(&dmg, gdmg);
+                        self.blitCellGlyph(g, ccx, ccy, fg_color, W, H, &dmg);
                     }
                 }
             }
@@ -1708,6 +1716,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.ascent = self.ft_face.ascent;
 
             self.atlas.clear();
+            self.color_atlas.clear();
             self.glyphs.clearRetainingCapacity();
 
             const pad_x = self.currentPadX();

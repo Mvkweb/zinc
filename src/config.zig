@@ -98,6 +98,8 @@ pub const Config = struct {
     // Images: full support costs pool + decode buffers (see gfx/image_pool.zig).
     sixel: bool = true,
     kitty_gfx: bool = true,
+    /// Color emoji (CBDT/COLR via dedicated face + RGBA atlas twin).
+    emoji: bool = true,
     kitty_b64_init_cap: u32 = 128,
     kitty_b64_max_cap: u32 = 16 * 1024 * 1024,
     sixel_init_size: u16 = 64,
@@ -177,6 +179,7 @@ pub const minimal: Config = .{
     .scrollback_cap = 0,
     .sixel = false,
     .kitty_gfx = false,
+    .emoji = false,
     .ligatures = false,
     .custom_boxes = false,
     .font_bleed = false,
