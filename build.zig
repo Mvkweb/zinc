@@ -20,8 +20,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    // freetype2 headers live outside the default include path.
-    translate_c.addIncludePath(.{ .cwd_relative = "/usr/include/freetype2" });
+    addFreetypeIncludes(b, translate_c);
 
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -88,4 +87,67 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step("check", "Compile check only (no install, no run)");
     check_step.dependOn(&check_exe.step);
     check_step.dependOn(&check_tests.step);
+}
+
+fn addFreetypeIncludes(b: *std.Build, translate_c: *std.Build.Step.TranslateC) void {
+    // 1. Explicit build option: zig build -Dfreetype-include=/path/to/freetype2
+    if (b.option([]const u8, "freetype-include", "Override freetype2 include directory")) |dir| {
+        translate_c.addIncludePath(.{ .cwd_relative = dir });
+        return;
+    }
+
+    // 2. Query pkg-config dynamically (works across NixOS, Arch, Debian, Fedora, etc.)
+    var exit_code: u8 = 0;
+    if (b.runAllowFail(&.{ "pkg-config", "--cflags-only-I", "freetype2" }, &exit_code, .inherit)) |out| {
+        if (exit_code == 0) {
+            var it = std.mem.tokenizeAny(u8, out, " \t\r\n");
+            while (it.next()) |token| {
+                if (std.mem.startsWith(u8, token, "-I")) {
+                    const inc = token[2..];
+                    if (inc.len > 0) {
+                        translate_c.addIncludePath(.{ .cwd_relative = inc });
+                    }
+                }
+            }
+        }
+    } else |_| {}
+
+    // 3. Explicit environment variable: FREETYPE_INCLUDE
+    if (b.graph.environ_map.get("FREETYPE_INCLUDE")) |dir| {
+        translate_c.addIncludePath(.{ .cwd_relative = dir });
+    }
+
+    // 4. NixOS / nix-shell: parse NIX_CFLAGS_COMPILE for freetype2 paths
+    if (b.graph.environ_map.get("NIX_CFLAGS_COMPILE")) |cflags| {
+        var it = std.mem.tokenizeScalar(u8, cflags, ' ');
+        while (it.next()) |token| {
+            if (std.mem.startsWith(u8, token, "-isystem") or std.mem.startsWith(u8, token, "-I")) {
+                const path = if (token.len > 8 and std.mem.startsWith(u8, token, "-isystem"))
+                    token[8..]
+                else if (token.len > 2 and std.mem.startsWith(u8, token, "-I"))
+                    token[2..]
+                else
+                    it.next() orelse continue;
+
+                if (std.mem.indexOf(u8, path, "freetype") != null) {
+                    translate_c.addIncludePath(.{ .cwd_relative = path });
+                }
+            }
+        }
+    }
+
+    // 5. NixOS / GCC CPATH: parse colon-separated paths
+    if (b.graph.environ_map.get("CPATH")) |cpath| {
+        var it = std.mem.tokenizeScalar(u8, cpath, ':');
+        while (it.next()) |dir| {
+            if (std.mem.indexOf(u8, dir, "freetype") != null) {
+                translate_c.addIncludePath(.{ .cwd_relative = dir });
+            }
+        }
+    }
+
+    // 6. Standard FHS and system locations (fallback for classic Linux / macOS)
+    translate_c.addIncludePath(.{ .cwd_relative = "/usr/include/freetype2" });
+    translate_c.addIncludePath(.{ .cwd_relative = "/usr/local/include/freetype2" });
+    translate_c.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include/freetype2" });
 }
