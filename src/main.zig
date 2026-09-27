@@ -234,10 +234,11 @@ fn smokeMain(gpa: std.mem.Allocator, io: std.Io) !void {
     if (!(found_ok and found_bold and child_ok)) std.process.exit(1);
 }
 
-/// Feed one open file through parse + answerQueries in 4KB chunks (like
-/// the PTY loop). Returns bytes consumed.
+/// Feed one open file through parse + answerQueries (like the PTY loop).
+/// Returns bytes consumed.
 fn feedFile(ctx: *context_mod.Context(config_mod.active), fd: i32) usize {
-    var read_buf: [4096]u8 = undefined;
+    // 64KB chunks mirror the live PTY loop (answerQueries window sizing).
+    var read_buf: [65536]u8 = undefined;
     var total: usize = 0;
     while (true) {
         const rrc = linux.read(fd, &read_buf, read_buf.len);

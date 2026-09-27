@@ -22,6 +22,9 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
         top: u16 = 0,
         /// Same offset for alt_cells (swapped alongside on alt switch).
         alt_top: u16 = 0,
+        /// Whole screen moved (scrollUp rotates every row's position):
+        /// the next frame repaints everything, O(1) instead of a flag loop.
+        dirty_all: bool = true,
         sb_head: usize = 0, // ring start (oldest)
         sb_len: usize = 0, // live scrollback rows
         view_offset: usize = 0, // 0 = following; >0 = scrolled up rows
@@ -82,6 +85,21 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
 
         pub fn markAllDirty(self: *Self) void {
             for (self.cells) |*c| c.dirty = true;
+            self.dirty_all = true;
+        }
+
+        /// Clear every live dirty flag (end of a full repaint).
+        pub fn markAllClean(self: *Self) void {
+            for (self.cells) |*c| c.dirty = false;
+            self.dirty_all = false;
+        }
+
+        /// Flag one logical row range dirty (region scrolls, IL/DL).
+        pub fn markRowsDirty(self: *Self, top: u16, bot: u16) void {
+            var r: u16 = top;
+            while (r <= bot and r < self.rows) : (r += 1) {
+                for (self.rowSlice(r)) |*c| c.dirty = true;
+            }
         }
 
         /// Push an arbitrary row into the scrollback ring.
@@ -116,6 +134,8 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
         /// Scroll the grid up one row. When push is false (alt-screen),
         /// the top row is discarded instead of entering scrollback.
         /// O(cols): rotates the live offset instead of memmoving rows.
+        /// Every row changes screen position, so the next frame repaints
+        /// all (dirty_all flag, O(1) — no per-cell loop here).
         pub fn scrollUp(self: *Self, push: bool) void {
             if (push) {
                 self.pushScrollbackRow(self.rowSlice(0));
@@ -124,7 +144,7 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
             if (self.top >= self.rows) self.top = 0;
             const b = self.rowSlice(self.rows - 1);
             @memset(b, .{});
-            for (b) |*c| c.dirty = true;
+            self.dirty_all = true;
         }
 
         pub fn clearScrollback(self: *Self) void {
@@ -281,4 +301,24 @@ test "viewport shows scrollback when scrolled" {
     try std.testing.expectEqual(@as(u32, 'B'), live.rune);
     g.scrollView(-5);
     try std.testing.expectEqual(@as(usize, 0), g.view_offset);
+}
+
+test "dirty flags: scroll sets all, ranges mark, clean clears" {
+    const G = Grid(.{ .scrollback_cap = 4, .alt_screen = false });
+    var g = try G.init(std.testing.allocator, 4, 3);
+    defer g.deinit();
+    g.markAllClean();
+    try std.testing.expect(!g.dirty_all);
+    try std.testing.expect(!g.at(0, 0).dirty);
+    g.scrollUp(true); // every row moved: whole screen repaints
+    try std.testing.expect(g.dirty_all);
+    g.markAllClean();
+    try std.testing.expect(!g.dirty_all);
+    g.markRowsDirty(1, 1);
+    try std.testing.expect(!g.at(0, 0).dirty);
+    try std.testing.expect(g.at(0, 1).dirty);
+    try std.testing.expect(!g.at(0, 2).dirty);
+    g.markAllDirty();
+    try std.testing.expect(g.dirty_all);
+    try std.testing.expect(g.at(3, 2).dirty);
 }

@@ -782,12 +782,23 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     i = idx;
                     continue;
                 }
-                // ASCII fast path (ground state, printable): bypasses
-                // parser.feed + apply dispatch for the bulk of output.
-                if (self.parser.state == .ground and b >= 0x20 and b <= 0x7E) {
-                    self.putAscii(b);
-                    i += 1;
-                    continue;
+                // ASCII fast path (ground state, printable + newline + CR):
+                // bypasses parser.feed + apply dispatch for the bulk of output.
+                if (self.parser.state == .ground) {
+                    if (b >= 0x20 and b <= 0x7E) {
+                        self.putAscii(b);
+                        i += 1;
+                        continue;
+                    } else if (b == '\n') {
+                        self.linefeed();
+                        i += 1;
+                        continue;
+                    } else if (b == '\r') {
+                        self.cursor_col = 0;
+                        self.pending_wrap = false;
+                        i += 1;
+                        continue;
+                    }
                 }
                 const act = self.parser.feed(b);
                 i += 1;
@@ -1208,7 +1219,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             // overlap tail or the chunk there is nothing to answer; just
             // advance the overlap tail exactly like the slow path below
             // (last 16 bytes) and return. One memchr replaces ~10 scans
-            // plus a 4KB window copy on data chunks.
+            // plus a window copy on data chunks.
             if (std.mem.indexOfScalar(u8, chunk, 0x1B) == null) {
                 var tail_esc = false;
                 for (self.q_overlap[0..self.q_overlap_len]) |b| {
@@ -1241,7 +1252,10 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     return;
                 }
             }
-            var window: [4112]u8 = undefined;
+            // Window fits a 16-byte overlap tail plus one full 64KB PTY
+            // read; larger chunks would smash the stack (callers cap reads).
+            std.debug.assert(chunk.len <= 65536);
+            var window: [16 + 65536]u8 = undefined;
             @memcpy(window[0..self.q_overlap_len], self.q_overlap[0..self.q_overlap_len]);
             @memcpy(window[self.q_overlap_len..][0..chunk.len], chunk);
             const win = window[0 .. self.q_overlap_len + chunk.len];
@@ -1353,8 +1367,9 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 return;
             }
             const col = self.cursor_col;
-            // Overwriting a wide lead kills it; ASCII prevs are never wide.
-            if (col > 0) {
+            if (col == 0) {
+                self.grid.at(self.grid.cols - 1, self.cursor_row).wrapped = false;
+            } else {
                 const prev = self.grid.at(col - 1, self.cursor_row);
                 if (cellCp(prev.rune) >= 0x1100 and utf8_mod.isWide(cellCp(prev.rune))) prev.* = self.penBlank();
             }
@@ -1366,7 +1381,6 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 cell.link_idx = self.cur_link;
             }
             if (col + 1 < self.grid.cols) {
-                self.grid.at(self.grid.cols - 1, self.cursor_row).wrapped = false;
                 self.cursor_col = col + 1;
             } else {
                 self.pending_wrap = true;
@@ -1608,6 +1622,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 @memcpy(self.grid.rowSlice(r), self.grid.rowSlice(r + 1));
             }
             @memset(self.grid.rowSlice(self.scroll_bot), self.penBlank());
+            self.grid.markRowsDirty(self.scroll_top, self.scroll_bot);
             self.shiftPlacements(self.scroll_top, self.scroll_bot, true);
         }
 
@@ -1647,6 +1662,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 @memcpy(self.grid.rowSlice(r), self.grid.rowSlice(r - 1));
             }
             @memset(self.grid.rowSlice(self.scroll_top), blank);
+            self.grid.markRowsDirty(self.scroll_top, self.scroll_bot);
             self.shiftPlacements(self.scroll_top, self.scroll_bot, false);
         }
 
@@ -1674,6 +1690,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
             var k: u16 = 0;
             while (k < nu16) : (k += 1) @memset(self.grid.rowSlice(top + k), self.penBlank());
+            self.grid.markRowsDirty(top, bot);
             var s: usize = 0;
             while (s < n) : (s += 1) self.shiftPlacements(top, bot, false);
         }
@@ -1700,6 +1717,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
             var k: u16 = 0;
             while (k < nu16) : (k += 1) @memset(self.grid.rowSlice(bot - nu16 + 1 + k), self.penBlank());
+            self.grid.markRowsDirty(top, bot);
             var s: usize = 0;
             while (s < n) : (s += 1) self.shiftPlacements(top, bot, true);
         }
@@ -2738,6 +2756,13 @@ test "answerQueries skips ESC-less chunks identically" {
     ctx.answerQueries("\x1b[");
     ctx.answerQueries("6n");
     try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "R") != null);
+    // 60KB ESC-less chunk: fast path must not smash the overlap window.
+    const big = try std.testing.allocator.alloc(u8, 60000);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    ctx.answerQueries(big);
+    try std.testing.expectEqual(@as(usize, 16), ctx.q_overlap_len);
+    try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxx", ctx.q_overlap[0..16]);
 }
 
 test "ascii fast path keeps style across sgr runs" {

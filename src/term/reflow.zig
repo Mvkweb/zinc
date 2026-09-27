@@ -214,12 +214,15 @@ pub fn reflowGrid(
                 // rows and strand orphan lines (diagonal staircase cascade).
                 // Box rows (leading U+2502) are exempt: fastfetch/neofetch
                 // value columns look identical to decorations but repaint
-                // never — trimming them deletes real content.
+                // never — trimming them deletes real content. The trim only
+                // ever runs when narrowing: widening cannot strand orphans,
+                // and unbordered content (fastfetch logos) must survive a
+                // fresh-window widen untouched.
                 const r0: u32 = if (ir.cells.len > 0) ir.cells[0].rune else ' ';
                 const cursor_input_row = sb_count + @as(usize, cursor_row.*);
                 const ir_idx = line_start + line_row_idx;
                 const is_prompt_zone = (ir_idx + 2 >= cursor_input_row and ir_idx <= cursor_input_row);
-                if (!ir.wrapped and is_prompt_zone and last_non_blank > 0 and r0 != 0x2502) {
+                if (!ir.wrapped and is_prompt_zone and last_non_blank > 0 and r0 != 0x2502 and new_cols < old_cols) {
                     const min_col_for_gap = if (ir.is_cursor) @as(usize, cursor_col.*) else 0;
                     if (last_non_blank > min_col_for_gap) {
                         var scan = last_non_blank;
@@ -866,4 +869,23 @@ test "extreme narrow 3-column squeeze restores box byte-identical at top" {
     // Assert prompt is at row 4
     try std.testing.expectEqual(@as(u16, 4), cur_row);
     try std.testing.expectEqual(@as(u32, '>'), g.at(0, 4).rune);
+}
+
+test "widen keeps gapped content rows intact" {
+    // fastfetch-logo shape: leading text, wide blank gap, trailing text,
+    // cursor two rows below (prompt zone). The prompt-zone trim is
+    // shrink-only: a fresh-window widen must not eat the trailing segment.
+    const grid_mod = @import("grid.zig");
+    const cfg = config_mod.Config{ .scrollback_cap = 8, .alt_screen = false };
+    const G = grid_mod.Grid(cfg);
+    var g = try G.init(std.testing.allocator, 80, 6);
+    defer g.deinit();
+    const line = "_____           __";
+    for (line, 0..) |ch, i| g.at(@intCast(i), 0).setRune(ch);
+    var cur_col: u16 = 0;
+    var cur_row: u16 = 2;
+    try reflowGrid(cfg, std.testing.allocator, &g, 170, 6, &cur_col, &cur_row, cfg.bg);
+    try std.testing.expectEqual(@as(u32, '_'), g.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, '_'), g.at(16, 0).rune);
+    try std.testing.expectEqual(@as(u32, '_'), g.at(17, 0).rune);
 }

@@ -27,6 +27,12 @@ pub const Damage = struct {
     }
 };
 
+/// Integer divide by 255, exact for v in [0, 65025] (covers every
+/// a*b + c*d blend term). Shifts instead of a hardware division.
+fn div255(v: u32) u32 {
+    return (v + 1 + (v >> 8)) >> 8;
+}
+
 /// Premultiplied src-over: the shm buffer is ARGB8888 in the pixman/foot
 /// convention (RGB already scaled by alpha), so blends stay in that space.
 /// src_argb is a straight opaque fg; alpha is the glyph coverage.
@@ -34,14 +40,14 @@ pub fn blendArgb(dst: u32, src_argb: u32, alpha: u8) u32 {
     const a: u32 = alpha;
     const ia: u32 = 255 - a;
     const da: u32 = (dst >> 24) & 0xFF;
-    const out_a: u32 = a + da * ia / 255;
+    const out_a: u32 = a + div255(da * ia);
     const dr = (dst >> 16) & 0xFF;
     const dg = (dst >> 8) & 0xFF;
     const db = dst & 0xFF;
     const sr = (src_argb >> 16) & 0xFF;
     const sg = (src_argb >> 8) & 0xFF;
     const sb = src_argb & 0xFF;
-    return (out_a << 24) | ((dr * ia + sr * a) / 255 << 16) | ((dg * ia + sg * a) / 255 << 8) | ((db * ia + sb * a) / 255);
+    return (out_a << 24) | (div255(dr * ia + sr * a) << 16) | (div255(dg * ia + sg * a) << 8) | div255(db * ia + sb * a);
 }
 
 /// Premultiplied src-over: src RGB already scaled by alpha (FreeType
@@ -54,51 +60,54 @@ pub fn blendPremult(dst: u32, src_premult: u32) u32 {
     if (sa == 255) return src_premult;
     const ia: u32 = 255 - sa;
     const da: u32 = (dst >> 24) & 0xFF;
-    const out_a: u32 = sa + da * ia / 255;
+    const out_a: u32 = sa + div255(da * ia);
     const dr: u32 = (dst >> 16) & 0xFF;
     const dg: u32 = (dst >> 8) & 0xFF;
     const db: u32 = dst & 0xFF;
     const sr: u32 = (src_premult >> 16) & 0xFF;
     const sg: u32 = (src_premult >> 8) & 0xFF;
     const sb: u32 = src_premult & 0xFF;
-    const or_: u32 = @min(255, sr + dr * ia / 255);
-    const og: u32 = @min(255, sg + dg * ia / 255);
-    const ob: u32 = @min(255, sb + db * ia / 255);
+    const or_: u32 = @min(255, sr + div255(dr * ia));
+    const og: u32 = @min(255, sg + div255(dg * ia));
+    const ob: u32 = @min(255, sb + div255(db * ia));
     return (out_a << 24) | (or_ << 16) | (og << 8) | ob;
 }
 
 pub fn fillRect(buf: []u32, stride: u32, height: u32, x: u32, y: u32, w: u32, h: u32, color: u32, dmg: ?*Damage) void {
+    // Clip once, then memset whole rows: no per-pixel branches.
+    if (w == 0 or h == 0 or x >= stride or y >= height) return;
+    const cw = @min(w, stride - x);
+    const ch = @min(h, height - y);
+    const cwu: usize = cw;
     var row: u32 = 0;
-    while (row < h) : (row += 1) {
-        const yy = y + row;
-        if (yy >= height) break;
-        var col: u32 = 0;
-        while (col < w) : (col += 1) {
-            const xx = x + col;
-            if (xx >= stride) break;
-            buf[@as(usize, yy) * stride + xx] = color;
-        }
+    while (row < ch) : (row += 1) {
+        const off: usize = @as(usize, y + row) * stride + x;
+        @memset(buf[off..][0..cwu], color);
     }
-    if (dmg) |d| d.add(@intCast(x), @intCast(y), @intCast(w), @intCast(h));
+    if (dmg) |d| d.add(@intCast(x), @intCast(y), @intCast(cw), @intCast(ch));
 }
 
 /// Alpha-blended rect over existing pixels (cursor trail ghosts). Signed
 /// coords like blitGlyph: out-of-bounds pixels are skipped, never wrapped.
 pub fn fillRectBlend(buf: []u32, stride: u32, height: u32, x: i32, y: i32, w: u32, h: u32, color: u32, alpha: u8, dmg: ?*Damage) void {
-    if (alpha == 0) return;
-    var row: u32 = 0;
-    while (row < h) : (row += 1) {
-        const yy = y + @as(i32, @intCast(row));
-        if (yy < 0 or yy >= height) continue;
-        var col: u32 = 0;
-        while (col < w) : (col += 1) {
-            const xx = x + @as(i32, @intCast(col));
-            if (xx < 0 or xx >= stride) continue;
-            const idx = @as(usize, @intCast(yy)) * stride + @as(usize, @intCast(xx));
+    if (alpha == 0 or w == 0 or h == 0) return;
+    const st: i32 = @intCast(stride);
+    const ht: i32 = @intCast(height);
+    const x0 = @max(x, 0);
+    const y0 = @max(y, 0);
+    const x1 = @min(x + @as(i32, @intCast(w)), st);
+    const y1 = @min(y + @as(i32, @intCast(h)), ht);
+    if (x0 >= x1 or y0 >= y1) return;
+    var yy = y0;
+    while (yy < y1) : (yy += 1) {
+        const base = @as(usize, @intCast(yy)) * stride;
+        var xx = x0;
+        while (xx < x1) : (xx += 1) {
+            const idx = base + @as(usize, @intCast(xx));
             buf[idx] = blendArgb(buf[idx], color, alpha);
-            if (dmg) |d| d.add(xx, yy, 1, 1);
         }
     }
+    if (dmg) |d| d.add(x0, y0, x1 - x0, y1 - y0);
 }
 
 test "damage union + blend" {
@@ -110,6 +119,54 @@ test "damage union + blend" {
     var buf: [16]u32 = [_]u32{0} ** 16;
     fillRect(&buf, 4, 4, 0, 0, 2, 2, 0xFF112233, null);
     try std.testing.expectEqual(@as(u32, 0xFF112233), buf[0]);
+}
+
+test "div255 matches integer division exhaustively" {
+    var v: u32 = 0;
+    while (v <= 65025) : (v += 1) {
+        try std.testing.expectEqual(v / 255, div255(v));
+    }
+}
+
+test "blendArgb matches exact reference" {
+    // Independent u64 reference over sampled channels (all four, alpha in).
+    const alphas = [_]u8{ 0, 1, 2, 5, 64, 127, 128, 200, 254, 255 };
+    const chans = [_]u64{ 0, 1, 17, 127, 128, 254, 255 };
+    for (alphas) |a| {
+        const au: u64 = a;
+        const iau: u64 = 255 - au;
+        for (chans) |da| {
+            for (chans) |dr| {
+                for (chans) |sr| {
+                    const dst: u32 = @intCast(da << 24 | dr << 16 | dr << 8 | dr);
+                    const src: u32 = @intCast(sr << 16 | sr << 8 | sr);
+                    const ref: u32 = @intCast(
+                        ((au + da * iau / 255) << 24) |
+                            (((dr * iau + sr * au) / 255) << 16) |
+                            (((dr * iau + sr * au) / 255) << 8) |
+                            ((dr * iau + sr * au) / 255),
+                    );
+                    try std.testing.expectEqual(ref, blendArgb(dst, src, a));
+                }
+            }
+        }
+    }
+}
+
+test "fillRect clips once, reports tight damage" {
+    var buf: [16]u32 = [_]u32{0xFF000000} ** 16;
+    var d = Damage{};
+    fillRect(&buf, 4, 4, 2, 2, 4, 4, 0xFF112233, &d); // half OOB
+    try std.testing.expectEqual(@as(u32, 0xFF112233), buf[2 * 4 + 2]);
+    try std.testing.expectEqual(@as(u32, 0xFF112233), buf[3 * 4 + 3]);
+    try std.testing.expectEqual(@as(u32, 0xFF000000), buf[1 * 4 + 1]);
+    try std.testing.expectEqual(@as(i32, 2), d.w);
+    try std.testing.expectEqual(@as(i32, 2), d.h);
+    // Fully OOB paints nothing and reports nothing.
+    var d2 = Damage{};
+    fillRect(&buf, 4, 4, 9, 9, 4, 4, 0xFFFFFFFF, &d2);
+    try std.testing.expect(d2.empty);
+    try std.testing.expectEqual(@as(u32, 0xFF000000), buf[0]);
 }
 
 test "fillRectBlend fades over pixels, skips OOB" {
@@ -125,6 +182,8 @@ test "fillRectBlend fades over pixels, skips OOB" {
 /// Blit an 8-bit coverage glyph from the atlas onto XRGB pixels.
 /// (ax, ay) is the glyph origin in the atlas; drawn at (dx, dy) + xoff,
 /// baseline-adjusted by yoff (FreeType bitmap_top convention).
+/// Clips once up front (no per-pixel bounds checks) and reports a single
+/// damage rect instead of one per painted pixel.
 /// Returns the drawn bounding box (for damage tracking).
 pub fn blitGlyph(
     buf: []u32,
@@ -144,21 +203,31 @@ pub fn blitGlyph(
 ) Damage {
     var dmg = Damage{};
     if (gw == 0 or gh == 0) return dmg;
-    var row: u16 = 0;
-    while (row < gh) : (row += 1) {
-        const yy = dy_baseline - yoff + row;
-        if (yy < 0 or yy >= height) continue;
-        var col: u16 = 0;
-        while (col < gw) : (col += 1) {
-            const xx = dx + xoff + col;
-            if (xx < 0 or xx >= stride) continue;
-            const cov = atlas_px[(@as(usize, ay) + row) * atlas_stride + ax + col];
+    const ox = dx + @as(i32, xoff);
+    const oy = dy_baseline - @as(i32, yoff);
+    const st: i32 = @intCast(stride);
+    const ht: i32 = @intCast(height);
+    const x0 = @max(ox, 0);
+    const y0 = @max(oy, 0);
+    const x1 = @min(ox + @as(i32, gw), st);
+    const y1 = @min(oy + @as(i32, gh), ht);
+    if (x0 >= x1 or y0 >= y1) return dmg;
+    const a_stride: usize = atlas_stride;
+    const a_x: usize = ax;
+    const a_y: usize = ay;
+    var yy = y0;
+    while (yy < y1) : (yy += 1) {
+        const arow = (a_y + @as(usize, @intCast(yy - oy))) * a_stride;
+        const base = @as(usize, @intCast(yy)) * stride;
+        var xx = x0;
+        while (xx < x1) : (xx += 1) {
+            const cov = atlas_px[arow + a_x + @as(usize, @intCast(xx - ox))];
             if (cov == 0) continue;
-            const idx = @as(usize, @intCast(yy)) * stride + @as(usize, @intCast(xx));
+            const idx = base + @as(usize, @intCast(xx));
             buf[idx] = blendArgb(buf[idx], color, cov);
-            dmg.add(xx, yy, 1, 1);
         }
     }
+    dmg.add(x0, y0, x1 - x0, y1 - y0);
     return dmg;
 }
 

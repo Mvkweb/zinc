@@ -54,7 +54,7 @@ pub fn shellPath() [*:0]const u8 {
 /// harness runs, "xterm-256color" for real use). Caller owns fd (close)
 /// and must reap pid (waitpid).
 pub fn spawnShell(cols: u16, rows: u16, term_env: ?[*:0]const u8) SpawnError!Child {
-    const master_rc = linux.open("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true }, 0);
+    const master_rc = linux.open("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true, .NONBLOCK = true }, 0);
     const master_err = linux.errno(master_rc);
     if (master_err != .SUCCESS) return error.OpenPtmx;
     const master: i32 = @intCast(master_rc);
@@ -181,6 +181,10 @@ pub fn writeAll(fd: i32, data: []const u8) void {
             if (rc == 0) break;
             off += rc;
         } else if (err == .INTR) {
+            continue;
+        } else if (err == .AGAIN) {
+            var pfd = [_]linux.pollfd{.{ .fd = fd, .events = linux.POLL.OUT, .revents = 0 }};
+            _ = linux.poll(&pfd, 1, 50);
             continue;
         } else {
             break;
