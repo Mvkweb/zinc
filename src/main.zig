@@ -30,6 +30,21 @@ pub fn main(init: std.process.Init) !void {
         try wayland_mod.probe(gpa, io);
         return;
     }
+    if (args.len > 1 and std.mem.eql(u8, args[1], "--bench")) {
+        // Headless engine bench: feed a file through parse + answerQueries
+        // in 4KB chunks (like the PTY loop) and time it. No window, no
+        // compositor, no PTY — measures parse+scroll only. Wrap with
+        // hyperfine for stats: hyperfine 'zinc --bench /tmp/bench-dense.txt'.
+        if (args.len < 3) {
+            var eb: [256]u8 = undefined;
+            var w = std.Io.File.stderr().writer(io, &eb);
+            try w.interface.print("usage: zinc --bench <file>\n", .{});
+            try w.interface.flush();
+            std.process.exit(2);
+        }
+        try benchMain(gpa, io, args[2]);
+        return;
+    }
 
     // Default: run the terminal. Opens a Wayland window; the USER runs this.
     var app = wayland_mod.App(config_mod.active).open(gpa, io) catch |err| {
@@ -217,6 +232,70 @@ fn smokeMain(gpa: std.mem.Allocator, io: std.Io) !void {
     });
     try w.interface.flush();
     if (!(found_ok and found_bold and child_ok)) std.process.exit(1);
+}
+
+/// Feed one open file through parse + answerQueries in 4KB chunks (like
+/// the PTY loop). Returns bytes consumed.
+fn feedFile(ctx: *context_mod.Context(config_mod.active), fd: i32) usize {
+    var read_buf: [4096]u8 = undefined;
+    var total: usize = 0;
+    while (true) {
+        const rrc = linux.read(fd, &read_buf, read_buf.len);
+        const rerr = linux.errno(rrc);
+        if (rerr != .SUCCESS) {
+            if (rerr == .INTR) continue;
+            break;
+        }
+        if (rrc == 0) break;
+        const chunk = read_buf[0..rrc];
+        ctx.parse(chunk);
+        ctx.answerQueries(chunk);
+        total += rrc;
+    }
+    return total;
+}
+
+fn benchMain(gpa: std.mem.Allocator, io: std.Io, path: []const u8) !void {
+    var zpath: [4096]u8 = undefined;
+    if (path.len == 0 or path.len >= zpath.len) {
+        var eb: [256]u8 = undefined;
+        var w = std.Io.File.stderr().writer(io, &eb);
+        try w.interface.print("bench: bad path\n", .{});
+        try w.interface.flush();
+        std.process.exit(2);
+    }
+    @memcpy(zpath[0..path.len], path);
+    zpath[path.len] = 0;
+    const zp: [*:0]const u8 = @ptrCast(&zpath);
+
+    var ctx = try context_mod.Context(config_mod.active).init(gpa);
+    defer ctx.deinit();
+
+    // Warmup (scrollback ring alloc, caches) is untimed; the timed pass
+    // replays the same bytes from a fresh open.
+    for ([_]bool{ false, true }) |timed| {
+        const orc = linux.open(zp, .{ .ACCMODE = .RDONLY }, 0);
+        if (linux.errno(orc) != .SUCCESS) {
+            var eb: [256]u8 = undefined;
+            var w = std.Io.File.stderr().writer(io, &eb);
+            try w.interface.print("bench: cannot open {s}\n", .{path});
+            try w.interface.flush();
+            std.process.exit(1);
+        }
+        const fd: i32 = @intCast(orc);
+        const t0 = context_mod.nowMs();
+        const n = feedFile(&ctx, fd);
+        const t1 = context_mod.nowMs();
+        _ = linux.close(fd);
+        if (timed) {
+            const ms: u64 = @intCast(@max(1, t1 - t0));
+            const mbps10: u64 = @as(u64, n) * 10000 / ms / 1048576;
+            var ob: [128]u8 = undefined;
+            var w = std.Io.File.stdout().writer(io, &ob);
+            try w.interface.print("bench: {d} bytes in {d} ms ({d}.{d} MB/s)\n", .{ n, ms, mbps10 / 10, mbps10 % 10 });
+            try w.interface.flush();
+        }
+    }
 }
 
 /// Read one chunk from fd, answer queries, feed the parser.
