@@ -901,12 +901,19 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     self.saved_wrap = self.pending_wrap;
                 },
                 'u' => {
+                    // SCO restore cursor — plain CSI u only. Priv-marked
+                    // ?u (kitty keyboard query, answered in answerQueries)
+                    // must never teleport the cursor (fish sends it every
+                    // prompt; it used to yank the cursor to (0,0)).
+                    if (priv) return;
                     self.cursor_col = @min(self.saved_col, self.grid.cols -| 1);
                     self.cursor_row = @min(self.saved_row, self.grid.rows -| 1);
                     self.pending_wrap = self.saved_wrap and self.saved_col < self.grid.cols and self.saved_row < self.grid.rows;
                 },
                 'q' => { // DECSCUSR: 0 restores default; 1/2 block,
                     // 3/4 underline, 5/6 bar (odd = blink, even = steady).
+                    // Priv-marked queries (?q) are not cursor-style requests.
+                    if (priv) return;
                     switch (n(params, 0, 0)) {
                         0 => {
                             self.decscusr_style = null;
@@ -1319,6 +1326,13 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
             const cell = self.grid.at(self.cursor_col, self.cursor_row);
             cell.setRune(cp);
+            // A shorter overwrite must not inherit the previous line's wrap
+            // continuation: reflow joins rows on the last cell's flag only,
+            // so void it whenever this write stops short of it (genuine
+            // wraps re-arm via pending_wrap on the next char regardless).
+            if (self.cursor_col + 1 < self.grid.cols) {
+                self.grid.at(self.grid.cols - 1, self.cursor_row).wrapped = false;
+            }
             const fg = self.resolveColor(self.pen.fg);
             cell.fg = fg;
             cell.bg = self.resolveColor(self.pen.bg);
@@ -2499,4 +2513,75 @@ test "wide wraps when pair won't fit" {
     try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[9].rune);
     try std.testing.expectEqual(@as(u16, 2), ctx.cursor_col);
     try std.testing.expectEqual(@as(u16, 1), ctx.cursor_row);
+}
+
+test "overwrite voids stale wrap continuation" {
+    // Genuine wrap, then home + short overwrite: the last cell must lose
+    // its flag or reflow joins live rows and drops content (fastfetch logo).
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("123456789"); // row 0 full, '9' wraps to row 1
+    try std.testing.expect(ctx.grid.cells[7].wrapped);
+    try std.testing.expectEqual(@as(u32, '9'), ctx.grid.cells[8].rune);
+    ctx.parse("\x1b[1;1H"); // home (motion clears pending_wrap)
+    ctx.parse("XY"); // short overwrite stops at col 1
+    try std.testing.expectEqual(@as(u32, 'X'), ctx.grid.cells[0].rune);
+    try std.testing.expect(!ctx.grid.cells[7].wrapped);
+    // A widen keeps both lines on their own rows (cursor back down first:
+    // reflow gathers rows up to the cursor).
+    ctx.parse("\x1b[2;1H");
+    ctx.resize(16, 4);
+    try std.testing.expectEqual(@as(u32, 'X'), ctx.grid.cells[0].rune);
+    try std.testing.expectEqual(@as(u32, 'Y'), ctx.grid.cells[1].rune);
+    try std.testing.expectEqual(@as(u32, '9'), ctx.grid.cells[16].rune);
+}
+
+test "priv-marked u never restores cursor" {
+    // CSI ? u is the kitty keyboard query (answered in answerQueries);
+    // fish sends it every prompt and it must not teleport the cursor.
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("\x1b[2;5H"); // row 1, col 4
+    ctx.parse("\x1b[s"); // save
+    ctx.parse("\x1b[1;1H"); // move away
+    ctx.parse("\x1b[?u"); // query: cursor must stay put
+    try std.testing.expectEqual(@as(u16, 0), ctx.cursor_col);
+    try std.testing.expectEqual(@as(u16, 0), ctx.cursor_row);
+    ctx.parse("\x1b[u"); // plain restore still works
+    try std.testing.expectEqual(@as(u16, 4), ctx.cursor_col);
+    try std.testing.expectEqual(@as(u16, 1), ctx.cursor_row);
+}
+
+test "priv-marked q never touches cursor style" {
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("\x1b[3 q"); // DECSCUSR underline blink
+    try std.testing.expect(ctx.decscusr_style.? == .underline);
+    ctx.parse("\x1b[?0q"); // query: style must survive
+    try std.testing.expect(ctx.decscusr_style.? == .underline);
+    ctx.parse("\x1b[0 q"); // plain reset still works
+    try std.testing.expect(ctx.decscusr_style == null);
+}
+
+test "teleport overwrite plus resize keeps content" {
+    // The fastfetch logo chain, synthetic: wrapped rows, a kitty ?u that
+    // must not teleport, a short overwrite, then a widen. Nothing joins.
+    var ctx = try Context(.{ .cols = 8, .rows = 6 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("12345678"); // full row 0
+    ctx.parse("ABCDEFGH"); // wraps row 0 (flagged), fills row 1
+    ctx.parse("XY"); // wraps row 1 (flagged), row 2 cols 0-1
+    try std.testing.expect(ctx.grid.cells[7].wrapped);
+    try std.testing.expect(ctx.grid.cells[15].wrapped);
+    ctx.parse("\x1b[?u"); // no teleport: cursor stays row 2
+    try std.testing.expectEqual(@as(u16, 2), ctx.cursor_col);
+    try std.testing.expectEqual(@as(u16, 2), ctx.cursor_row);
+    ctx.parse("\r"); // col 0, row 2
+    ctx.parse("logo!"); // short overwrite voids row 2's stale flag
+    try std.testing.expect(!ctx.grid.cells[23].wrapped);
+    ctx.resize(16, 6);
+    // Joined pair re-splits onto row 0, logo keeps its own row.
+    try std.testing.expectEqual(@as(u32, '1'), ctx.grid.cells[0].rune);
+    try std.testing.expectEqual(@as(u32, 'H'), ctx.grid.cells[15].rune);
+    try std.testing.expectEqual(@as(u32, 'l'), ctx.grid.cells[16].rune);
 }
