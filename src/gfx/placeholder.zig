@@ -51,6 +51,14 @@ pub const DIACRITICS: [297]u32 = .{
     0x01D244,
 };
 
+// Floor pin: putCodepoint skips the combining/diacritic checks for cp <
+// 0x300, so no table entry may sit below it. Breaks loudly if violated.
+comptime {
+    for (DIACRITICS) |d| {
+        if (d < 0x300) @compileError("diacritic entry below ASCII fast-path floor");
+    }
+}
+
 /// Reverse lookup: diacritic char -> number (image row/col/id-extra).
 /// Linear scan; only called for combining marks on placeholder cells.
 pub fn diacriticValue(cp: u32) ?u16 {

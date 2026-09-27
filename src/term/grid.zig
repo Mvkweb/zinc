@@ -15,6 +15,13 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
         sb_rows: []?[]C = &.{},
         cols: u16,
         rows: u16,
+        /// Physical row of logical row 0: scrollUp rotates this instead of
+        /// memmoving the grid (O(cols) per scroll, not O(rows*cols)).
+        /// All logical access goes through index/at/rowSlice; linearizing
+        /// ops (resize, reflow) reset it to 0.
+        top: u16 = 0,
+        /// Same offset for alt_cells (swapped alongside on alt switch).
+        alt_top: u16 = 0,
         sb_head: usize = 0, // ring start (oldest)
         sb_len: usize = 0, // live scrollback rows
         view_offset: usize = 0, // 0 = following; >0 = scrolled up rows
@@ -49,7 +56,9 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
         }
 
         pub inline fn index(self: *const Self, col: u16, row: u16) usize {
-            return @as(usize, row) * self.cols + col;
+            var pr: usize = @as(usize, self.top) + row;
+            if (pr >= self.rows) pr -= self.rows;
+            return pr * self.cols + col;
         }
 
         pub fn at(self: *Self, col: u16, row: u16) *C {
@@ -57,8 +66,18 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
         }
 
         pub fn rowSlice(self: *Self, row: u16) []C {
-            const start = @as(usize, row) * self.cols;
+            var pr: usize = @as(usize, self.top) + row;
+            if (pr >= self.rows) pr -= self.rows;
+            const start = pr * self.cols;
             return self.cells[start .. start + self.cols];
+        }
+
+        /// Physical slice of an alt-screen row (offset by alt_top).
+        pub fn altRowSlice(self: *Self, row: u16) []C {
+            var pr: usize = @as(usize, self.alt_top) + row;
+            if (pr >= self.rows) pr -= self.rows;
+            const start = pr * self.cols;
+            return self.alt_cells[start .. start + self.cols];
         }
 
         pub fn markAllDirty(self: *Self) void {
@@ -96,13 +115,16 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
         /// Push top row into scrollback ring (or drop if disabled).
         /// Scroll the grid up one row. When push is false (alt-screen),
         /// the top row is discarded instead of entering scrollback.
+        /// O(cols): rotates the live offset instead of memmoving rows.
         pub fn scrollUp(self: *Self, push: bool) void {
             if (push) {
-                self.pushScrollbackRow(self.cells[0..self.cols]);
+                self.pushScrollbackRow(self.rowSlice(0));
             }
-            std.mem.copyForwards(C, self.cells[0 .. self.cells.len - self.cols], self.cells[self.cols..]);
-            @memset(self.cells[self.cells.len - self.cols ..], .{});
-            for (self.cells[self.cells.len - self.cols ..]) |*c| c.dirty = true;
+            self.top += 1;
+            if (self.top >= self.rows) self.top = 0;
+            const b = self.rowSlice(self.rows - 1);
+            @memset(b, .{});
+            for (b) |*c| c.dirty = true;
         }
 
         pub fn clearScrollback(self: *Self) void {
@@ -145,7 +167,8 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
         }
 
         /// Resize the grid, preserving the overlapping region top-left without reflow.
-        /// Scrollback history is retained across width changes.
+        /// Scrollback history is retained across width changes. Linearizes
+        /// the live offset (top = 0 afterwards).
         pub fn resizeCrop(self: *Self, cols: u16, rows: u16) !void {
             if (cols == self.cols and rows == self.rows) return;
             const CellT = @TypeOf(self.cells[0]);
@@ -157,11 +180,12 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
             while (r < copy_rows) : (r += 1) {
                 @memcpy(
                     new_cells[@as(usize, r) * cols ..][0..copy_cols],
-                    self.cells[@as(usize, r) * self.cols ..][0..copy_cols],
+                    self.rowSlice(r)[0..copy_cols],
                 );
             }
             self.gpa.free(self.cells);
             self.cells = new_cells;
+            self.top = 0;
             if (cfg.alt_screen and self.alt_cells.len > 0) {
                 const new_alt = try self.gpa.alloc(CellT, @as(usize, cols) * rows);
                 @memset(new_alt, .{});
@@ -169,11 +193,12 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
                 while (ar < copy_rows) : (ar += 1) {
                     @memcpy(
                         new_alt[@as(usize, ar) * cols ..][0..copy_cols],
-                        self.alt_cells[@as(usize, ar) * self.cols ..][0..copy_cols],
+                        self.altRowSlice(ar)[0..copy_cols],
                     );
                 }
                 self.gpa.free(self.alt_cells);
                 self.alt_cells = new_alt;
+                self.alt_top = 0;
             }
             self.cols = cols;
             self.rows = rows;

@@ -69,7 +69,7 @@ fn absRune(grid: anytype, abs: usize, sb_len: usize, cols: usize, col: usize) ?u
     }
     const r = abs - sb_len;
     if (r >= grid.rows) return null;
-    const v: u32 = grid.cells[r * cols + col].rune;
+    const v: u32 = grid.rowSlice(@intCast(r))[col].rune;
     return v;
 }
 

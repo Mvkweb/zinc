@@ -64,13 +64,13 @@ fn logReflow(
     var r: usize = 0;
     while (r < rows) : (r += 1) {
         aw.writer.print("S{d:4} |", .{r}) catch return;
-        var c: usize = 0;
-        while (c < cols) : (c += 1) {
-            const v: u32 = grid.cells[r * cols + c].rune;
+        const rslice = grid.rowSlice(@intCast(r));
+        for (rslice) |cell| {
+            const v: u32 = cell.rune;
             const ch: u8 = if (v >= 32 and v < 127) @intCast(v) else '?';
             aw.writer.print("{c}", .{ch}) catch return;
         }
-        const w = grid.cells[r * cols + cols - 1].wrapped;
+        const w = rslice[rslice.len - 1].wrapped;
         aw.writer.print("|{s}\n", .{if (w) "[W]" else ""}) catch return;
     }
     if (comptime cfg.scrollback_cap > 0) {
@@ -144,8 +144,7 @@ pub fn reflowGrid(
     }
 
     for (0..active_screen_rows) |r| {
-        const start = r * @as(usize, old_cols);
-        const rslice = grid.cells[start .. start + old_cols];
+        const rslice = grid.rowSlice(@intCast(r));
         const is_wrap = if (rslice.len > 0) rslice[rslice.len - 1].wrapped else false;
         input_rows[sb_count + r] = .{
             .cells = rslice,
@@ -404,6 +403,7 @@ pub fn reflowGrid(
 
     grid.gpa.free(grid.cells);
     grid.cells = new_cells;
+    grid.top = 0; // fresh linear layout
 
     // Alt-screen crop
     if (cfg.alt_screen and grid.alt_cells.len > 0) {
@@ -413,13 +413,16 @@ pub fn reflowGrid(
         const copy_r = @min(new_rows, old_rows);
         var ar: u16 = 0;
         while (ar < copy_r) : (ar += 1) {
+            var prow: usize = @as(usize, grid.alt_top) + ar;
+            if (prow >= old_rows) prow -= old_rows;
             @memcpy(
                 new_alt[@as(usize, ar) * new_cols ..][0..copy_c],
-                grid.alt_cells[@as(usize, ar) * old_cols ..][0..copy_c],
+                grid.alt_cells[prow * old_cols ..][0..copy_c],
             );
         }
         grid.gpa.free(grid.alt_cells);
         grid.alt_cells = new_alt;
+        grid.alt_top = 0;
     }
 
     cursor_row.* = @intCast(std.math.clamp(@as(i64, @intCast(cursor_line)) - @as(i64, @intCast(st)), 0, new_rows - 1));

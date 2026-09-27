@@ -34,6 +34,11 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         grid: grid_mod.Grid(cfg),
         parser: parser_mod.Parser = .{},
         pen: sgr_mod.Attr = .{},
+        /// Resolved pen baked into a blank cell: the ASCII fast path stamps
+        /// this per char instead of re-resolving colors/attrs every time.
+        /// Refreshed by refreshPenCell on every pen mutation (SGR, reset).
+        /// Default-constructed == default pen, so no init call is needed.
+        pen_cell: cell_mod.Cell(cfg) = .{},
         cursor_col: u16 = 0,
         cursor_row: u16 = 0,
         /// Cell pixel size for kitty image cursor-advance math. Set by the
@@ -777,6 +782,13 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     i = idx;
                     continue;
                 }
+                // ASCII fast path (ground state, printable): bypasses
+                // parser.feed + apply dispatch for the bulk of output.
+                if (self.parser.state == .ground and b >= 0x20 and b <= 0x7E) {
+                    self.putAscii(b);
+                    i += 1;
+                    continue;
+                }
                 const act = self.parser.feed(b);
                 i += 1;
                 if (act) |a| self.apply(a);
@@ -894,7 +906,10 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 },
                 'J' => self.eraseDisplay(n(params, 0, 0)),
                 'K' => self.eraseLine(n(params, 0, 0)),
-                'm' => sgr_mod.applySgr(&self.pen, params, sub),
+                'm' => {
+                    sgr_mod.applySgr(&self.pen, params, sub);
+                    self.refreshPenCell();
+                },
                 's' => {
                     self.saved_col = self.cursor_col;
                     self.saved_row = self.cursor_row;
@@ -1007,10 +1022,12 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             self.alt_saved_col = self.cursor_col;
             self.alt_saved_row = self.cursor_row;
             self.alt_saved_wrap = self.pending_wrap;
+            self.grid.alt_top = self.grid.top;
             std.mem.swap(@TypeOf(self.grid.cells), &self.grid.cells, &self.grid.alt_cells);
             self.alt_active = true;
             self.grid.view_offset = 0;
             @memset(self.grid.cells, .{});
+            self.grid.top = 0;
             self.cursor_col = 0;
             self.cursor_row = 0;
             self.pending_wrap = false;
@@ -1023,6 +1040,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         fn exitAlt(self: *Self) void {
             if (!self.alt_active) return;
             std.mem.swap(@TypeOf(self.grid.cells), &self.grid.cells, &self.grid.alt_cells);
+            self.grid.top = self.grid.alt_top;
             self.alt_active = false;
             self.cursor_col = @min(self.alt_saved_col, self.grid.cols -| 1);
             self.cursor_row = @min(self.alt_saved_row, self.grid.rows -| 1);
@@ -1186,6 +1204,43 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// kitty keyboard) via the write callback. Same coverage as the
         /// smoke harness; the overlap window catches split reads.
         pub fn answerQueries(self: *Self, chunk: []const u8) void {
+            // Fast path: every query contains ESC. With no ESC in the
+            // overlap tail or the chunk there is nothing to answer; just
+            // advance the overlap tail exactly like the slow path below
+            // (last 16 bytes) and return. One memchr replaces ~10 scans
+            // plus a 4KB window copy on data chunks.
+            if (std.mem.indexOfScalar(u8, chunk, 0x1B) == null) {
+                var tail_esc = false;
+                for (self.q_overlap[0..self.q_overlap_len]) |b| {
+                    if (b == 0x1B) {
+                        tail_esc = true;
+                        break;
+                    }
+                }
+                if (!tail_esc) {
+                    if (chunk.len >= 16) {
+                        @memcpy(self.q_overlap[0..16], chunk[chunk.len - 16 ..]);
+                        self.q_overlap_len = 16;
+                    } else if (chunk.len > 0) {
+                        const total = self.q_overlap_len + chunk.len;
+                        if (total <= 16) {
+                            @memcpy(self.q_overlap[self.q_overlap_len..][0..chunk.len], chunk);
+                            self.q_overlap_len = total;
+                        } else {
+                            const drop = total - 16;
+                            if (drop >= self.q_overlap_len) {
+                                @memcpy(self.q_overlap[0..16], chunk[drop - self.q_overlap_len ..][0..16]);
+                            } else {
+                                const keep_old = self.q_overlap_len - drop;
+                                std.mem.copyForwards(u8, self.q_overlap[0..keep_old], self.q_overlap[drop..self.q_overlap_len]);
+                                @memcpy(self.q_overlap[keep_old..][0..chunk.len], chunk);
+                            }
+                            self.q_overlap_len = 16;
+                        }
+                    }
+                    return;
+                }
+            }
             var window: [4112]u8 = undefined;
             @memcpy(window[0..self.q_overlap_len], self.q_overlap[0..self.q_overlap_len]);
             @memcpy(window[self.q_overlap_len..][0..chunk.len], chunk);
@@ -1257,6 +1312,67 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             return @intCast(v);
         }
 
+        /// Re-resolve the pen into the ASCII fast-path template. Called on
+        /// every pen mutation (SGR, reset); mirrors putCodepoint's resolve.
+        fn refreshPenCell(self: *Self) void {
+            const fg = self.resolveColor(self.pen.fg);
+            self.pen_cell.fg = fg;
+            self.pen_cell.bg = self.resolveColor(self.pen.bg);
+            self.pen_cell.ul_color = switch (self.pen.ul.kind) {
+                .default => fg,
+                else => self.resolveColor(self.pen.ul),
+            };
+            self.pen_cell.ul_style = if (!self.pen.underline) .none else switch (self.pen.ul_style) {
+                2 => .double,
+                3 => .curly,
+                4 => .dotted,
+                5 => .dashed,
+                else => .single,
+            };
+            self.pen_cell.attr = .{
+                .bold = self.pen.bold,
+                .italic = self.pen.italic,
+                .underline = self.pen.underline,
+                .blink = self.pen.blink,
+                .reverse = self.pen.reverse,
+                .strikethrough = self.pen.strikethrough,
+                .dim = self.pen.dim,
+                .invisible = self.pen.invisible,
+            };
+        }
+
+        /// ASCII fast path (0x20..0x7E, ground state only): the parser
+        /// dispatch and every non-ASCII-only check collapse into a template
+        /// stamp. Combining/VS16/wide/style faces are all impossible below
+        /// 0x80 (wide starts at U+1100, combining at U+300, diacritics at
+        /// U+305 — the table floor is pinned at compile time). Seams
+        /// (pending wrap, IRM, overflow) delegate to the full path.
+        fn putAscii(self: *Self, byte: u8) void {
+            if (self.pending_wrap or self.cursor_col >= self.grid.cols or self.insert_mode) {
+                self.putCodepoint(byte);
+                return;
+            }
+            const col = self.cursor_col;
+            // Overwriting a wide lead kills it; ASCII prevs are never wide.
+            if (col > 0) {
+                const prev = self.grid.at(col - 1, self.cursor_row);
+                if (cellCp(prev.rune) >= 0x1100 and utf8_mod.isWide(cellCp(prev.rune))) prev.* = self.penBlank();
+            }
+            const cell = self.grid.at(col, self.cursor_row);
+            cell.* = self.pen_cell;
+            cell.setRune(byte);
+            if (cfg.hyperlinks) {
+                cell.has_link = self.cur_link != 0;
+                cell.link_idx = self.cur_link;
+            }
+            if (col + 1 < self.grid.cols) {
+                self.grid.at(self.grid.cols - 1, self.cursor_row).wrapped = false;
+                self.cursor_col = col + 1;
+            } else {
+                self.pending_wrap = true;
+            }
+        }
+
         fn putCodepoint(self: *Self, cp: u21) void {
             if (self.pending_wrap or self.cursor_col >= self.grid.cols) {
                 // Deferred soft-wrap: the previous print filled the last
@@ -1271,14 +1387,15 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             // IRM (CSI 4 h): shift the row right before placing.
             if (self.insert_mode and self.cursor_col + 1 < self.grid.cols) {
                 const CellT = @TypeOf(self.grid.cells[0]);
-                const off = @as(usize, self.cursor_row) * self.grid.cols;
+                const row = self.grid.rowSlice(self.cursor_row);
                 const col = self.cursor_col;
-                std.mem.copyBackwards(CellT, self.grid.cells[off + col + 1 .. off + self.grid.cols], self.grid.cells[off + col .. off + self.grid.cols - 1]);
+                std.mem.copyBackwards(CellT, row[col + 1 ..], row[col .. row.len - 1]);
             }
             // Combining marks attach to the preceding cell instead of
             // overwriting it (kitty unicode-placeholder diacritics ride
-            // here); they never advance the cursor.
-            if (utf8_mod.isCombining(cp) or placeholder_mod.isDiacritic(cp)) {
+            // here); they never advance the cursor. Guarded below U+300:
+            // nothing combinable or diacritic lives down there.
+            if (cp >= 0x300 and (utf8_mod.isCombining(cp) or placeholder_mod.isDiacritic(cp))) {
                 const base_col = if (self.pending_wrap or self.cursor_col == 0) self.cursor_col else self.cursor_col - 1;
                 const mark_cell = self.grid.at(base_col, self.cursor_row);
                 if (mark_cell.combining_count < cfg.font_max_combining) {
@@ -1484,15 +1601,13 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 self.shiftPlacements(0, self.grid.rows -| 1, true);
                 return;
             }
-            var r = self.scroll_top;
+            // Offset-safe: move whole logical rows via slices (each row is
+            // contiguous; logical adjacency need not be physical).
+            var r: u16 = self.scroll_top;
             while (r < self.scroll_bot) : (r += 1) {
-                const dst = @as(usize, r) * self.grid.cols;
-                const src = @as(usize, r + 1) * self.grid.cols;
-                @memcpy(self.grid.cells[dst..][0..self.grid.cols], self.grid.cells[src..][0..self.grid.cols]);
+                @memcpy(self.grid.rowSlice(r), self.grid.rowSlice(r + 1));
             }
-            const last = @as(usize, self.scroll_bot) * self.grid.cols;
-            const blank = self.penBlank();
-            @memset(self.grid.cells[last..][0..self.grid.cols], blank);
+            @memset(self.grid.rowSlice(self.scroll_bot), self.penBlank());
             self.shiftPlacements(self.scroll_top, self.scroll_bot, true);
         }
 
@@ -1527,13 +1642,11 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// One row of region scroll-down (shared by reverse-index and SD).
         fn scrollRegionDown(self: *Self) void {
             const blank = self.penBlank();
-            var r = self.scroll_bot;
+            var r: u16 = self.scroll_bot;
             while (r > self.scroll_top) : (r -= 1) {
-                const dst = @as(usize, r) * self.grid.cols;
-                const src = @as(usize, r - 1) * self.grid.cols;
-                @memcpy(self.grid.cells[dst..][0..self.grid.cols], self.grid.cells[src..][0..self.grid.cols]);
+                @memcpy(self.grid.rowSlice(r), self.grid.rowSlice(r - 1));
             }
-            @memset(self.grid.cells[@as(usize, self.scroll_top) * self.grid.cols ..][0..self.grid.cols], blank);
+            @memset(self.grid.rowSlice(self.scroll_top), blank);
             self.shiftPlacements(self.scroll_top, self.scroll_bot, false);
         }
 
@@ -1544,21 +1657,25 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// panics on aliasing rows).
         fn insertLines(self: *Self, count: u16) void {
             if (count == 0 or self.cursor_row > self.scroll_bot) return;
-            const CellT = @TypeOf(self.grid.cells[0]);
-            const cols: usize = self.grid.cols;
-            const top: usize = @max(self.cursor_row, self.scroll_top);
-            const bot: usize = self.scroll_bot;
-            const h: usize = bot -| top +| 1;
+            const top: u16 = @max(self.cursor_row, self.scroll_top);
+            const bot: u16 = self.scroll_bot;
+            const h: usize = @as(usize, bot) -| top +| 1;
             const n: usize = @min(@as(usize, count), h);
+            const nu16: u16 = @intCast(n);
+            // Offset-safe: shift whole logical rows down (physical rows are
+            // distinct slices, so plain per-row copies are exact).
             if (n < h) {
-                const len = (h - n) * cols;
-                std.mem.copyBackwards(CellT, self.grid.cells[(top + n) * cols ..][0..len], self.grid.cells[top * cols ..][0..len]);
+                var r: u16 = bot;
+                while (true) {
+                    @memcpy(self.grid.rowSlice(r), self.grid.rowSlice(r - nu16));
+                    if (r == top + nu16) break;
+                    r -= 1;
+                }
             }
-            @memset(self.grid.cells[top * cols ..][0 .. n * cols], self.penBlank());
-            const tu: u16 = @intCast(top);
-            const bu: u16 = @intCast(bot);
-            var k: usize = 0;
-            while (k < n) : (k += 1) self.shiftPlacements(tu, bu, false);
+            var k: u16 = 0;
+            while (k < nu16) : (k += 1) @memset(self.grid.rowSlice(top + k), self.penBlank());
+            var s: usize = 0;
+            while (s < n) : (s += 1) self.shiftPlacements(top, bot, false);
         }
 
         /// DL (CSI n M): delete n lines at the cursor row (cursor stays).
@@ -1567,33 +1684,39 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// construction (@memcpy panics on aliasing rows).
         fn deleteLines(self: *Self, count: u16) void {
             if (count == 0 or self.cursor_row > self.scroll_bot) return;
-            const CellT = @TypeOf(self.grid.cells[0]);
-            const cols: usize = self.grid.cols;
-            const top: usize = @max(self.cursor_row, self.scroll_top);
-            const bot: usize = self.scroll_bot;
-            const h: usize = bot -| top +| 1;
+            const top: u16 = @max(self.cursor_row, self.scroll_top);
+            const bot: u16 = self.scroll_bot;
+            const h: usize = @as(usize, bot) -| top +| 1;
             const n: usize = @min(@as(usize, count), h);
+            const nu16: u16 = @intCast(n);
+            // Offset-safe per-row copies (see insertLines).
             if (n < h) {
-                const len = (h - n) * cols;
-                std.mem.copyForwards(CellT, self.grid.cells[top * cols ..][0..len], self.grid.cells[(top + n) * cols ..][0..len]);
+                var r: u16 = top;
+                while (true) {
+                    @memcpy(self.grid.rowSlice(r), self.grid.rowSlice(r + nu16));
+                    if (r == bot - nu16) break;
+                    r += 1;
+                }
             }
-            @memset(self.grid.cells[(bot - n + 1) * cols ..][0 .. n * cols], self.penBlank());
-            const tu: u16 = @intCast(top);
-            const bu: u16 = @intCast(bot);
-            var k: usize = 0;
-            while (k < n) : (k += 1) self.shiftPlacements(tu, bu, true);
+            var k: u16 = 0;
+            while (k < nu16) : (k += 1) @memset(self.grid.rowSlice(bot - nu16 + 1 + k), self.penBlank());
+            var s: usize = 0;
+            while (s < n) : (s += 1) self.shiftPlacements(top, bot, true);
         }
 
         fn eraseDisplay(self: *Self, mode: u16) void {
             const blank = self.penBlank();
             switch (mode) {
                 0 => { // cursor -> end
-                    const start = self.grid.index(self.cursor_col, self.cursor_row);
-                    @memset(self.grid.cells[start..], blank);
+                    const row = self.grid.rowSlice(self.cursor_row);
+                    @memset(row[self.cursor_col..], blank);
+                    var r: u16 = self.cursor_row + 1;
+                    while (r < self.grid.rows) : (r += 1) @memset(self.grid.rowSlice(r), blank);
                 },
                 1 => { // start -> cursor
-                    const end = self.grid.index(self.cursor_col, self.cursor_row) + 1;
-                    @memset(self.grid.cells[0..end], blank);
+                    var r: u16 = 0;
+                    while (r < self.cursor_row) : (r += 1) @memset(self.grid.rowSlice(r), blank);
+                    @memset(self.grid.rowSlice(self.cursor_row)[0 .. self.cursor_col + 1], blank);
                 },
                 2, 3 => {
                     @memset(self.grid.cells, blank);
@@ -1608,11 +1731,11 @@ pub fn Context(comptime cfg: config_mod.Config) type {
 
         fn eraseLine(self: *Self, mode: u16) void {
             const blank = self.penBlank();
-            const row_off = @as(usize, self.cursor_row) * self.grid.cols;
+            const row = self.grid.rowSlice(self.cursor_row);
             switch (mode) {
-                0 => @memset(self.grid.cells[row_off + self.cursor_col ..][0 .. self.grid.cols - self.cursor_col], blank),
-                1 => @memset(self.grid.cells[row_off..][0 .. self.cursor_col + 1], blank),
-                2 => @memset(self.grid.cells[row_off..][0..self.grid.cols], blank),
+                0 => @memset(row[self.cursor_col..], blank),
+                1 => @memset(row[0 .. self.cursor_col + 1], blank),
+                2 => @memset(row, blank),
                 else => {},
             }
         }
@@ -1621,10 +1744,9 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// Vacated cells take the pen background (BCE).
         fn eraseChars(self: *Self, count: u16) void {
             const cols: usize = self.grid.cols;
-            const start: usize = @as(usize, self.cursor_row) * cols + self.cursor_col;
-            const max: usize = (@as(usize, self.cursor_row) + 1) * cols;
-            const n: usize = @min(@as(usize, count), max -| start);
-            @memset(self.grid.cells[start..][0..n], self.penBlank());
+            const row = self.grid.rowSlice(self.cursor_row);
+            const n: usize = @min(@as(usize, count), cols -| self.cursor_col);
+            @memset(row[self.cursor_col..][0..n], self.penBlank());
         }
 
         /// DCH (CSI n P): delete n chars at the cursor, shifting the rest
@@ -1634,20 +1756,23 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             if (count == 0) return;
             const CellT = @TypeOf(self.grid.cells[0]);
             const cols: usize = self.grid.cols;
-            const row_off: usize = @as(usize, self.cursor_row) * cols;
+            const row = self.grid.rowSlice(self.cursor_row);
             const tail: usize = cols -| self.cursor_col;
             const n: usize = @min(@as(usize, count), tail);
             if (n < tail) {
-                std.mem.copyForwards(CellT, self.grid.cells[row_off + self.cursor_col ..][0 .. tail - n], self.grid.cells[row_off + self.cursor_col + n ..][0 .. tail - n]);
+                std.mem.copyForwards(CellT, row[self.cursor_col..][0 .. tail - n], row[self.cursor_col + n ..][0 .. tail - n]);
             }
-            @memset(self.grid.cells[row_off + cols - n ..][0..n], self.penBlank());
+            @memset(row[cols - n ..][0..n], self.penBlank());
         }
 
         fn reset(self: *Self) void {
             const CellT = @TypeOf(self.grid.cells[0]);
             const blank = CellT{};
             @memset(self.grid.cells, blank);
+            self.grid.top = 0;
+            self.grid.alt_top = 0;
             self.pen = .{};
+            self.refreshPenCell();
             self.cursor_col = 0;
             self.cursor_row = 0;
             self.pending_wrap = false;
@@ -2232,8 +2357,8 @@ test "su on full region feeds scrollback" {
     ctx.parse("0\r\n1\r\n2\r\n3");
     ctx.parse("\x1b[S");
     try std.testing.expectEqual(@as(usize, 1), ctx.grid.sb_len);
-    try std.testing.expectEqual(@as(u32, '1'), ctx.grid.cells[0 * 8].rune);
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[3 * 8].rune);
+    try std.testing.expectEqual(@as(u32, '1'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(0, 3).rune);
     try std.testing.expectEqual(@as(u16, 3), ctx.cursor_row);
 }
 
@@ -2584,4 +2709,81 @@ test "teleport overwrite plus resize keeps content" {
     try std.testing.expectEqual(@as(u32, '1'), ctx.grid.cells[0].rune);
     try std.testing.expectEqual(@as(u32, 'H'), ctx.grid.cells[15].rune);
     try std.testing.expectEqual(@as(u32, 'l'), ctx.grid.cells[16].rune);
+}
+
+test "answerQueries skips ESC-less chunks identically" {
+    // Fast path must maintain the same 16-byte overlap tail as the slow
+    // path, and a query split across the boundary must still be answered.
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    const Sink = struct {
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+        fn cb(user: ?*anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(user));
+            const n = @min(data.len, self.buf.len - self.len);
+            @memcpy(self.buf[self.len..][0..n], data[0..n]);
+            self.len += n;
+        }
+    };
+    var sink = Sink{};
+    ctx.onWrite(Sink.cb, &sink);
+    ctx.answerQueries("0123456789ABCDEFGHIJ"); // 20 bytes, no ESC
+    try std.testing.expectEqual(@as(usize, 16), ctx.q_overlap_len);
+    try std.testing.expectEqualStrings("456789ABCDEFGHIJ", ctx.q_overlap[0..16]);
+    ctx.answerQueries("klm"); // short tail appends
+    try std.testing.expectEqual(@as(usize, 16), ctx.q_overlap_len);
+    try std.testing.expectEqualStrings("789ABCDEFGHIJklm", ctx.q_overlap[0..16]);
+    // Split CPR query: ESC at chunk end, rest next chunk.
+    ctx.answerQueries("\x1b[");
+    ctx.answerQueries("6n");
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "R") != null);
+}
+
+test "ascii fast path keeps style across sgr runs" {
+    var ctx = try Context(.{ .cols = 16, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("ab\x1b[1;31mCD\x1b[0mef");
+    try std.testing.expect(!ctx.grid.at(0, 0).attr.bold);
+    try std.testing.expect(!ctx.grid.at(1, 0).attr.bold);
+    try std.testing.expect(ctx.grid.at(2, 0).attr.bold);
+    try std.testing.expect(ctx.grid.at(3, 0).attr.bold);
+    try std.testing.expect(!ctx.grid.at(4, 0).attr.bold);
+    try std.testing.expectEqual(@as(u32, 'C'), ctx.grid.at(2, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'f'), ctx.grid.at(5, 0).rune);
+}
+
+test "ascii fast path wraps at row end" {
+    var ctx = try Context(.{ .cols = 4, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("abcd"); // fills row 0, pending
+    ctx.parse("ef"); // 'e' wraps (flag), 'f' lands row 1
+    try std.testing.expect(ctx.grid.at(3, 0).wrapped);
+    try std.testing.expectEqual(@as(u32, 'e'), ctx.grid.at(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, 'f'), ctx.grid.at(1, 1).rune);
+}
+
+test "ascii fast path survives reset" {
+    var ctx = try Context(.{ .cols = 8, .rows = 2 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("\x1b[1mAB");
+    try std.testing.expect(ctx.grid.at(0, 0).attr.bold);
+    ctx.parse("\x1bcCD"); // RIS clears grid + pen
+    try std.testing.expectEqual(@as(u32, 'C'), ctx.grid.at(0, 0).rune);
+    try std.testing.expect(!ctx.grid.at(0, 0).attr.bold);
+}
+
+test "ascii fast path preconditions hold" {
+    // putAscii skips the combining/diacritic/VS16/wide checks for bytes
+    // below 0x80. If any classifier ever claims an ASCII byte, the fast
+    // path silently misroutes. Pin the floor (tiger-style: assert the
+    // invariant where the optimization depends on it).
+    var cp: u21 = 0;
+    while (cp < 0x80) : (cp += 1) {
+        try std.testing.expect(!utf8_mod.isCombining(cp));
+        try std.testing.expect(!utf8_mod.isWide(cp));
+        try std.testing.expect(!utf8_mod.isEmoji(cp));
+        try std.testing.expect(!placeholder_mod.isDiacritic(cp));
+        try std.testing.expect(cp != 0xFE0F and cp != 0x200D);
+    }
 }
