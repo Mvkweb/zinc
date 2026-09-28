@@ -189,10 +189,11 @@ fn smokeMain(gpa: std.mem.Allocator, io: std.Io) !void {
     var found_bold = false; // synthetic "BOLD plain" with bold attr on B
     var r: u16 = 0;
     while (r < ctx.grid.rows) : (r += 1) {
+        const rslice = ctx.grid.rowSlice(r);
         var last: usize = 0;
         var c: u16 = 0;
         while (c < ctx.grid.cols) : (c += 1) {
-            const cell = ctx.grid.cells[ctx.grid.index(c, r)];
+            const cell = rslice[c];
             const cp: u32 = cell.rune;
             if (cp != ' ') {
                 last = c + 1;
@@ -206,7 +207,7 @@ fn smokeMain(gpa: std.mem.Allocator, io: std.Io) !void {
         var enc: [4]u8 = undefined;
         c = 0;
         while (c < last and row_n < row_text.len - 4) : (c += 1) {
-            const cell = ctx.grid.cells[ctx.grid.index(c, r)];
+            const cell = rslice[c];
             const slice = utf8_mod.encode(toCp(cell.rune), &enc);
             @memcpy(row_text[row_n..][0..slice.len], slice);
             row_n += slice.len;
@@ -221,7 +222,7 @@ fn smokeMain(gpa: std.mem.Allocator, io: std.Io) !void {
             // Require the B cell to actually carry the bold attribute.
             const bcol = std.mem.indexOf(u8, row, "BOLD") orelse 9999;
             if (bcol < ctx.grid.cols) {
-                const bcell = ctx.grid.cells[ctx.grid.index(@intCast(bcol), r)];
+                const bcell = rslice[@intCast(bcol)];
                 if (bcell.attr.bold) found_bold = true;
             }
         }

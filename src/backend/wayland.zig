@@ -343,6 +343,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
         ptr_serial: u32 = 0,
         /// Current server cursor shape (0 = unset / needs refresh; see P.cursor_shape.SHAPE_*).
         cursor_shape: u32 = 0,
+        /// Debug knobs, read from the environment ONCE at open (never in
+        /// the PTY/render hot path: getenv scans environ per call).
+        trace_on: bool = false,
+        profile_on: bool = false,
 
         xkb_ctx: ?*XkbContext = null,
         xkb_map: ?*XkbKeymap = null,
@@ -466,6 +470,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .ft_face = ft_face,
                 .atlas = atlas,
                 .color_atlas = color_atlas,
+                .trace_on = std.c.getenv("ZINC_TRACE") != null,
+                .profile_on = std.c.getenv("ZINC_PROFILE") != null,
                 .glyphs = std.AutoHashMap(u32, atlas_mod.Baked).init(gpa),
                 .cell_w = ft_face.cell_w,
                 .cell_h = ft_face.cell_h,
@@ -869,8 +875,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         /// Debug: with ZINC_TRACE=1, append raw PTY bytes to
         /// /tmp/zinc-trace.bin for offline escape-stream analysis.
-        fn tracePty(bytes: []const u8) void {
-            if (std.c.getenv("ZINC_TRACE") == null) return;
+        fn tracePty(self: *const Self, bytes: []const u8) void {
+            if (!self.trace_on) return;
             const f = fopen("/tmp/zinc-trace.bin", "ab") orelse return;
             _ = fwrite(bytes.ptr, 1, bytes.len, f);
             _ = fclose(f);
@@ -1843,7 +1849,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.last_cur_col = self.ctx.cursor_col;
                 self.last_cur_row = self.ctx.cursor_row;
             }
-            const is_prof = std.c.getenv("ZINC_PROFILE") != null;
+            const is_prof = self.profile_on;
             const t0: i64 = if (is_prof) context_mod.nowMs() else 0;
             const is_cursor_only = self.cursor_only_render and self.pending_resize == null and self.resize_settle_ms == 0 and self.flow.settled();
             self.cursor_only_render = false;
@@ -1946,7 +1952,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                             self.running = false;
                             break;
                         }
-                        tracePty(pty_buf[0..rrc]);
+                        self.tracePty(pty_buf[0..rrc]);
                         // Parse first, answerQueries second: replies must go
                         // out in byte-arrival order. Capability batches (e.g.
                         // ratatui-image's probe) end with DSR as a terminator;

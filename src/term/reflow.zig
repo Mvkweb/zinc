@@ -76,15 +76,15 @@ fn logReflow(
     if (comptime cfg.scrollback_cap > 0) {
         var i: usize = 0;
         while (i < grid.sb_len) : (i += 1) {
-            const phys = (grid.sb_head + i) % cfg.scrollback_cap;
             aw.writer.print("H{d:4} |", .{i}) catch return;
-            if (grid.sb_rows[phys]) |row| {
+            const row = grid.getScrollbackRow(i);
+            if (row.len > 0) {
                 for (row) |cell| {
                     const v: u32 = cell.rune;
                     const ch: u8 = if (v >= 32 and v < 127) @intCast(v) else '?';
                     aw.writer.print("{c}", .{ch}) catch return;
                 }
-                const w = row.len > 0 and row[row.len - 1].wrapped;
+                const w = row[row.len - 1].wrapped;
                 aw.writer.print("|{s}\n", .{if (w) "[W]" else ""}) catch return;
             } else {
                 aw.writer.print("(null)\n", .{}) catch return;
@@ -132,8 +132,7 @@ pub fn reflowGrid(
 
     if (comptime cfg.scrollback_cap > 0) {
         for (0..sb_count) |i| {
-            const phys = (grid.sb_head + i) % cfg.scrollback_cap;
-            const rslice = grid.sb_rows[phys] orelse &.{};
+            const rslice = grid.getScrollbackRow(i);
             const is_wrap = if (rslice.len > 0) rslice[rslice.len - 1].wrapped else false;
             input_rows[i] = .{
                 .cells = rslice,
@@ -363,69 +362,86 @@ pub fn reflowGrid(
     const st: usize = if (total_lines > new_rows) total_lines - new_rows else 0;
 
     // Free all old rows in scrollback ring
-    if (comptime cfg.scrollback_cap > 0) {
-        for (0..grid.sb_len) |i| {
-            const phys = (grid.sb_head + i) % cfg.scrollback_cap;
-            if (grid.sb_rows[phys]) |old_r| {
-                gpa.free(old_r);
-                grid.sb_rows[phys] = null;
-            }
-        }
-        grid.sb_head = 0;
-        grid.sb_len = 0;
-    }
-
     // Scrollback gets rows 0 .. st (capped at scrollback_cap)
-    if (comptime cfg.scrollback_cap > 0) {
-        const drop_count = if (st > cfg.scrollback_cap) st - cfg.scrollback_cap else 0;
-        for (out_rows.items[0..drop_count]) |old_r| gpa.free(old_r);
-        for (out_rows.items[drop_count..st]) |sb_r| {
-            grid.sb_rows[grid.sb_len] = sb_r;
-            grid.sb_len += 1;
-        }
-    } else {
-        for (out_rows.items[0..st]) |old_r| gpa.free(old_r);
+    const sb_count_new = if (comptime cfg.scrollback_cap > 0)
+        @min(st, cfg.scrollback_cap)
+    else
+        0;
+    const drop_count = if (st > sb_count_new) st - sb_count_new else 0;
+    for (out_rows.items[0..drop_count]) |old_r| gpa.free(old_r);
+
+    // Free all old rows in grid.ring:
+    for (grid.ring) |maybe_r| {
+        if (maybe_r) |r| gpa.free(r);
     }
+    gpa.free(grid.ring);
+
+    // Allocate new ring:
+    const needed = if (cfg.scrollback_cap > 0)
+        cfg.scrollback_cap + @as(usize, new_rows)
+    else
+        @as(usize, new_rows);
+    const new_ring_cap = std.math.ceilPowerOfTwo(usize, @max(16, needed)) catch return error.OutOfMemory;
+    const new_ring_mask = new_ring_cap - 1;
+    const new_ring = try gpa.alloc(?[]C, new_ring_cap);
+    @memset(new_ring, null);
 
     // Live screen gets rows st .. min(st + new_rows, total_lines)
     const copy_lines = @min(total_lines - st, @as(usize, new_rows));
-    const new_cells = try gpa.alloc(C, @as(usize, new_cols) * new_rows);
-    @memset(new_cells, .{ .bg = filler_bg });
-
-    for (0..copy_lines) |line_i| {
-        const src_r = out_rows.items[st + line_i];
-        @memcpy(new_cells[line_i * new_cols .. (line_i + 1) * new_cols], src_r);
-        gpa.free(src_r);
+    for (0..new_rows) |r| {
+        if (r < copy_lines) {
+            new_ring[r] = out_rows.items[st + r];
+        } else {
+            const blank_r = try gpa.alloc(C, new_cols);
+            @memset(blank_r, .{ .bg = filler_bg });
+            new_ring[r] = blank_r;
+        }
     }
 
-    // Free any remaining rows in out_rows past the visible screen
+    // Scrollback rows installed before offset 0:
+    for (0..sb_count_new) |i| {
+        const k = sb_count_new - i;
+        const phys = (new_ring_cap - k) & new_ring_mask;
+        new_ring[phys] = out_rows.items[drop_count + i];
+    }
+
     for (out_rows.items[st + copy_lines ..]) |extra_r| {
         gpa.free(extra_r);
     }
     out_rows.deinit(gpa);
 
-    grid.gpa.free(grid.cells);
-    grid.cells = new_cells;
-    grid.top = 0; // fresh linear layout
+    grid.ring = new_ring;
+    grid.ring_mask = new_ring_mask;
+    grid.offset = 0;
+    grid.sb_len = sb_count_new;
 
     // Alt-screen crop
-    if (cfg.alt_screen and grid.alt_cells.len > 0) {
-        const new_alt = try grid.gpa.alloc(C, @as(usize, new_cols) * new_rows);
-        @memset(new_alt, .{ .bg = filler_bg });
+    if (cfg.alt_screen and grid.alt_ring.len > 0) {
+        const alt_needed: usize = @as(usize, new_rows);
+        const alt_cap = std.math.ceilPowerOfTwo(usize, @max(16, alt_needed)) catch return error.OutOfMemory;
+        const alt_mask = alt_cap - 1;
+        const new_alt = try grid.gpa.alloc(?[]C, alt_cap);
+        @memset(new_alt, null);
         const copy_c = @min(new_cols, old_cols);
         const copy_r = @min(new_rows, old_rows);
-        var ar: u16 = 0;
-        while (ar < copy_r) : (ar += 1) {
-            var prow: usize = @as(usize, grid.alt_top) + ar;
-            if (prow >= old_rows) prow -= old_rows;
-            @memcpy(
-                new_alt[@as(usize, ar) * new_cols ..][0..copy_c],
-                grid.alt_cells[prow * old_cols ..][0..copy_c],
-            );
+        for (0..new_rows) |r| {
+            const new_r = try grid.gpa.alloc(C, new_cols);
+            @memset(new_r, .{ .bg = filler_bg });
+            if (r < copy_r) {
+                const old_phys = (grid.alt_offset + r) & grid.alt_ring_mask;
+                if (grid.alt_ring[old_phys]) |old_r| {
+                    @memcpy(new_r[0..copy_c], old_r[0..copy_c]);
+                }
+            }
+            new_alt[r] = new_r;
         }
-        grid.gpa.free(grid.alt_cells);
-        grid.alt_cells = new_alt;
-        grid.alt_top = 0;
+        for (grid.alt_ring) |maybe_r| {
+            if (maybe_r) |r| grid.gpa.free(r);
+        }
+        grid.gpa.free(grid.alt_ring);
+        grid.alt_ring = new_alt;
+        grid.alt_ring_mask = alt_mask;
+        grid.alt_offset = 0;
     }
 
     cursor_row.* = @intCast(std.math.clamp(@as(i64, @intCast(cursor_line)) - @as(i64, @intCast(st)), 0, new_rows - 1));
@@ -669,7 +685,7 @@ test "mixed-width scrollback heals even on height-only resize" {
     try std.testing.expectEqual(@as(u16, 4), g.cols);
     try std.testing.expectEqual(@as(u16, 3), g.rows);
     try std.testing.expectEqual(@as(usize, 1), g.sb_len);
-    const h0 = g.sb_rows[g.sb_head] orelse return error.Fail;
+    const h0 = g.getScrollbackRow(0);
     try std.testing.expectEqual(@as(usize, 4), h0.len);
     try std.testing.expectEqual(@as(u32, 'A'), h0[0].rune);
     try std.testing.expectEqual(@as(u32, 'X'), g.at(0, 0).rune);
