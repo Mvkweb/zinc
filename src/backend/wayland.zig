@@ -289,6 +289,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
         copy_anchor_arow: usize = 0,
         copy_anchor_acol: u16 = 0,
         copy_selecting: bool = false,
+        /// Dirty-row render bookkeeping: last painted overlay bits (any
+        /// change forces a full repaint — overlays paint without cell
+        /// writes) and last painted cursor cell (motion without writes
+        /// would ghost; both rows repaint instead).
+        last_overlay: u32 = 0,
+        last_cur_col: u16 = 0,
+        last_cur_row: u16 = 0,
         /// Runtime badge knobs (file config overrides comptime defaults).
         find_numbers: bool = cfg.find_match_numbers,
         find_num_scale: u8 = cfg.find_number_scale,
@@ -336,6 +343,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
         ptr_serial: u32 = 0,
         /// Current server cursor shape (0 = unset / needs refresh; see P.cursor_shape.SHAPE_*).
         cursor_shape: u32 = 0,
+        /// Debug knobs, read from the environment ONCE at open (never in
+        /// the PTY/render hot path: getenv scans environ per call).
+        trace_on: bool = false,
+        profile_on: bool = false,
 
         xkb_ctx: ?*XkbContext = null,
         xkb_map: ?*XkbKeymap = null,
@@ -459,6 +470,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .ft_face = ft_face,
                 .atlas = atlas,
                 .color_atlas = color_atlas,
+                .trace_on = std.c.getenv("ZINC_TRACE") != null,
+                .profile_on = std.c.getenv("ZINC_PROFILE") != null,
                 .glyphs = std.AutoHashMap(u32, atlas_mod.Baked).init(gpa),
                 .cell_w = ft_face.cell_w,
                 .cell_h = ft_face.cell_h,
@@ -862,8 +875,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         /// Debug: with ZINC_TRACE=1, append raw PTY bytes to
         /// /tmp/zinc-trace.bin for offline escape-stream analysis.
-        fn tracePty(bytes: []const u8) void {
-            if (std.c.getenv("ZINC_TRACE") == null) return;
+        fn tracePty(self: *const Self, bytes: []const u8) void {
+            if (!self.trace_on) return;
             const f = fopen("/tmp/zinc-trace.bin", "ab") orelse return;
             _ = fwrite(bytes.ptr, 1, bytes.len, f);
             _ = fclose(f);
@@ -1203,6 +1216,14 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
         }
 
+        /// Any dirty cell on a live row (dirty-row render gate).
+        fn rowDirty(self: *Self, row: u16) bool {
+            for (self.ctx.grid.rowSlice(row)) |*cell| {
+                if (cell.dirty) return true;
+            }
+            return false;
+        }
+
         fn renderCells(self: *Self) software.Damage {
             var dmg = software.Damage{};
             const W: u32 = @intCast(self.width);
@@ -1213,7 +1234,26 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const cw = self.cell_w;
             const ch = self.cell_h;
             const bg_all = self.themed(self.ctx.bg, true);
-            software.fillRect(self.pool_pixels, W, H, 0, 0, W, H, bg_all, &dmg);
+            const voff: usize = @min(self.ctx.grid.view_offset, self.ctx.grid.sb_len);
+            // Dirty-row gate: repaint everything unless the frame is provably
+            // a quiet text update (settled flow, live view, no overlays or
+            // images). Anything fancy falls back to today's full repaint,
+            // so the fast path cannot stale a pixel it doesn't understand.
+            const full =
+                self.ctx.grid.dirty_all or
+                !self.flow.settled() or
+                self.pending_resize != null or
+                self.resize_settle_ms > 0 or
+                voff != 0 or
+                (cfg.find and self.find_active) or
+                (cfg.selection and self.sel.active) or
+                (cfg.hyperlinks and self.hover_active and self.ctrlHeld()) or
+                (cfg.copy_mode and self.copy_active) or
+                (self.trail_ms > 0 and self.flow.trail_n > 0) or
+                (cfg.kitty_gfx and self.ctx.images.placements.items.len > 0);
+            if (full) {
+                software.fillRect(self.pool_pixels, W, H, 0, 0, W, H, bg_all, &dmg);
+            }
 
             const visible_cols = @min(self.ctx.grid.cols, @as(u16, @intCast(@max(0, @divFloor(self.width - px, cw)))));
             const visible_rows = @min(self.ctx.grid.rows, @as(u16, @intCast(@max(0, @divFloor(self.height - py, ch)))));
@@ -1233,9 +1273,27 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Tier 0 images (below cell backgrounds).
             self.blitImageTier(0, W, H, px, py, cw, ch, visible_cols, visible_rows, &dmg);
 
-            // Pass 1: non-default cell backgrounds (default bg was filled above).
+            // Pass 1: row background bands (default bg base) + non-default
+            // cell blocks. Clean rows are skipped entirely on quiet frames.
             var row: u16 = 0;
             while (row < row_end) : (row += 1) {
+                if (!full and !self.rowDirty(row)) continue;
+                if (!full and cw > 0 and ch > 0 and px >= 0) {
+                    const syb: i32 = py + @as(i32, row) * ch + fyshift;
+                    if (syb >= 0 and syb < @as(i32, @intCast(H))) {
+                        software.fillRect(
+                            self.pool_pixels,
+                            W,
+                            H,
+                            @intCast(px),
+                            @intCast(syb),
+                            @as(u32, visible_cols) * @as(u32, @intCast(cw)),
+                            @intCast(ch),
+                            bg_all,
+                            &dmg,
+                        );
+                    }
+                }
                 var col: u16 = 0;
                 while (col < visible_cols) : (col += 1) {
                     const cell_ptr = self.ctx.grid.viewCell(col, row) orelse continue;
@@ -1274,11 +1332,16 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
             // Tier 1 images (below text, above cell backgrounds).
             self.blitImageTier(1, W, H, px, py, cw, ch, visible_cols, visible_rows, &dmg);
-            // Pass 2: glyphs, combining marks, underlines.
+            // Pass 2: glyphs, combining marks, underlines. Painted rows are
+            // claimed clean up front (anything repainted from here is fresh).
+            // Ctrl+hover is hoisted: xkb state can't change mid-frame.
+            const link_hover_armed = cfg.hyperlinks and self.hover_active and self.ctrlHeld();
             row = 0;
             while (row < row_end) : (row += 1) {
+                if (!full and !self.rowDirty(row)) continue;
+                for (self.ctx.grid.rowSlice(row)) |*cell| cell.dirty = false;
                 // Ctrl+hover hyperlink span on this row (if any).
-                const link_hover = cfg.hyperlinks and self.hover_active and row == self.hover_row and self.ctrlHeld();
+                const link_hover = link_hover_armed and row == self.hover_row;
                 var col: u16 = 0;
                 while (col < visible_cols) : (col += 1) {
                     // Wide-char follower column belongs to the previous cell.
@@ -1533,6 +1596,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (cfg.find and self.find_active and visible_rows > 0) {
                 self.drawFindBar(W, H, px, py, cw, ch, visible_cols, visible_rows, &dmg);
             }
+            // Full repaint painted everything: clear all flags so later
+            // dirty-row frames stay truthful. (Dirty path clears rows as
+            // it paints them, above.)
+            if (full) self.ctx.grid.markAllClean();
             return dmg;
         }
 
@@ -1751,7 +1818,38 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const view_live = voff == 0 and !self.copy_active;
             const flow_visible = (!(self.ctx.decscusr_blink orelse self.cursor_blink) or self.ctx.blink_visible) and self.ctx.show_cursor and view_live;
             self.flow.step(flow_now, self.ctx.cursor_col, self.ctx.cursor_row, voff, flow_visible, !view_live, self.cell_w, self.cell_h, self.glide, self.glide_ms, self.trail_ms, self.smooth_scroll, self.smooth_scroll_ms);
-            const is_prof = std.c.getenv("ZINC_PROFILE") != null;
+            // Overlay-change detection: selection/find/hover/copy/shape
+            // toggles alter pixels without cell writes. Any change forces
+            // a full repaint (one bitmask compare per frame, covers all
+            // present and future overlay sites).
+            var ob: u32 = 0;
+            if (self.find_active) ob |= 1;
+            if (self.sel.active) ob |= 2;
+            if (self.copy_active) ob |= 4;
+            if (self.hover_active) ob |= 8;
+            if (self.ctx.show_cursor) ob |= 16;
+            if (self.ctx.focused) ob |= 32;
+            if (self.trail_ms > 0 and self.flow.trail_n > 0) ob |= 64;
+            if (voff != 0) ob |= 128;
+            // Image placements paint over text without cell writes; a
+            // removed last image must repaint the text beneath (ghost
+            // otherwise). Presence bit transitions force that frame.
+            if (cfg.kitty_gfx and self.ctx.images.placements.items.len > 0) ob |= 256;
+            ob |= @as(u32, @intFromEnum(self.ctx.decscusr_style orelse .block)) << 8;
+            if (self.ctx.decscusr_blink orelse false) ob |= 0x1000;
+            if (ob != self.last_overlay) {
+                self.ctx.grid.markAllDirty();
+                self.last_overlay = ob;
+            }
+            // Cursor motion without cell writes (CUP over clean area) would
+            // ghost the block: repaint the rows it left and entered instead.
+            if (self.ctx.cursor_col != self.last_cur_col or self.ctx.cursor_row != self.last_cur_row) {
+                self.ctx.grid.markRowsDirty(self.last_cur_row, self.last_cur_row);
+                self.ctx.grid.markRowsDirty(self.ctx.cursor_row, self.ctx.cursor_row);
+                self.last_cur_col = self.ctx.cursor_col;
+                self.last_cur_row = self.ctx.cursor_row;
+            }
+            const is_prof = self.profile_on;
             const t0: i64 = if (is_prof) context_mod.nowMs() else 0;
             const is_cursor_only = self.cursor_only_render and self.pending_resize == null and self.resize_settle_ms == 0 and self.flow.settled();
             self.cursor_only_render = false;
@@ -1800,7 +1898,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         pub fn run(self: *Self) void {
             const wl_fd = c.wl_display_get_fd(self.display);
-            var pty_buf: [4096]u8 = undefined;
+            // 64KB reads: the pipe holds 64KB, so one syscall gulps a full
+            // drain and writers do full-size bursts instead of partial-write
+            // churn on a perpetually near-full buffer (zt parity).
+            var pty_buf: [65536]u8 = undefined;
             while (self.running) {
                 while (c.wl_display_prepare_read(self.display) != 0) {
                     _ = c.wl_display_dispatch_pending(self.display);
@@ -1813,6 +1914,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 };
                 const nfds: usize = if (self.repeat_fd >= 0) 3 else 2;
                 var poll_timeout: i32 = self.ctx.getTimeoutMs();
+                if (self.needs_render and !self.frame_pending) {
+                    poll_timeout = 0;
+                } else if (self.needs_render) {
+                    poll_timeout = if (poll_timeout < 0) 16 else @min(poll_timeout, 16);
+                }
                 if (self.resize_settle_ms > 0) {
                     const now = context_mod.nowMs();
                     if (now >= self.resize_settle_ms) {
@@ -1837,16 +1943,16 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 if ((fds[1].revents & linux.POLL.IN) != 0) {
                     self.markActivity();
                     self.cursor_only_render = false;
-                    var iters: u8 = 0;
-                    while (iters < 4) : (iters += 1) {
+                    const drain_t0 = context_mod.nowMs();
+                    while (true) {
                         const rrc = linux.read(self.pty_fd, &pty_buf, pty_buf.len);
                         const rerr = linux.errno(rrc);
-                        if (rerr != .SUCCESS) break;
-                        if (rrc == 0) {
+                        if (rerr == .AGAIN) break;
+                        if (rerr != .SUCCESS or rrc == 0) {
                             self.running = false;
                             break;
                         }
-                        tracePty(pty_buf[0..rrc]);
+                        self.tracePty(pty_buf[0..rrc]);
                         // Parse first, answerQueries second: replies must go
                         // out in byte-arrival order. Capability batches (e.g.
                         // ratatui-image's probe) end with DSR as a terminator;
@@ -1867,7 +1973,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                             self.handleAltChange();
                         }
                         self.needs_render = true;
-                        if (rrc < pty_buf.len) break;
+                        if (context_mod.nowMs() - drain_t0 >= 8) break;
                     }
                 }
                 if (nfds == 3 and (fds[2].revents & linux.POLL.IN) != 0) {

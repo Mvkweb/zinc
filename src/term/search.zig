@@ -60,17 +60,13 @@ pub const Pos = struct { row: usize, col: u16 };
 fn absRune(grid: anytype, abs: usize, sb_len: usize, cols: usize, col: usize) ?u32 {
     if (col >= cols) return null;
     if (abs < sb_len) {
-        const cap: usize = grid.sb_rows.len;
-        if (cap == 0) return null;
-        const slice = grid.sb_rows[(grid.sb_head + abs) % cap] orelse return null;
+        const slice = grid.getScrollbackRow(abs);
         if (col >= slice.len) return null;
-        const v: u32 = slice[col].rune;
-        return v;
+        return slice[col].rune;
     }
     const r = abs - sb_len;
     if (r >= grid.rows) return null;
-    const v: u32 = grid.cells[r * cols + col].rune;
-    return v;
+    return grid.rowSlice(@intCast(r))[col].rune;
 }
 
 fn absClass(grid: anytype, abs: usize, sb_len: usize, cols: usize, col: usize) selection_mod.CharClass {
@@ -270,35 +266,19 @@ fn appendCell(t: *RowText, gpa: std.mem.Allocator, cell: anytype, col: u16, abs:
 /// Append one physical row's text (trailing blanks kept here; the logical
 /// line trims once at the end). Returns whether the row soft-wraps onward.
 fn appendRow(grid: anytype, abs: usize, sb_len: usize, cols: usize, t: *RowText, gpa: std.mem.Allocator) !bool {
-    if (abs < sb_len) {
-        const cap: usize = grid.sb_rows.len;
-        if (cap == 0) return false;
-        const phys = (grid.sb_head + abs) % cap;
-        const slice = grid.sb_rows[phys] orelse return false;
-        const n = @min(cols, slice.len);
-        var prev_wide = false;
-        var c: usize = 0;
-        while (c < n) : (c += 1) {
-            const v: u32 = slice[c].rune;
-            const wide_here = utf8_mod.isWide(@intCast(v));
-            if (prev_wide) {
-                prev_wide = wide_here;
-                continue;
-            }
-            prev_wide = wide_here;
-            try appendCell(t, gpa, slice[c], @intCast(c), abs);
-        }
-        if (n == 0) return false;
-        return slice[n - 1].wrapped;
-    }
-    const r = abs - sb_len;
-    const live_rows: usize = grid.rows;
-    if (r >= live_rows) return false;
-    const cells = grid.cells;
+    const row_slice = if (abs < sb_len)
+        grid.getScrollbackRow(abs)
+    else blk: {
+        const r = abs - sb_len;
+        if (r >= grid.rows) return false;
+        break :blk grid.rowSlice(@intCast(r));
+    };
+    if (row_slice.len == 0) return false;
+    const n = @min(cols, row_slice.len);
     var prev_wide = false;
     var c: usize = 0;
-    while (c < cols) : (c += 1) {
-        const cell = cells[r * cols + c];
+    while (c < n) : (c += 1) {
+        const cell = row_slice[c];
         const v: u32 = cell.rune;
         const wide_here = utf8_mod.isWide(@intCast(v));
         if (prev_wide) {
@@ -308,7 +288,7 @@ fn appendRow(grid: anytype, abs: usize, sb_len: usize, cols: usize, t: *RowText,
         prev_wide = wide_here;
         try appendCell(t, gpa, cell, @intCast(c), abs);
     }
-    return cells[r * cols + cols - 1].wrapped;
+    return row_slice[n - 1].wrapped;
 }
 
 fn trimRight(t: *RowText) void {
@@ -366,10 +346,9 @@ pub fn findAll(gpa: std.mem.Allocator, grid: anytype, query: []const u8, max: us
 }
 
 fn setCell(g: anytype, cols: usize, abs_row: usize, sb_len: usize, col: usize, rune: u21, wrapped: bool) void {
+    _ = cols;
     if (abs_row < sb_len) {
-        const cap: usize = g.sb_rows.len;
-        const phys = (g.sb_head + abs_row) % cap;
-        if (g.sb_rows[phys]) |slice| {
+        if (g.getScrollbackRowMut(abs_row)) |slice| {
             if (col < slice.len) {
                 slice[col].rune = @intCast(rune);
                 slice[col].wrapped = wrapped;
@@ -378,8 +357,9 @@ fn setCell(g: anytype, cols: usize, abs_row: usize, sb_len: usize, col: usize, r
         return;
     }
     const r = abs_row - sb_len;
-    g.cells[r * cols + col].rune = @intCast(rune);
-    g.cells[r * cols + col].wrapped = wrapped;
+    const cell = g.at(@intCast(col), @intCast(r));
+    cell.rune = @intCast(rune);
+    cell.wrapped = wrapped;
 }
 
 fn putStr(g: anytype, cols: usize, abs_row: usize, sb_len: usize, col0: usize, s: []const u8, wrap_last: bool) void {

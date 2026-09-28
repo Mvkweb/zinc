@@ -34,6 +34,11 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         grid: grid_mod.Grid(cfg),
         parser: parser_mod.Parser = .{},
         pen: sgr_mod.Attr = .{},
+        /// Resolved pen baked into a blank cell: the ASCII fast path stamps
+        /// this per char instead of re-resolving colors/attrs every time.
+        /// Refreshed by refreshPenCell on every pen mutation (SGR, reset).
+        /// Default-constructed == default pen, so no init call is needed.
+        pen_cell: cell_mod.Cell(cfg) = .{},
         cursor_col: u16 = 0,
         cursor_row: u16 = 0,
         /// Cell pixel size for kitty image cursor-advance math. Set by the
@@ -777,6 +782,30 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     i = idx;
                     continue;
                 }
+                // ASCII fast path (ground state, printable + newline + CR):
+                // bypasses parser.feed + apply dispatch for the bulk of output.
+                // Printable spans stamp whole runs via putAsciiRun (one row
+                // slice, one memset, per-byte runes); seams (wrap, IRM,
+                // control bytes) stay on the per-char path.
+                if (self.parser.state == .ground) {
+                    if (b >= 0x20 and b <= 0x7E and !self.pending_wrap and !self.insert_mode and self.cursor_col < self.grid.cols) {
+                        const max_run = @min(data.len - i, @as(usize, self.grid.cols) - self.cursor_col);
+                        var n: usize = 1;
+                        while (n < max_run and data[i + n] >= 0x20 and data[i + n] <= 0x7E) n += 1;
+                        self.putAsciiRun(data[i .. i + n]);
+                        i += n;
+                        continue;
+                    } else if (b == '\n') {
+                        self.linefeed();
+                        i += 1;
+                        continue;
+                    } else if (b == '\r') {
+                        self.cursor_col = 0;
+                        self.pending_wrap = false;
+                        i += 1;
+                        continue;
+                    }
+                }
                 const act = self.parser.feed(b);
                 i += 1;
                 if (act) |a| self.apply(a);
@@ -894,19 +923,29 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 },
                 'J' => self.eraseDisplay(n(params, 0, 0)),
                 'K' => self.eraseLine(n(params, 0, 0)),
-                'm' => sgr_mod.applySgr(&self.pen, params, sub),
+                'm' => {
+                    sgr_mod.applySgr(&self.pen, params, sub);
+                    self.refreshPenCell();
+                },
                 's' => {
                     self.saved_col = self.cursor_col;
                     self.saved_row = self.cursor_row;
                     self.saved_wrap = self.pending_wrap;
                 },
                 'u' => {
+                    // SCO restore cursor — plain CSI u only. Priv-marked
+                    // ?u (kitty keyboard query, answered in answerQueries)
+                    // must never teleport the cursor (fish sends it every
+                    // prompt; it used to yank the cursor to (0,0)).
+                    if (priv) return;
                     self.cursor_col = @min(self.saved_col, self.grid.cols -| 1);
                     self.cursor_row = @min(self.saved_row, self.grid.rows -| 1);
                     self.pending_wrap = self.saved_wrap and self.saved_col < self.grid.cols and self.saved_row < self.grid.rows;
                 },
                 'q' => { // DECSCUSR: 0 restores default; 1/2 block,
                     // 3/4 underline, 5/6 bar (odd = blink, even = steady).
+                    // Priv-marked queries (?q) are not cursor-style requests.
+                    if (priv) return;
                     switch (n(params, 0, 0)) {
                         0 => {
                             self.decscusr_style = null;
@@ -994,16 +1033,15 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
         }
 
-        /// Switch to the alternate screen (TUI mode). O(1) slice swap.
+        /// Switch to the alternate screen (TUI mode). O(1) swap.
         fn enterAlt(self: *Self) void {
-            if (!cfg.alt_screen or self.alt_active or self.grid.alt_cells.len == 0) return;
+            if (!cfg.alt_screen or self.alt_active or self.grid.alt_ring.len == 0) return;
             self.alt_saved_col = self.cursor_col;
             self.alt_saved_row = self.cursor_row;
             self.alt_saved_wrap = self.pending_wrap;
-            std.mem.swap(@TypeOf(self.grid.cells), &self.grid.cells, &self.grid.alt_cells);
+            self.grid.swapAlt();
             self.alt_active = true;
-            self.grid.view_offset = 0;
-            @memset(self.grid.cells, .{});
+            self.grid.clearScreen(.{});
             self.cursor_col = 0;
             self.cursor_row = 0;
             self.pending_wrap = false;
@@ -1015,7 +1053,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// Back to the main screen, restoring the saved cursor.
         fn exitAlt(self: *Self) void {
             if (!self.alt_active) return;
-            std.mem.swap(@TypeOf(self.grid.cells), &self.grid.cells, &self.grid.alt_cells);
+            self.grid.swapAlt();
             self.alt_active = false;
             self.cursor_col = @min(self.alt_saved_col, self.grid.cols -| 1);
             self.cursor_row = @min(self.alt_saved_row, self.grid.rows -| 1);
@@ -1179,7 +1217,47 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// kitty keyboard) via the write callback. Same coverage as the
         /// smoke harness; the overlap window catches split reads.
         pub fn answerQueries(self: *Self, chunk: []const u8) void {
-            var window: [4112]u8 = undefined;
+            // Fast path: every query contains ESC. With no ESC in the
+            // overlap tail or the chunk there is nothing to answer; just
+            // advance the overlap tail exactly like the slow path below
+            // (last 16 bytes) and return. One memchr replaces ~10 scans
+            // plus a window copy on data chunks.
+            if (std.mem.indexOfScalar(u8, chunk, 0x1B) == null) {
+                var tail_esc = false;
+                for (self.q_overlap[0..self.q_overlap_len]) |b| {
+                    if (b == 0x1B) {
+                        tail_esc = true;
+                        break;
+                    }
+                }
+                if (!tail_esc) {
+                    if (chunk.len >= 16) {
+                        @memcpy(self.q_overlap[0..16], chunk[chunk.len - 16 ..]);
+                        self.q_overlap_len = 16;
+                    } else if (chunk.len > 0) {
+                        const total = self.q_overlap_len + chunk.len;
+                        if (total <= 16) {
+                            @memcpy(self.q_overlap[self.q_overlap_len..][0..chunk.len], chunk);
+                            self.q_overlap_len = total;
+                        } else {
+                            const drop = total - 16;
+                            if (drop >= self.q_overlap_len) {
+                                @memcpy(self.q_overlap[0..16], chunk[drop - self.q_overlap_len ..][0..16]);
+                            } else {
+                                const keep_old = self.q_overlap_len - drop;
+                                std.mem.copyForwards(u8, self.q_overlap[0..keep_old], self.q_overlap[drop..self.q_overlap_len]);
+                                @memcpy(self.q_overlap[keep_old..][0..chunk.len], chunk);
+                            }
+                            self.q_overlap_len = 16;
+                        }
+                    }
+                    return;
+                }
+            }
+            // Window fits a 16-byte overlap tail plus one full 64KB PTY
+            // read; larger chunks would smash the stack (callers cap reads).
+            std.debug.assert(chunk.len <= 65536);
+            var window: [16 + 65536]u8 = undefined;
             @memcpy(window[0..self.q_overlap_len], self.q_overlap[0..self.q_overlap_len]);
             @memcpy(window[self.q_overlap_len..][0..chunk.len], chunk);
             const win = window[0 .. self.q_overlap_len + chunk.len];
@@ -1250,6 +1328,103 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             return @intCast(v);
         }
 
+        /// Re-resolve the pen into the ASCII fast-path template. Called on
+        /// every pen mutation (SGR, reset); mirrors putCodepoint's resolve.
+        fn refreshPenCell(self: *Self) void {
+            const fg = self.resolveColor(self.pen.fg);
+            self.pen_cell.fg = fg;
+            self.pen_cell.bg = self.resolveColor(self.pen.bg);
+            self.pen_cell.ul_color = switch (self.pen.ul.kind) {
+                .default => fg,
+                else => self.resolveColor(self.pen.ul),
+            };
+            self.pen_cell.ul_style = if (!self.pen.underline) .none else switch (self.pen.ul_style) {
+                2 => .double,
+                3 => .curly,
+                4 => .dotted,
+                5 => .dashed,
+                else => .single,
+            };
+            self.pen_cell.attr = .{
+                .bold = self.pen.bold,
+                .italic = self.pen.italic,
+                .underline = self.pen.underline,
+                .blink = self.pen.blink,
+                .reverse = self.pen.reverse,
+                .strikethrough = self.pen.strikethrough,
+                .dim = self.pen.dim,
+                .invisible = self.pen.invisible,
+            };
+        }
+
+        /// ASCII fast path (0x20..0x7E, ground state only): the parser
+        /// dispatch and every non-ASCII-only check collapse into a template
+        /// stamp. Combining/VS16/wide/style faces are all impossible below
+        /// 0x80 (wide starts at U+1100, combining at U+300, diacritics at
+        /// U+305 — the table floor is pinned at compile time). Seams
+        /// (pending wrap, IRM, overflow) delegate to the full path.
+        fn putAscii(self: *Self, byte: u8) void {
+            if (self.pending_wrap or self.cursor_col >= self.grid.cols or self.insert_mode) {
+                self.putCodepoint(byte);
+                return;
+            }
+            const row = self.grid.rowSlice(self.cursor_row);
+            const col = self.cursor_col;
+            if (col == 0) {
+                row[self.grid.cols - 1].wrapped = false;
+            } else {
+                const prev = &row[col - 1];
+                if (cellCp(prev.rune) >= 0x1100 and utf8_mod.isWide(cellCp(prev.rune))) prev.* = self.penBlank();
+            }
+            const cell = &row[col];
+            cell.* = self.pen_cell;
+            cell.setRune(byte);
+            if (cfg.hyperlinks) {
+                cell.has_link = self.cur_link != 0;
+                cell.link_idx = self.cur_link;
+            }
+            if (col + 1 < self.grid.cols) {
+                self.cursor_col = col + 1;
+            } else {
+                self.pending_wrap = true;
+            }
+        }
+
+        /// ASCII run stamp: bytes are all 0x20..0x7E, ground state, no
+        /// pending wrap, no IRM, cursor inside the line, run capped at the
+        /// line end — so wrap/linefeed stay on the per-char path. Stale
+        /// wide leads (only possible directly before the run) and an open
+        /// OSC 8 link are handled; wide/combining/diacritics are all
+        /// impossible inside the run (floors at U+300/U+305/U+1100).
+        /// Byte-for-byte equivalent to putAscii per char.
+        fn putAsciiRun(self: *Self, bytes: []const u8) void {
+            const cols = self.grid.cols;
+            const col: usize = self.cursor_col;
+            const n = bytes.len; // <= cols - col by contract
+            const row = self.grid.rowSlice(self.cursor_row);
+            if (col == 0) {
+                row[cols - 1].wrapped = false;
+            } else {
+                const pv = row[col - 1].rune;
+                if (cellCp(pv) >= 0x1100 and utf8_mod.isWide(cellCp(pv))) row[col - 1] = self.penBlank();
+            }
+            @memset(row[col .. col + n], self.pen_cell);
+            for (bytes, 0..) |b, k| row[col + k].setRune(b);
+            if (cfg.hyperlinks and self.cur_link != 0) {
+                for (row[col .. col + n]) |*c| {
+                    c.has_link = true;
+                    c.link_idx = self.cur_link;
+                }
+            }
+            if (col + n < cols) {
+                self.cursor_col = @intCast(col + n);
+            } else {
+                // Sit on the last column with the wrap pending (putAscii parity).
+                self.cursor_col = cols - 1;
+                self.pending_wrap = true;
+            }
+        }
+
         fn putCodepoint(self: *Self, cp: u21) void {
             if (self.pending_wrap or self.cursor_col >= self.grid.cols) {
                 // Deferred soft-wrap: the previous print filled the last
@@ -1263,15 +1438,16 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
             // IRM (CSI 4 h): shift the row right before placing.
             if (self.insert_mode and self.cursor_col + 1 < self.grid.cols) {
-                const CellT = @TypeOf(self.grid.cells[0]);
-                const off = @as(usize, self.cursor_row) * self.grid.cols;
+                const CellT = cell_mod.Cell(cfg);
+                const row = self.grid.rowSlice(self.cursor_row);
                 const col = self.cursor_col;
-                std.mem.copyBackwards(CellT, self.grid.cells[off + col + 1 .. off + self.grid.cols], self.grid.cells[off + col .. off + self.grid.cols - 1]);
+                std.mem.copyBackwards(CellT, row[col + 1 ..], row[col .. row.len - 1]);
             }
             // Combining marks attach to the preceding cell instead of
             // overwriting it (kitty unicode-placeholder diacritics ride
-            // here); they never advance the cursor.
-            if (utf8_mod.isCombining(cp) or placeholder_mod.isDiacritic(cp)) {
+            // here); they never advance the cursor. Guarded below U+300:
+            // nothing combinable or diacritic lives down there.
+            if (cp >= 0x300 and (utf8_mod.isCombining(cp) or placeholder_mod.isDiacritic(cp))) {
                 const base_col = if (self.pending_wrap or self.cursor_col == 0) self.cursor_col else self.cursor_col - 1;
                 const mark_cell = self.grid.at(base_col, self.cursor_row);
                 if (mark_cell.combining_count < cfg.font_max_combining) {
@@ -1319,6 +1495,13 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
             const cell = self.grid.at(self.cursor_col, self.cursor_row);
             cell.setRune(cp);
+            // A shorter overwrite must not inherit the previous line's wrap
+            // continuation: reflow joins rows on the last cell's flag only,
+            // so void it whenever this write stops short of it (genuine
+            // wraps re-arm via pending_wrap on the next char regardless).
+            if (self.cursor_col + 1 < self.grid.cols) {
+                self.grid.at(self.grid.cols - 1, self.cursor_row).wrapped = false;
+            }
             const fg = self.resolveColor(self.pen.fg);
             cell.fg = fg;
             cell.bg = self.resolveColor(self.pen.bg);
@@ -1386,8 +1569,8 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// Blank cell for erase ops (BCE): space with the current pen
         /// background, everything else default. Our TERM claims bce, so
         /// EL/ED/scroll/IL/DL fills use the pen bg, never defaults.
-        fn penBlank(self: *const Self) @TypeOf(self.grid.cells[0]) {
-            const CellT = @TypeOf(self.grid.cells[0]);
+        fn penBlank(self: *const Self) cell_mod.Cell(cfg) {
+            const CellT = cell_mod.Cell(cfg);
             return CellT{ .bg = self.resolveColor(self.pen.bg) };
         }
 
@@ -1470,15 +1653,14 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 self.shiftPlacements(0, self.grid.rows -| 1, true);
                 return;
             }
-            var r = self.scroll_top;
+            // Offset-safe: move whole logical rows via slices (each row is
+            // contiguous; logical adjacency need not be physical).
+            var r: u16 = self.scroll_top;
             while (r < self.scroll_bot) : (r += 1) {
-                const dst = @as(usize, r) * self.grid.cols;
-                const src = @as(usize, r + 1) * self.grid.cols;
-                @memcpy(self.grid.cells[dst..][0..self.grid.cols], self.grid.cells[src..][0..self.grid.cols]);
+                @memcpy(self.grid.rowSlice(r), self.grid.rowSlice(r + 1));
             }
-            const last = @as(usize, self.scroll_bot) * self.grid.cols;
-            const blank = self.penBlank();
-            @memset(self.grid.cells[last..][0..self.grid.cols], blank);
+            @memset(self.grid.rowSlice(self.scroll_bot), self.penBlank());
+            self.grid.markRowsDirty(self.scroll_top, self.scroll_bot);
             self.shiftPlacements(self.scroll_top, self.scroll_bot, true);
         }
 
@@ -1513,13 +1695,12 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// One row of region scroll-down (shared by reverse-index and SD).
         fn scrollRegionDown(self: *Self) void {
             const blank = self.penBlank();
-            var r = self.scroll_bot;
+            var r: u16 = self.scroll_bot;
             while (r > self.scroll_top) : (r -= 1) {
-                const dst = @as(usize, r) * self.grid.cols;
-                const src = @as(usize, r - 1) * self.grid.cols;
-                @memcpy(self.grid.cells[dst..][0..self.grid.cols], self.grid.cells[src..][0..self.grid.cols]);
+                @memcpy(self.grid.rowSlice(r), self.grid.rowSlice(r - 1));
             }
-            @memset(self.grid.cells[@as(usize, self.scroll_top) * self.grid.cols ..][0..self.grid.cols], blank);
+            @memset(self.grid.rowSlice(self.scroll_top), blank);
+            self.grid.markRowsDirty(self.scroll_top, self.scroll_bot);
             self.shiftPlacements(self.scroll_top, self.scroll_bot, false);
         }
 
@@ -1530,21 +1711,26 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// panics on aliasing rows).
         fn insertLines(self: *Self, count: u16) void {
             if (count == 0 or self.cursor_row > self.scroll_bot) return;
-            const CellT = @TypeOf(self.grid.cells[0]);
-            const cols: usize = self.grid.cols;
-            const top: usize = @max(self.cursor_row, self.scroll_top);
-            const bot: usize = self.scroll_bot;
-            const h: usize = bot -| top +| 1;
+            const top: u16 = @max(self.cursor_row, self.scroll_top);
+            const bot: u16 = self.scroll_bot;
+            const h: usize = @as(usize, bot) -| top +| 1;
             const n: usize = @min(@as(usize, count), h);
+            const nu16: u16 = @intCast(n);
+            // Offset-safe: shift whole logical rows down (physical rows are
+            // distinct slices, so plain per-row copies are exact).
             if (n < h) {
-                const len = (h - n) * cols;
-                std.mem.copyBackwards(CellT, self.grid.cells[(top + n) * cols ..][0..len], self.grid.cells[top * cols ..][0..len]);
+                var r: u16 = bot;
+                while (true) {
+                    @memcpy(self.grid.rowSlice(r), self.grid.rowSlice(r - nu16));
+                    if (r == top + nu16) break;
+                    r -= 1;
+                }
             }
-            @memset(self.grid.cells[top * cols ..][0 .. n * cols], self.penBlank());
-            const tu: u16 = @intCast(top);
-            const bu: u16 = @intCast(bot);
-            var k: usize = 0;
-            while (k < n) : (k += 1) self.shiftPlacements(tu, bu, false);
+            var k: u16 = 0;
+            while (k < nu16) : (k += 1) @memset(self.grid.rowSlice(top + k), self.penBlank());
+            self.grid.markRowsDirty(top, bot);
+            var s: usize = 0;
+            while (s < n) : (s += 1) self.shiftPlacements(top, bot, false);
         }
 
         /// DL (CSI n M): delete n lines at the cursor row (cursor stays).
@@ -1553,36 +1739,43 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// construction (@memcpy panics on aliasing rows).
         fn deleteLines(self: *Self, count: u16) void {
             if (count == 0 or self.cursor_row > self.scroll_bot) return;
-            const CellT = @TypeOf(self.grid.cells[0]);
-            const cols: usize = self.grid.cols;
-            const top: usize = @max(self.cursor_row, self.scroll_top);
-            const bot: usize = self.scroll_bot;
-            const h: usize = bot -| top +| 1;
+            const top: u16 = @max(self.cursor_row, self.scroll_top);
+            const bot: u16 = self.scroll_bot;
+            const h: usize = @as(usize, bot) -| top +| 1;
             const n: usize = @min(@as(usize, count), h);
+            const nu16: u16 = @intCast(n);
+            // Offset-safe per-row copies (see insertLines).
             if (n < h) {
-                const len = (h - n) * cols;
-                std.mem.copyForwards(CellT, self.grid.cells[top * cols ..][0..len], self.grid.cells[(top + n) * cols ..][0..len]);
+                var r: u16 = top;
+                while (true) {
+                    @memcpy(self.grid.rowSlice(r), self.grid.rowSlice(r + nu16));
+                    if (r == bot - nu16) break;
+                    r += 1;
+                }
             }
-            @memset(self.grid.cells[(bot - n + 1) * cols ..][0 .. n * cols], self.penBlank());
-            const tu: u16 = @intCast(top);
-            const bu: u16 = @intCast(bot);
-            var k: usize = 0;
-            while (k < n) : (k += 1) self.shiftPlacements(tu, bu, true);
+            var k: u16 = 0;
+            while (k < nu16) : (k += 1) @memset(self.grid.rowSlice(bot - nu16 + 1 + k), self.penBlank());
+            self.grid.markRowsDirty(top, bot);
+            var s: usize = 0;
+            while (s < n) : (s += 1) self.shiftPlacements(top, bot, true);
         }
 
         fn eraseDisplay(self: *Self, mode: u16) void {
             const blank = self.penBlank();
             switch (mode) {
                 0 => { // cursor -> end
-                    const start = self.grid.index(self.cursor_col, self.cursor_row);
-                    @memset(self.grid.cells[start..], blank);
+                    const row = self.grid.rowSlice(self.cursor_row);
+                    @memset(row[self.cursor_col..], blank);
+                    var r: u16 = self.cursor_row + 1;
+                    while (r < self.grid.rows) : (r += 1) @memset(self.grid.rowSlice(r), blank);
                 },
                 1 => { // start -> cursor
-                    const end = self.grid.index(self.cursor_col, self.cursor_row) + 1;
-                    @memset(self.grid.cells[0..end], blank);
+                    var r: u16 = 0;
+                    while (r < self.cursor_row) : (r += 1) @memset(self.grid.rowSlice(r), blank);
+                    @memset(self.grid.rowSlice(self.cursor_row)[0 .. self.cursor_col + 1], blank);
                 },
                 2, 3 => {
-                    @memset(self.grid.cells, blank);
+                    self.grid.clearScreen(blank);
                     if (mode == 3 and cfg.scrollback_clear_on_ed3) self.grid.clearScrollback();
                     self.in_prompt = false;
                     self.prompt_start_row = null;
@@ -1594,11 +1787,11 @@ pub fn Context(comptime cfg: config_mod.Config) type {
 
         fn eraseLine(self: *Self, mode: u16) void {
             const blank = self.penBlank();
-            const row_off = @as(usize, self.cursor_row) * self.grid.cols;
+            const row = self.grid.rowSlice(self.cursor_row);
             switch (mode) {
-                0 => @memset(self.grid.cells[row_off + self.cursor_col ..][0 .. self.grid.cols - self.cursor_col], blank),
-                1 => @memset(self.grid.cells[row_off..][0 .. self.cursor_col + 1], blank),
-                2 => @memset(self.grid.cells[row_off..][0..self.grid.cols], blank),
+                0 => @memset(row[self.cursor_col..], blank),
+                1 => @memset(row[0 .. self.cursor_col + 1], blank),
+                2 => @memset(row, blank),
                 else => {},
             }
         }
@@ -1607,10 +1800,9 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// Vacated cells take the pen background (BCE).
         fn eraseChars(self: *Self, count: u16) void {
             const cols: usize = self.grid.cols;
-            const start: usize = @as(usize, self.cursor_row) * cols + self.cursor_col;
-            const max: usize = (@as(usize, self.cursor_row) + 1) * cols;
-            const n: usize = @min(@as(usize, count), max -| start);
-            @memset(self.grid.cells[start..][0..n], self.penBlank());
+            const row = self.grid.rowSlice(self.cursor_row);
+            const n: usize = @min(@as(usize, count), cols -| self.cursor_col);
+            @memset(row[self.cursor_col..][0..n], self.penBlank());
         }
 
         /// DCH (CSI n P): delete n chars at the cursor, shifting the rest
@@ -1618,22 +1810,25 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// Single forwards range copy: overlap-safe by construction.
         fn deleteChars(self: *Self, count: u16) void {
             if (count == 0) return;
-            const CellT = @TypeOf(self.grid.cells[0]);
+            const CellT = cell_mod.Cell(cfg);
             const cols: usize = self.grid.cols;
-            const row_off: usize = @as(usize, self.cursor_row) * cols;
+            const row = self.grid.rowSlice(self.cursor_row);
             const tail: usize = cols -| self.cursor_col;
             const n: usize = @min(@as(usize, count), tail);
             if (n < tail) {
-                std.mem.copyForwards(CellT, self.grid.cells[row_off + self.cursor_col ..][0 .. tail - n], self.grid.cells[row_off + self.cursor_col + n ..][0 .. tail - n]);
+                std.mem.copyForwards(CellT, row[self.cursor_col..][0 .. tail - n], row[self.cursor_col + n ..][0 .. tail - n]);
             }
-            @memset(self.grid.cells[row_off + cols - n ..][0..n], self.penBlank());
+            @memset(row[cols - n ..][0..n], self.penBlank());
         }
 
         fn reset(self: *Self) void {
-            const CellT = @TypeOf(self.grid.cells[0]);
+            const CellT = cell_mod.Cell(cfg);
             const blank = CellT{};
-            @memset(self.grid.cells, blank);
+            self.grid.clearScreen(blank);
+            self.grid.offset = 0;
+            self.grid.alt_offset = 0;
             self.pen = .{};
+            self.refreshPenCell();
             self.cursor_col = 0;
             self.cursor_row = 0;
             self.pending_wrap = false;
@@ -2107,12 +2302,12 @@ test "decset alt-screen swaps grids" {
     ctx.parse("main");
     ctx.parse("\x1b[?1049h");
     try std.testing.expect(ctx.alt_active);
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[0].rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(0, 0).rune);
     ctx.parse("alt!");
     ctx.parse("\x1b[?1049l");
     try std.testing.expect(!ctx.alt_active);
-    try std.testing.expectEqual(@as(u32, 'm'), ctx.grid.cells[0].rune);
-    try std.testing.expectEqual(@as(u32, 'n'), ctx.grid.cells[3].rune);
+    try std.testing.expectEqual(@as(u32, 'm'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'n'), ctx.grid.at(3, 0).rune);
 }
 
 test "decset decckm cursor application mode" {
@@ -2144,10 +2339,10 @@ test "split multibyte across parse calls" {
     defer ctx.deinit();
     // U+2500 (─) is E2 94 80. A chunk split must not become U+FFFD tofu.
     ctx.parse("\xE2\x94");
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[0].rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(0, 0).rune);
     ctx.parse("\x80X");
-    try std.testing.expectEqual(@as(u21, 0x2500), ctx.grid.cells[0].rune);
-    try std.testing.expectEqual(@as(u21, 'X'), ctx.grid.cells[1].rune);
+    try std.testing.expectEqual(@as(u21, 0x2500), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u21, 'X'), ctx.grid.at(1, 0).rune);
 }
 
 test "decset cursor visibility + mouse modes" {
@@ -2196,20 +2391,20 @@ test "su/sd scroll the scroll region, cursor stays" {
     ctx.parse("0\r\n1\r\n2\r\n3");
     ctx.parse("\x1b[2;3r"); // region = rows 1..2 (1-based)
     ctx.parse("\x1b[S"); // SU: row 1 takes old row 2, row 2 blanks
-    try std.testing.expectEqual(@as(u32, '0'), ctx.grid.cells[0 * 8].rune);
-    try std.testing.expectEqual(@as(u32, '2'), ctx.grid.cells[1 * 8].rune);
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[2 * 8].rune);
-    try std.testing.expectEqual(@as(u32, '3'), ctx.grid.cells[3 * 8].rune);
+    try std.testing.expectEqual(@as(u32, '0'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, '2'), ctx.grid.at(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(0, 2).rune);
+    try std.testing.expectEqual(@as(u32, '3'), ctx.grid.at(0, 3).rune);
     // SU never moves the cursor (was row 3, col 1).
     try std.testing.expectEqual(@as(u16, 3), ctx.cursor_row);
     try std.testing.expectEqual(@as(u16, 1), ctx.cursor_col);
     // Sub-region scrolls never touch scrollback.
     try std.testing.expectEqual(@as(usize, 0), ctx.grid.sb_len);
     ctx.parse("\x1b[T"); // SD: row 1 blanks, row 2 takes old row 1
-    try std.testing.expectEqual(@as(u32, '0'), ctx.grid.cells[0 * 8].rune);
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[1 * 8].rune);
-    try std.testing.expectEqual(@as(u32, '2'), ctx.grid.cells[2 * 8].rune);
-    try std.testing.expectEqual(@as(u32, '3'), ctx.grid.cells[3 * 8].rune);
+    try std.testing.expectEqual(@as(u32, '0'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, '2'), ctx.grid.at(0, 2).rune);
+    try std.testing.expectEqual(@as(u32, '3'), ctx.grid.at(0, 3).rune);
 }
 
 test "su on full region feeds scrollback" {
@@ -2218,8 +2413,8 @@ test "su on full region feeds scrollback" {
     ctx.parse("0\r\n1\r\n2\r\n3");
     ctx.parse("\x1b[S");
     try std.testing.expectEqual(@as(usize, 1), ctx.grid.sb_len);
-    try std.testing.expectEqual(@as(u32, '1'), ctx.grid.cells[0 * 8].rune);
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[3 * 8].rune);
+    try std.testing.expectEqual(@as(u32, '1'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(0, 3).rune);
     try std.testing.expectEqual(@as(u16, 3), ctx.cursor_row);
 }
 
@@ -2229,15 +2424,15 @@ test "il inserts blank lines in region" {
     ctx.parse("0\r\n1\r\n2\r\n3");
     ctx.parse("\x1b[2;1H"); // cursor to row 1
     ctx.parse("\x1b[2L"); // insert 2: old row 1 lands on row 3
-    try std.testing.expectEqual(@as(u32, '0'), ctx.grid.cells[0 * 8].rune);
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[1 * 8].rune);
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[2 * 8].rune);
-    try std.testing.expectEqual(@as(u32, '1'), ctx.grid.cells[3 * 8].rune);
+    try std.testing.expectEqual(@as(u32, '0'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(0, 2).rune);
+    try std.testing.expectEqual(@as(u32, '1'), ctx.grid.at(0, 3).rune);
     try std.testing.expectEqual(@as(u16, 1), ctx.cursor_row);
     ctx.parse("\x1b[9L"); // over-count clamps: everything below blanks
-    try std.testing.expectEqual(@as(u32, '0'), ctx.grid.cells[0 * 8].rune);
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[1 * 8].rune);
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[3 * 8].rune);
+    try std.testing.expectEqual(@as(u32, '0'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(0, 3).rune);
 }
 
 test "dl deletes lines in region" {
@@ -2246,10 +2441,10 @@ test "dl deletes lines in region" {
     ctx.parse("0\r\n1\r\n2\r\n3");
     ctx.parse("\x1b[2;1H"); // cursor to row 1
     ctx.parse("\x1b[2M"); // delete 2: row 1 takes old row 3
-    try std.testing.expectEqual(@as(u32, '0'), ctx.grid.cells[0 * 8].rune);
-    try std.testing.expectEqual(@as(u32, '3'), ctx.grid.cells[1 * 8].rune);
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[2 * 8].rune);
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[3 * 8].rune);
+    try std.testing.expectEqual(@as(u32, '0'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, '3'), ctx.grid.at(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(0, 2).rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(0, 3).rune);
     try std.testing.expectEqual(@as(u16, 1), ctx.cursor_row);
 }
 
@@ -2257,29 +2452,29 @@ test "el fills pen background (bce)" {
     var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
     defer ctx.deinit();
     ctx.parse("\x1b[44mXY"); // blue-bg pen, two cells on row 0
-    const want_bg = ctx.grid.cells[0].bg;
+    const want_bg = ctx.grid.at(0, 0).bg;
     try std.testing.expect(!cell_mod.isDefaultColor(want_bg));
     ctx.parse("\x1b[1;1H"); // home
     ctx.parse("\x1b[K"); // EL0: clear to end of row
     // Cleared cells are blank but keep the pen bg, not defaults.
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[0].rune);
-    try std.testing.expectEqual(want_bg, ctx.grid.cells[0].bg);
-    try std.testing.expectEqual(want_bg, ctx.grid.cells[7].bg);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(want_bg, ctx.grid.at(0, 0).bg);
+    try std.testing.expectEqual(want_bg, ctx.grid.at(7, 0).bg);
     // Untouched rows stay default.
-    try std.testing.expect(cell_mod.isDefaultColor(ctx.grid.cells[8].bg));
+    try std.testing.expect(cell_mod.isDefaultColor(ctx.grid.at(0, 1).bg));
 }
 
 test "ed2 fills pen background" {
     var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
     defer ctx.deinit();
     ctx.parse("\x1b[41mA\x1b[2;1H"); // red-bg pen, A on row 0, cursor row 1
-    const want_bg = ctx.grid.cells[0].bg;
+    const want_bg = ctx.grid.at(0, 0).bg;
     try std.testing.expect(!cell_mod.isDefaultColor(want_bg));
     ctx.parse("\x1b[2J");
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[0].rune);
-    try std.testing.expectEqual(want_bg, ctx.grid.cells[0].bg);
-    try std.testing.expectEqual(want_bg, ctx.grid.cells[15].bg);
-    try std.testing.expectEqual(want_bg, ctx.grid.cells[31].bg);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(want_bg, ctx.grid.at(0, 0).bg);
+    try std.testing.expectEqual(want_bg, ctx.grid.at(7, 1).bg);
+    try std.testing.expectEqual(want_bg, ctx.grid.at(7, 3).bg);
 }
 
 test "il blank lines carry pen background" {
@@ -2288,8 +2483,8 @@ test "il blank lines carry pen background" {
     ctx.parse("\x1b[42m0\r\n1"); // green-bg pen, rows 0-1
     ctx.parse("\x1b[2;1H"); // cursor to row 1
     ctx.parse("\x1b[L"); // insert 1: row 1 blanks with green bg
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[1 * 8].rune);
-    try std.testing.expectEqual(ctx.grid.cells[0].bg, ctx.grid.cells[1 * 8].bg);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(0, 1).rune);
+    try std.testing.expectEqual(ctx.grid.at(0, 0).bg, ctx.grid.at(0, 1).bg);
 }
 
 test "ech/dch erase with pen background" {
@@ -2299,19 +2494,19 @@ test "ech/dch erase with pen background" {
     ctx.parse("\x1b[1;3H"); // col 2
     ctx.parse("\x1b[41m"); // red-bg pen, no text yet
     ctx.parse("\x1b[2X"); // erase cols 2-3 with red bg
-    const want_bg = ctx.grid.cells[2].bg;
+    const want_bg = ctx.grid.at(2, 0).bg;
     try std.testing.expect(!cell_mod.isDefaultColor(want_bg));
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[2].rune);
-    try std.testing.expectEqual(@as(u32, 'e'), ctx.grid.cells[4].rune);
-    try std.testing.expect(cell_mod.isDefaultColor(ctx.grid.cells[4].bg));
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(2, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'e'), ctx.grid.at(4, 0).rune);
+    try std.testing.expect(cell_mod.isDefaultColor(ctx.grid.at(4, 0).bg));
     ctx.parse("\x1b[1;1H"); // col 0
     ctx.parse("\x1b[2P"); // delete a,b: row shifts left, red blanks fill in
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[0].rune);
-    try std.testing.expectEqual(want_bg, ctx.grid.cells[0].bg);
-    try std.testing.expectEqual(@as(u32, 'e'), ctx.grid.cells[2].rune);
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[4].rune);
-    try std.testing.expect(cell_mod.isDefaultColor(ctx.grid.cells[4].bg));
-    try std.testing.expectEqual(want_bg, ctx.grid.cells[6].bg);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(want_bg, ctx.grid.at(0, 0).bg);
+    try std.testing.expectEqual(@as(u32, 'e'), ctx.grid.at(2, 0).rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(4, 0).rune);
+    try std.testing.expect(cell_mod.isDefaultColor(ctx.grid.at(4, 0).bg));
+    try std.testing.expectEqual(want_bg, ctx.grid.at(6, 0).bg);
 }
 
 test "tick toggles blink after rate" {
@@ -2331,8 +2526,8 @@ test "context parse + sgr + osc title" {
     var ctx = try Context(.{}).init(std.testing.allocator);
     defer ctx.deinit();
     ctx.parse("hi\x1b[1m!\x1b[0m");
-    try std.testing.expectEqual(@as(u32, '!'), ctx.grid.cells[2].rune);
-    try std.testing.expect(ctx.grid.cells[2].attr.bold);
+    try std.testing.expectEqual(@as(u32, '!'), ctx.grid.at(2, 0).rune);
+    try std.testing.expect(ctx.grid.at(2, 0).attr.bold);
     ctx.parse("\x1b]2;zinc\x07");
     try std.testing.expectEqualStrings("zinc", ctx.title[0..ctx.title_len]);
 }
@@ -2345,8 +2540,10 @@ test "modifyOtherKeys query leaves no underline" {
     ctx.parse("\x1b[>4;1m\x1b=\x1b[K\x1b[1;30m          \x1b[0m\r\n");
     try std.testing.expect(!ctx.pen.underline);
     try std.testing.expect(!ctx.pen.bold);
-    for (ctx.grid.cells) |c| {
-        try std.testing.expect(c.ul_style == .none);
+    for (0..ctx.grid.rows) |r| {
+        for (ctx.grid.rowSlice(@intCast(r))) |c| {
+            try std.testing.expect(c.ul_style == .none);
+        }
     }
 }
 
@@ -2368,20 +2565,20 @@ test "osc 4 and osc 10/11/12 dynamic palette" {
 
     // Fastfetch-style print using 38;5;16 / 17 / 18
     ctx.parse("\x1b[38;5;16mA\x1b[38;5;17mB\x1b[38;5;18mC");
-    try std.testing.expect(cell_mod.isIndexedColor(ctx.grid.cells[0].fg));
-    try std.testing.expectEqual(@as(u8, 16), cell_mod.colorIndex(ctx.grid.cells[0].fg));
-    try std.testing.expectEqual(@as(u32, 0xa1cde1), ctx.palette[cell_mod.colorIndex(ctx.grid.cells[0].fg)]);
-    try std.testing.expectEqual(@as(u8, 17), cell_mod.colorIndex(ctx.grid.cells[1].fg));
-    try std.testing.expectEqual(@as(u8, 18), cell_mod.colorIndex(ctx.grid.cells[2].fg));
+    try std.testing.expect(cell_mod.isIndexedColor(ctx.grid.at(0, 0).fg));
+    try std.testing.expectEqual(@as(u8, 16), cell_mod.colorIndex(ctx.grid.at(0, 0).fg));
+    try std.testing.expectEqual(@as(u32, 0xa1cde1), ctx.palette[cell_mod.colorIndex(ctx.grid.at(0, 0).fg)]);
+    try std.testing.expectEqual(@as(u8, 17), cell_mod.colorIndex(ctx.grid.at(1, 0).fg));
+    try std.testing.expectEqual(@as(u8, 18), cell_mod.colorIndex(ctx.grid.at(2, 0).fg));
 
     // Dynamic palette update: changing OSC 4 updates the palette and cell dynamically reflects it!
     ctx.parse("\x1b]4;16;rgb:ff/00/aa\x1b\\");
-    try std.testing.expectEqual(@as(u32, 0xff00aa), ctx.palette[cell_mod.colorIndex(ctx.grid.cells[0].fg)]);
+    try std.testing.expectEqual(@as(u32, 0xff00aa), ctx.palette[cell_mod.colorIndex(ctx.grid.at(0, 0).fg)]);
 
     // Unstyled print stores COLOR_DEFAULT sentinel so it dynamically tracks theme
     ctx.parse("\x1b[0mD");
-    try std.testing.expect(cell_mod.isDefaultColor(ctx.grid.cells[3].fg));
-    try std.testing.expect(cell_mod.isDefaultColor(ctx.grid.cells[3].bg));
+    try std.testing.expect(cell_mod.isDefaultColor(ctx.grid.at(3, 0).fg));
+    try std.testing.expect(cell_mod.isDefaultColor(ctx.grid.at(3, 0).bg));
 }
 
 test "pending wrap keeps cursor in bounds at 1 col" {
@@ -2452,17 +2649,17 @@ test "wide chars take follower cells" {
     defer ctx.deinit();
     ctx.parse("a\xF0\x9F\x98\xB1b"); // a 😱 b
     // Lead + blank follower; the char after still shows (cursor rode +2).
-    try std.testing.expectEqual(@as(u32, 'a'), ctx.grid.cells[0].rune);
-    try std.testing.expectEqual(@as(u32, 0x1F631), ctx.grid.cells[1].rune);
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[2].rune);
-    try std.testing.expectEqual(@as(u32, 'b'), ctx.grid.cells[3].rune);
+    try std.testing.expectEqual(@as(u32, 'a'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 0x1F631), ctx.grid.at(1, 0).rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(2, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'b'), ctx.grid.at(3, 0).rune);
     try std.testing.expectEqual(@as(u16, 4), ctx.cursor_col);
     // CJK takes followers too.
     ctx.parse("\r\n");
     ctx.parse("a\xE4\xB8\xADb"); // a 中 b
-    try std.testing.expectEqual(@as(u32, 0x4E2D), ctx.grid.cells[8 + 1].rune);
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[8 + 2].rune);
-    try std.testing.expectEqual(@as(u32, 'b'), ctx.grid.cells[8 + 3].rune);
+    try std.testing.expectEqual(@as(u32, 0x4E2D), ctx.grid.at(1, 1).rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(2, 1).rune);
+    try std.testing.expectEqual(@as(u32, 'b'), ctx.grid.at(3, 1).rune);
 }
 
 test "narrow overwrite clears wide lead" {
@@ -2472,8 +2669,8 @@ test "narrow overwrite clears wide lead" {
     ctx.parse("\x1b[1;3H"); // onto the follower (col 2)
     ctx.parse("X");
     // Lead blanked (else X hides under the prev-wide skip), X shows.
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[1].rune);
-    try std.testing.expectEqual(@as(u32, 'X'), ctx.grid.cells[2].rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(1, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'X'), ctx.grid.at(2, 0).rune);
     try std.testing.expectEqual(@as(u16, 3), ctx.cursor_col);
 }
 
@@ -2483,8 +2680,8 @@ test "vs16 after emoji is zero-width" {
     ctx.parse("a\xF0\x9F\x98\xB1\xEF\xB8\x8F"); // a 😱 VS16
     // No advance past the follower; mark attached to the lead.
     try std.testing.expectEqual(@as(u16, 3), ctx.cursor_col);
-    try std.testing.expectEqual(@as(u8, 1), ctx.grid.cells[1].combining_count);
-    try std.testing.expectEqual(@as(u32, 0xFE0F), ctx.grid.cells[1].combining[0]);
+    try std.testing.expectEqual(@as(u8, 1), ctx.grid.at(1, 0).combining_count);
+    try std.testing.expectEqual(@as(u32, 0xFE0F), ctx.grid.at(1, 0).combining[0]);
 }
 
 test "wide wraps when pair won't fit" {
@@ -2493,10 +2690,230 @@ test "wide wraps when pair won't fit" {
     ctx.parse("1234567"); // cols 0-6, cursor on last col
     ctx.parse("\xF0\x9F\x98\xB1");
     // Pair doesn't fit: col 7 keeps blank + wrap flag, emoji leads row 1.
-    try std.testing.expectEqual(@as(u32, '7'), ctx.grid.cells[6].rune);
-    try std.testing.expect(ctx.grid.cells[7].wrapped);
-    try std.testing.expectEqual(@as(u32, 0x1F631), ctx.grid.cells[8].rune);
-    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.cells[9].rune);
+    try std.testing.expectEqual(@as(u32, '7'), ctx.grid.at(6, 0).rune);
+    try std.testing.expect(ctx.grid.at(7, 0).wrapped);
+    try std.testing.expectEqual(@as(u32, 0x1F631), ctx.grid.at(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(1, 1).rune);
     try std.testing.expectEqual(@as(u16, 2), ctx.cursor_col);
     try std.testing.expectEqual(@as(u16, 1), ctx.cursor_row);
+}
+
+test "overwrite voids stale wrap continuation" {
+    // Genuine wrap, then home + short overwrite: the last cell must lose
+    // its flag or reflow joins live rows and drops content (fastfetch logo).
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("123456789"); // row 0 full, '9' wraps to row 1
+    try std.testing.expect(ctx.grid.at(7, 0).wrapped);
+    try std.testing.expectEqual(@as(u32, '9'), ctx.grid.at(0, 1).rune);
+    ctx.parse("\x1b[1;1H"); // home (motion clears pending_wrap)
+    ctx.parse("XY"); // short overwrite stops at col 1
+    try std.testing.expectEqual(@as(u32, 'X'), ctx.grid.at(0, 0).rune);
+    try std.testing.expect(!ctx.grid.at(7, 0).wrapped);
+    // A widen keeps both lines on their own rows (cursor back down first:
+    // reflow gathers rows up to the cursor).
+    ctx.parse("\x1b[2;1H");
+    ctx.resize(16, 4);
+    try std.testing.expectEqual(@as(u32, 'X'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'Y'), ctx.grid.at(1, 0).rune);
+    try std.testing.expectEqual(@as(u32, '9'), ctx.grid.at(0, 1).rune);
+}
+
+test "priv-marked u never restores cursor" {
+    // CSI ? u is the kitty keyboard query (answered in answerQueries);
+    // fish sends it every prompt and it must not teleport the cursor.
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("\x1b[2;5H"); // row 1, col 4
+    ctx.parse("\x1b[s"); // save
+    ctx.parse("\x1b[1;1H"); // move away
+    ctx.parse("\x1b[?u"); // query: cursor must stay put
+    try std.testing.expectEqual(@as(u16, 0), ctx.cursor_col);
+    try std.testing.expectEqual(@as(u16, 0), ctx.cursor_row);
+    ctx.parse("\x1b[u"); // plain restore still works
+    try std.testing.expectEqual(@as(u16, 4), ctx.cursor_col);
+    try std.testing.expectEqual(@as(u16, 1), ctx.cursor_row);
+}
+
+test "priv-marked q never touches cursor style" {
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("\x1b[3 q"); // DECSCUSR underline blink
+    try std.testing.expect(ctx.decscusr_style.? == .underline);
+    ctx.parse("\x1b[?0q"); // query: style must survive
+    try std.testing.expect(ctx.decscusr_style.? == .underline);
+    ctx.parse("\x1b[0 q"); // plain reset still works
+    try std.testing.expect(ctx.decscusr_style == null);
+}
+
+test "teleport overwrite plus resize keeps content" {
+    // The fastfetch logo chain, synthetic: wrapped rows, a kitty ?u that
+    // must not teleport, a short overwrite, then a widen. Nothing joins.
+    var ctx = try Context(.{ .cols = 8, .rows = 6 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("12345678"); // full row 0
+    ctx.parse("ABCDEFGH"); // wraps row 0 (flagged), fills row 1
+    ctx.parse("XY"); // wraps row 1 (flagged), row 2 cols 0-1
+    try std.testing.expect(ctx.grid.at(7, 0).wrapped);
+    try std.testing.expect(ctx.grid.at(7, 1).wrapped);
+    ctx.parse("\x1b[?u"); // no teleport: cursor stays row 2
+    try std.testing.expectEqual(@as(u16, 2), ctx.cursor_col);
+    try std.testing.expectEqual(@as(u16, 2), ctx.cursor_row);
+    ctx.parse("\r"); // col 0, row 2
+    ctx.parse("logo!"); // short overwrite voids row 2's stale flag
+    try std.testing.expect(!ctx.grid.at(7, 2).wrapped);
+    ctx.resize(16, 6);
+    // Joined pair re-splits onto row 0, logo keeps its own row.
+    try std.testing.expectEqual(@as(u32, '1'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'H'), ctx.grid.at(15, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'l'), ctx.grid.at(0, 1).rune);
+}
+
+test "answerQueries skips ESC-less chunks identically" {
+    // Fast path must maintain the same 16-byte overlap tail as the slow
+    // path, and a query split across the boundary must still be answered.
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    const Sink = struct {
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+        fn cb(user: ?*anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(user));
+            const n = @min(data.len, self.buf.len - self.len);
+            @memcpy(self.buf[self.len..][0..n], data[0..n]);
+            self.len += n;
+        }
+    };
+    var sink = Sink{};
+    ctx.onWrite(Sink.cb, &sink);
+    ctx.answerQueries("0123456789ABCDEFGHIJ"); // 20 bytes, no ESC
+    try std.testing.expectEqual(@as(usize, 16), ctx.q_overlap_len);
+    try std.testing.expectEqualStrings("456789ABCDEFGHIJ", ctx.q_overlap[0..16]);
+    ctx.answerQueries("klm"); // short tail appends
+    try std.testing.expectEqual(@as(usize, 16), ctx.q_overlap_len);
+    try std.testing.expectEqualStrings("789ABCDEFGHIJklm", ctx.q_overlap[0..16]);
+    // Split CPR query: ESC at chunk end, rest next chunk.
+    ctx.answerQueries("\x1b[");
+    ctx.answerQueries("6n");
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "R") != null);
+    // 60KB ESC-less chunk: fast path must not smash the overlap window.
+    const big = try std.testing.allocator.alloc(u8, 60000);
+    defer std.testing.allocator.free(big);
+    @memset(big, 'x');
+    ctx.answerQueries(big);
+    try std.testing.expectEqual(@as(usize, 16), ctx.q_overlap_len);
+    try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxx", ctx.q_overlap[0..16]);
+}
+
+test "ascii fast path keeps style across sgr runs" {
+    var ctx = try Context(.{ .cols = 16, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("ab\x1b[1;31mCD\x1b[0mef");
+    try std.testing.expect(!ctx.grid.at(0, 0).attr.bold);
+    try std.testing.expect(!ctx.grid.at(1, 0).attr.bold);
+    try std.testing.expect(ctx.grid.at(2, 0).attr.bold);
+    try std.testing.expect(ctx.grid.at(3, 0).attr.bold);
+    try std.testing.expect(!ctx.grid.at(4, 0).attr.bold);
+    try std.testing.expectEqual(@as(u32, 'C'), ctx.grid.at(2, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'f'), ctx.grid.at(5, 0).rune);
+}
+
+test "ascii fast path wraps at row end" {
+    var ctx = try Context(.{ .cols = 4, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("abcd"); // fills row 0, pending
+    ctx.parse("ef"); // 'e' wraps (flag), 'f' lands row 1
+    try std.testing.expect(ctx.grid.at(3, 0).wrapped);
+    try std.testing.expectEqual(@as(u32, 'e'), ctx.grid.at(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, 'f'), ctx.grid.at(1, 1).rune);
+}
+
+test "ascii fast path survives reset" {
+    var ctx = try Context(.{ .cols = 8, .rows = 2 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("\x1b[1mAB");
+    try std.testing.expect(ctx.grid.at(0, 0).attr.bold);
+    ctx.parse("\x1bcCD"); // RIS clears grid + pen
+    try std.testing.expectEqual(@as(u32, 'C'), ctx.grid.at(0, 0).rune);
+    try std.testing.expect(!ctx.grid.at(0, 0).attr.bold);
+}
+
+test "ascii run voids stale wrap flag at col 0" {
+    var ctx = try Context(.{ .cols = 4, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("abcde"); // row 0 full + wrap flag, 'e' on row 1
+    try std.testing.expect(ctx.grid.at(3, 0).wrapped);
+    ctx.parse("\x1b[1;1H"); // home
+    ctx.parse("XY"); // short run overwrite at cols 0-1
+    try std.testing.expectEqual(@as(u32, 'X'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'Y'), ctx.grid.at(1, 0).rune);
+    try std.testing.expect(!ctx.grid.at(3, 0).wrapped);
+    try std.testing.expectEqual(@as(u16, 2), ctx.cursor_col);
+}
+
+test "ascii run stops at control bytes and resumes" {
+    var ctx = try Context(.{ .cols = 16, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("ab\r\ncd\tef\x1b[1mgh");
+    try std.testing.expectEqual(@as(u32, 'a'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'b'), ctx.grid.at(1, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'c'), ctx.grid.at(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, 'd'), ctx.grid.at(1, 1).rune);
+    // Tab jumps to col 8; run resumes after it.
+    try std.testing.expectEqual(@as(u32, 'e'), ctx.grid.at(8, 1).rune);
+    try std.testing.expectEqual(@as(u32, 'f'), ctx.grid.at(9, 1).rune);
+    try std.testing.expect(ctx.grid.at(10, 1).attr.bold);
+    try std.testing.expectEqual(@as(u32, 'h'), ctx.grid.at(11, 1).rune);
+}
+
+test "ascii run blanks a stale wide lead before it" {
+    var ctx = try Context(.{ .cols = 8, .rows = 2 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("a\xE4\xB8\xADb"); // a 中 b: lead at 1, follower at 2
+    ctx.parse("\x1b[1;3H"); // onto the follower (col 2)
+    ctx.parse("XYZ"); // run starting on the follower
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(1, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'X'), ctx.grid.at(2, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'Z'), ctx.grid.at(4, 0).rune);
+}
+
+test "ascii run defers to full path under IRM" {
+    var ctx = try Context(.{ .cols = 8, .rows = 2 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("abcdef");
+    ctx.parse("\x1b[1;1H"); // home
+    ctx.parse("\x1b[4h"); // IRM on: runs disabled
+    ctx.parse("XY");
+    // Insert shift: row reads X Y a b c d, cursor after the run.
+    try std.testing.expectEqual(@as(u32, 'X'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'Y'), ctx.grid.at(1, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'a'), ctx.grid.at(2, 0).rune);
+    try std.testing.expectEqual(@as(u16, 2), ctx.cursor_col);
+}
+
+test "ascii run fills to line end then wraps on next char" {
+    var ctx = try Context(.{ .cols = 4, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("ab"); // cols 0-1
+    ctx.parse("cdef"); // run of 2 caps at cols (c,d), then e,f wrap
+    try std.testing.expectEqual(@as(u32, 'c'), ctx.grid.at(2, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'd'), ctx.grid.at(3, 0).rune);
+    try std.testing.expect(ctx.grid.at(3, 0).wrapped);
+    try std.testing.expectEqual(@as(u32, 'e'), ctx.grid.at(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, 'f'), ctx.grid.at(1, 1).rune);
+}
+
+test "ascii fast path preconditions hold" {
+    // putAscii skips the combining/diacritic/VS16/wide checks for bytes
+    // below 0x80. If any classifier ever claims an ASCII byte, the fast
+    // path silently misroutes. Pin the floor (tiger-style: assert the
+    // invariant where the optimization depends on it).
+    var cp: u21 = 0;
+    while (cp < 0x80) : (cp += 1) {
+        try std.testing.expect(!utf8_mod.isCombining(cp));
+        try std.testing.expect(!utf8_mod.isWide(cp));
+        try std.testing.expect(!utf8_mod.isEmoji(cp));
+        try std.testing.expect(!placeholder_mod.isDiacritic(cp));
+        try std.testing.expect(cp != 0xFE0F and cp != 0x200D);
+    }
 }

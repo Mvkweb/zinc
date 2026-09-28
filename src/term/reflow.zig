@@ -64,27 +64,27 @@ fn logReflow(
     var r: usize = 0;
     while (r < rows) : (r += 1) {
         aw.writer.print("S{d:4} |", .{r}) catch return;
-        var c: usize = 0;
-        while (c < cols) : (c += 1) {
-            const v: u32 = grid.cells[r * cols + c].rune;
+        const rslice = grid.rowSlice(@intCast(r));
+        for (rslice) |cell| {
+            const v: u32 = cell.rune;
             const ch: u8 = if (v >= 32 and v < 127) @intCast(v) else '?';
             aw.writer.print("{c}", .{ch}) catch return;
         }
-        const w = grid.cells[r * cols + cols - 1].wrapped;
+        const w = rslice[rslice.len - 1].wrapped;
         aw.writer.print("|{s}\n", .{if (w) "[W]" else ""}) catch return;
     }
     if (comptime cfg.scrollback_cap > 0) {
         var i: usize = 0;
         while (i < grid.sb_len) : (i += 1) {
-            const phys = (grid.sb_head + i) % cfg.scrollback_cap;
             aw.writer.print("H{d:4} |", .{i}) catch return;
-            if (grid.sb_rows[phys]) |row| {
+            const row = grid.getScrollbackRow(i);
+            if (row.len > 0) {
                 for (row) |cell| {
                     const v: u32 = cell.rune;
                     const ch: u8 = if (v >= 32 and v < 127) @intCast(v) else '?';
                     aw.writer.print("{c}", .{ch}) catch return;
                 }
-                const w = row.len > 0 and row[row.len - 1].wrapped;
+                const w = row[row.len - 1].wrapped;
                 aw.writer.print("|{s}\n", .{if (w) "[W]" else ""}) catch return;
             } else {
                 aw.writer.print("(null)\n", .{}) catch return;
@@ -132,8 +132,7 @@ pub fn reflowGrid(
 
     if (comptime cfg.scrollback_cap > 0) {
         for (0..sb_count) |i| {
-            const phys = (grid.sb_head + i) % cfg.scrollback_cap;
-            const rslice = grid.sb_rows[phys] orelse &.{};
+            const rslice = grid.getScrollbackRow(i);
             const is_wrap = if (rslice.len > 0) rslice[rslice.len - 1].wrapped else false;
             input_rows[i] = .{
                 .cells = rslice,
@@ -144,8 +143,7 @@ pub fn reflowGrid(
     }
 
     for (0..active_screen_rows) |r| {
-        const start = r * @as(usize, old_cols);
-        const rslice = grid.cells[start .. start + old_cols];
+        const rslice = grid.rowSlice(@intCast(r));
         const is_wrap = if (rslice.len > 0) rslice[rslice.len - 1].wrapped else false;
         input_rows[sb_count + r] = .{
             .cells = rslice,
@@ -215,12 +213,15 @@ pub fn reflowGrid(
                 // rows and strand orphan lines (diagonal staircase cascade).
                 // Box rows (leading U+2502) are exempt: fastfetch/neofetch
                 // value columns look identical to decorations but repaint
-                // never — trimming them deletes real content.
+                // never — trimming them deletes real content. The trim only
+                // ever runs when narrowing: widening cannot strand orphans,
+                // and unbordered content (fastfetch logos) must survive a
+                // fresh-window widen untouched.
                 const r0: u32 = if (ir.cells.len > 0) ir.cells[0].rune else ' ';
                 const cursor_input_row = sb_count + @as(usize, cursor_row.*);
                 const ir_idx = line_start + line_row_idx;
                 const is_prompt_zone = (ir_idx + 2 >= cursor_input_row and ir_idx <= cursor_input_row);
-                if (!ir.wrapped and is_prompt_zone and last_non_blank > 0 and r0 != 0x2502) {
+                if (!ir.wrapped and is_prompt_zone and last_non_blank > 0 and r0 != 0x2502 and new_cols < old_cols) {
                     const min_col_for_gap = if (ir.is_cursor) @as(usize, cursor_col.*) else 0;
                     if (last_non_blank > min_col_for_gap) {
                         var scan = last_non_blank;
@@ -361,65 +362,86 @@ pub fn reflowGrid(
     const st: usize = if (total_lines > new_rows) total_lines - new_rows else 0;
 
     // Free all old rows in scrollback ring
-    if (comptime cfg.scrollback_cap > 0) {
-        for (0..grid.sb_len) |i| {
-            const phys = (grid.sb_head + i) % cfg.scrollback_cap;
-            if (grid.sb_rows[phys]) |old_r| {
-                gpa.free(old_r);
-                grid.sb_rows[phys] = null;
-            }
-        }
-        grid.sb_head = 0;
-        grid.sb_len = 0;
-    }
-
     // Scrollback gets rows 0 .. st (capped at scrollback_cap)
-    if (comptime cfg.scrollback_cap > 0) {
-        const drop_count = if (st > cfg.scrollback_cap) st - cfg.scrollback_cap else 0;
-        for (out_rows.items[0..drop_count]) |old_r| gpa.free(old_r);
-        for (out_rows.items[drop_count..st]) |sb_r| {
-            grid.sb_rows[grid.sb_len] = sb_r;
-            grid.sb_len += 1;
-        }
-    } else {
-        for (out_rows.items[0..st]) |old_r| gpa.free(old_r);
+    const sb_count_new = if (comptime cfg.scrollback_cap > 0)
+        @min(st, cfg.scrollback_cap)
+    else
+        0;
+    const drop_count = if (st > sb_count_new) st - sb_count_new else 0;
+    for (out_rows.items[0..drop_count]) |old_r| gpa.free(old_r);
+
+    // Free all old rows in grid.ring:
+    for (grid.ring) |maybe_r| {
+        if (maybe_r) |r| gpa.free(r);
     }
+    gpa.free(grid.ring);
+
+    // Allocate new ring:
+    const needed = if (cfg.scrollback_cap > 0)
+        cfg.scrollback_cap + @as(usize, new_rows)
+    else
+        @as(usize, new_rows);
+    const new_ring_cap = std.math.ceilPowerOfTwo(usize, @max(16, needed)) catch return error.OutOfMemory;
+    const new_ring_mask = new_ring_cap - 1;
+    const new_ring = try gpa.alloc(?[]C, new_ring_cap);
+    @memset(new_ring, null);
 
     // Live screen gets rows st .. min(st + new_rows, total_lines)
     const copy_lines = @min(total_lines - st, @as(usize, new_rows));
-    const new_cells = try gpa.alloc(C, @as(usize, new_cols) * new_rows);
-    @memset(new_cells, .{ .bg = filler_bg });
-
-    for (0..copy_lines) |line_i| {
-        const src_r = out_rows.items[st + line_i];
-        @memcpy(new_cells[line_i * new_cols .. (line_i + 1) * new_cols], src_r);
-        gpa.free(src_r);
+    for (0..new_rows) |r| {
+        if (r < copy_lines) {
+            new_ring[r] = out_rows.items[st + r];
+        } else {
+            const blank_r = try gpa.alloc(C, new_cols);
+            @memset(blank_r, .{ .bg = filler_bg });
+            new_ring[r] = blank_r;
+        }
     }
 
-    // Free any remaining rows in out_rows past the visible screen
+    // Scrollback rows installed before offset 0:
+    for (0..sb_count_new) |i| {
+        const k = sb_count_new - i;
+        const phys = (new_ring_cap - k) & new_ring_mask;
+        new_ring[phys] = out_rows.items[drop_count + i];
+    }
+
     for (out_rows.items[st + copy_lines ..]) |extra_r| {
         gpa.free(extra_r);
     }
     out_rows.deinit(gpa);
 
-    grid.gpa.free(grid.cells);
-    grid.cells = new_cells;
+    grid.ring = new_ring;
+    grid.ring_mask = new_ring_mask;
+    grid.offset = 0;
+    grid.sb_len = sb_count_new;
 
     // Alt-screen crop
-    if (cfg.alt_screen and grid.alt_cells.len > 0) {
-        const new_alt = try grid.gpa.alloc(C, @as(usize, new_cols) * new_rows);
-        @memset(new_alt, .{ .bg = filler_bg });
+    if (cfg.alt_screen and grid.alt_ring.len > 0) {
+        const alt_needed: usize = @as(usize, new_rows);
+        const alt_cap = std.math.ceilPowerOfTwo(usize, @max(16, alt_needed)) catch return error.OutOfMemory;
+        const alt_mask = alt_cap - 1;
+        const new_alt = try grid.gpa.alloc(?[]C, alt_cap);
+        @memset(new_alt, null);
         const copy_c = @min(new_cols, old_cols);
         const copy_r = @min(new_rows, old_rows);
-        var ar: u16 = 0;
-        while (ar < copy_r) : (ar += 1) {
-            @memcpy(
-                new_alt[@as(usize, ar) * new_cols ..][0..copy_c],
-                grid.alt_cells[@as(usize, ar) * old_cols ..][0..copy_c],
-            );
+        for (0..new_rows) |r| {
+            const new_r = try grid.gpa.alloc(C, new_cols);
+            @memset(new_r, .{ .bg = filler_bg });
+            if (r < copy_r) {
+                const old_phys = (grid.alt_offset + r) & grid.alt_ring_mask;
+                if (grid.alt_ring[old_phys]) |old_r| {
+                    @memcpy(new_r[0..copy_c], old_r[0..copy_c]);
+                }
+            }
+            new_alt[r] = new_r;
         }
-        grid.gpa.free(grid.alt_cells);
-        grid.alt_cells = new_alt;
+        for (grid.alt_ring) |maybe_r| {
+            if (maybe_r) |r| grid.gpa.free(r);
+        }
+        grid.gpa.free(grid.alt_ring);
+        grid.alt_ring = new_alt;
+        grid.alt_ring_mask = alt_mask;
+        grid.alt_offset = 0;
     }
 
     cursor_row.* = @intCast(std.math.clamp(@as(i64, @intCast(cursor_line)) - @as(i64, @intCast(st)), 0, new_rows - 1));
@@ -663,7 +685,7 @@ test "mixed-width scrollback heals even on height-only resize" {
     try std.testing.expectEqual(@as(u16, 4), g.cols);
     try std.testing.expectEqual(@as(u16, 3), g.rows);
     try std.testing.expectEqual(@as(usize, 1), g.sb_len);
-    const h0 = g.sb_rows[g.sb_head] orelse return error.Fail;
+    const h0 = g.getScrollbackRow(0);
     try std.testing.expectEqual(@as(usize, 4), h0.len);
     try std.testing.expectEqual(@as(u32, 'A'), h0[0].rune);
     try std.testing.expectEqual(@as(u32, 'X'), g.at(0, 0).rune);
@@ -863,4 +885,23 @@ test "extreme narrow 3-column squeeze restores box byte-identical at top" {
     // Assert prompt is at row 4
     try std.testing.expectEqual(@as(u16, 4), cur_row);
     try std.testing.expectEqual(@as(u32, '>'), g.at(0, 4).rune);
+}
+
+test "widen keeps gapped content rows intact" {
+    // fastfetch-logo shape: leading text, wide blank gap, trailing text,
+    // cursor two rows below (prompt zone). The prompt-zone trim is
+    // shrink-only: a fresh-window widen must not eat the trailing segment.
+    const grid_mod = @import("grid.zig");
+    const cfg = config_mod.Config{ .scrollback_cap = 8, .alt_screen = false };
+    const G = grid_mod.Grid(cfg);
+    var g = try G.init(std.testing.allocator, 80, 6);
+    defer g.deinit();
+    const line = "_____           __";
+    for (line, 0..) |ch, i| g.at(@intCast(i), 0).setRune(ch);
+    var cur_col: u16 = 0;
+    var cur_row: u16 = 2;
+    try reflowGrid(cfg, std.testing.allocator, &g, 170, 6, &cur_col, &cur_row, cfg.bg);
+    try std.testing.expectEqual(@as(u32, '_'), g.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, '_'), g.at(16, 0).rune);
+    try std.testing.expectEqual(@as(u32, '_'), g.at(17, 0).rune);
 }

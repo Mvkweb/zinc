@@ -20,8 +20,11 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    // freetype2 headers live outside the default include path.
-    translate_c.addIncludePath(.{ .cwd_relative = "/usr/include/freetype2" });
+
+    addPkgConfigIncludes(b, translate_c, "wayland-client");
+    addPkgConfigIncludes(b, translate_c, "freetype2");
+    addPkgConfigIncludes(b, translate_c, "fontconfig");
+    addPkgConfigIncludes(b, translate_c, "xkbcommon");
 
     const root_module = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -88,4 +91,18 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step("check", "Compile check only (no install, no run)");
     check_step.dependOn(&check_exe.step);
     check_step.dependOn(&check_tests.step);
+}
+
+fn addPkgConfigIncludes(b: *std.Build, translate_c: *std.Build.Step.TranslateC, lib_name: []const u8) void {
+    const stdout = b.run(&.{ "pkg-config", "--cflags-only-I", lib_name });
+
+    var it = std.mem.tokenizeAny(u8, stdout, " \t\r\n");
+    while (it.next()) |flag| {
+        if (std.mem.startsWith(u8, flag, "-I")) {
+            const path = flag[2..];
+            if (path.len > 0) {
+                translate_c.addSystemIncludePath(.{ .cwd_relative = path });
+            }
+        }
+    }
 }

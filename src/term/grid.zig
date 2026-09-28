@@ -1,4 +1,5 @@
-//! Flat grid + scrollback ring + alt-screen. Owns cell storage.
+//! Unified circular row-pointer ring + alt-screen (Foot architecture).
+//! Owns cell storage. Zero-copy scrolling via pointer rotation.
 //! Zig 0.16: unmanaged ArrayList semantics — allocator passed explicitly.
 
 const std = @import("std");
@@ -9,110 +10,220 @@ const reflow_mod = @import("reflow.zig");
 pub fn Grid(comptime cfg: config_mod.Config) type {
     const C = cell_mod.Cell(cfg);
     return struct {
+        pub const Cell = C;
+
         gpa: std.mem.Allocator,
-        cells: []C = &.{},
-        alt_cells: []C = &.{},
-        sb_rows: []?[]C = &.{},
         cols: u16,
         rows: u16,
-        sb_head: usize = 0, // ring start (oldest)
-        sb_len: usize = 0, // live scrollback rows
-        view_offset: usize = 0, // 0 = following; >0 = scrolled up rows
+
+        /// Unified circular ring of row pointers (Foot architecture).
+        /// Ring capacity is a power of two for fast bitmask indexing.
+        ring: []?[]C = &.{},
+        ring_mask: usize = 0,
+
+        /// Physical ring index of visible screen row 0.
+        /// Screen row `r` is at `(offset + r) & ring_mask`.
+        offset: usize = 0,
+
+        /// Number of valid scrollback rows currently stored.
+        /// The oldest scrollback row is at:
+        /// `(offset + ring.len - sb_len) & ring_mask`.
+        sb_len: usize = 0,
+
+        /// Viewport offset (0 = following live screen; >0 = scrolled up into history).
+        view_offset: usize = 0,
+
+        /// Flag indicating that all screen cells moved (scrollUp rotates every row):
+        /// next frame repaints all rows, O(1) instead of per-cell loops.
+        dirty_all: bool = true,
+
+        /// Alt-screen ring storage (swapped alongside on alt switch).
+        alt_ring: []?[]C = &.{},
+        alt_ring_mask: usize = 0,
+        alt_offset: usize = 0,
+        /// Scrollback count parked while the alt screen is live: swapAlt
+        /// swaps sb_len <-> alt_sb_len, so the primary history rides out
+        /// a TUI session inside the alt ring (and resizeCrop preserves it
+        /// there instead of freeing it).
+        alt_sb_len: usize = 0,
 
         const Self = @This();
 
         pub fn init(gpa: std.mem.Allocator, cols: u16, rows: u16) !Self {
             var self = Self{ .gpa = gpa, .cols = cols, .rows = rows };
-            self.cells = try gpa.alloc(C, @as(usize, cols) * rows);
-            @memset(self.cells, .{});
+            const needed: usize = if (cfg.scrollback_cap > 0)
+                cfg.scrollback_cap + @as(usize, rows)
+            else
+                @as(usize, rows);
+
+            const ring_cap = std.math.ceilPowerOfTwo(usize, @max(16, needed)) catch return error.OutOfMemory;
+            self.ring_mask = ring_cap - 1;
+            self.ring = try gpa.alloc(?[]C, ring_cap);
+            @memset(self.ring, null);
+
+            for (0..rows) |r| {
+                const row_slice = try gpa.alloc(C, cols);
+                @memset(row_slice, .{});
+                self.ring[r] = row_slice;
+            }
+
             if (cfg.alt_screen) {
-                self.alt_cells = try gpa.alloc(C, @as(usize, cols) * rows);
-                @memset(self.alt_cells, .{});
+                // Sized like the primary ring: while alt is live it parks
+                // the primary scrollback, which resizeCrop must preserve.
+                const alt_needed: usize = if (cfg.scrollback_cap > 0)
+                    cfg.scrollback_cap + @as(usize, rows)
+                else
+                    @as(usize, rows);
+                const alt_cap = std.math.ceilPowerOfTwo(usize, @max(16, alt_needed)) catch return error.OutOfMemory;
+                self.alt_ring_mask = alt_cap - 1;
+                self.alt_ring = try gpa.alloc(?[]C, alt_cap);
+                @memset(self.alt_ring, null);
+                for (0..rows) |r| {
+                    const row_slice = try gpa.alloc(C, cols);
+                    @memset(row_slice, .{});
+                    self.alt_ring[r] = row_slice;
+                }
             }
-            if (cfg.scrollback_cap > 0) {
-                self.sb_rows = try gpa.alloc(?[]C, cfg.scrollback_cap);
-                @memset(self.sb_rows, null);
-            }
+
             return self;
         }
 
         pub fn deinit(self: *Self) void {
-            self.gpa.free(self.cells);
-            if (self.alt_cells.len > 0) self.gpa.free(self.alt_cells);
-            if (self.sb_rows.len > 0) {
-                for (self.sb_rows) |maybe_row| {
+            if (self.ring.len > 0) {
+                for (self.ring) |maybe_row| {
                     if (maybe_row) |row| self.gpa.free(row);
                 }
-                self.gpa.free(self.sb_rows);
+                self.gpa.free(self.ring);
+            }
+            if (self.alt_ring.len > 0) {
+                for (self.alt_ring) |maybe_row| {
+                    if (maybe_row) |row| self.gpa.free(row);
+                }
+                self.gpa.free(self.alt_ring);
             }
             self.* = undefined;
         }
 
-        pub inline fn index(self: *const Self, col: u16, row: u16) usize {
-            return @as(usize, row) * self.cols + col;
+        pub fn at(self: *Self, col: u16, row: u16) *C {
+            const r = self.rowSlice(row);
+            return &r[col];
         }
 
-        pub fn at(self: *Self, col: u16, row: u16) *C {
-            return &self.cells[self.index(col, row)];
+        pub fn atConst(self: *const Self, col: u16, row: u16) *const C {
+            const r = self.rowSliceConst(row);
+            return &r[col];
         }
 
         pub fn rowSlice(self: *Self, row: u16) []C {
-            const start = @as(usize, row) * self.cols;
-            return self.cells[start .. start + self.cols];
-        }
-
-        pub fn markAllDirty(self: *Self) void {
-            for (self.cells) |*c| c.dirty = true;
-        }
-
-        /// Push an arbitrary row into the scrollback ring.
-        pub fn pushScrollbackRow(self: *Self, src: []const C) void {
-            if (cfg.scrollback_cap == 0 or self.sb_rows.len == 0) return;
-            const dst_idx = (self.sb_head + self.sb_len) % cfg.scrollback_cap;
-            var row = self.sb_rows[dst_idx];
-            if (row == null or row.?.len != src.len) {
-                if (row) |r| self.gpa.free(r);
-                row = self.gpa.alloc(C, src.len) catch null;
-                self.sb_rows[dst_idx] = row;
+            const phys = (self.offset + row) & self.ring_mask;
+            if (self.ring[phys] == null or self.ring[phys].?.len != self.cols) {
+                if (self.ring[phys]) |old_r| self.gpa.free(old_r);
+                self.ring[phys] = self.gpa.alloc(C, self.cols) catch null;
+                if (self.ring[phys]) |r| @memset(r, .{});
             }
-            if (row) |r| {
+            return self.ring[phys].?;
+        }
+
+        pub fn rowSliceConst(self: *const Self, row: u16) []const C {
+            const phys = (self.offset + row) & self.ring_mask;
+            return self.ring[phys] orelse &.{};
+        }
+
+        /// Row `i` of scrollback, where 0 is the OLDEST row and `sb_len - 1` is the NEWEST.
+        pub fn getScrollbackRow(self: *const Self, i: usize) []const C {
+            if (i >= self.sb_len) return &.{};
+            const k = self.sb_len - i;
+            const phys = (self.offset + self.ring.len - k) & self.ring_mask;
+            return self.ring[phys] orelse &.{};
+        }
+
+        pub fn getScrollbackRowMut(self: *Self, i: usize) ?[]C {
+            if (i >= self.sb_len) return null;
+            const k = self.sb_len - i;
+            const phys = (self.offset + self.ring.len - k) & self.ring_mask;
+            return self.ring[phys];
+        }
+
+        /// Push an arbitrary row into the scrollback ring (used by reflow/tests).
+        pub fn pushScrollbackRow(self: *Self, src: []const C) void {
+            if (cfg.scrollback_cap == 0 or self.ring.len == 0) return;
+            if (self.sb_len < cfg.scrollback_cap) {
+                self.sb_len += 1;
+            }
+            const phys = (self.offset + self.ring.len - self.sb_len) & self.ring_mask;
+            if (self.ring[phys] == null or self.ring[phys].?.len != src.len) {
+                if (self.ring[phys]) |r| self.gpa.free(r);
+                self.ring[phys] = self.gpa.alloc(C, src.len) catch null;
+            }
+            if (self.ring[phys]) |r| {
                 @memcpy(r, src);
+            }
+        }
+
+        /// Zero-Copy Scroll: Rotates the live offset.
+        /// Screen row 0 instantly enters scrollback without copying any cell data.
+        /// The new bottom row is cleared in-place. Total memory copied: 0 bytes.
+        pub fn scrollUp(self: *Self, push: bool) void {
+            if (push and cfg.scrollback_cap > 0) {
                 if (self.sb_len < cfg.scrollback_cap) {
                     self.sb_len += 1;
-                } else {
-                    self.sb_head = (self.sb_head + 1) % cfg.scrollback_cap;
                 }
             }
-        }
-
-        /// Pop the newest row from the scrollback ring.
-        pub fn popScrollbackRow(self: *Self) ?[]const C {
-            if (cfg.scrollback_cap == 0 or self.sb_len == 0) return null;
-            const last_idx = (self.sb_head + self.sb_len - 1) % cfg.scrollback_cap;
-            self.sb_len -= 1;
-            return self.sb_rows[last_idx];
-        }
-
-        /// Push top row into scrollback ring (or drop if disabled).
-        /// Scroll the grid up one row. When push is false (alt-screen),
-        /// the top row is discarded instead of entering scrollback.
-        pub fn scrollUp(self: *Self, push: bool) void {
-            if (push) {
-                self.pushScrollbackRow(self.cells[0..self.cols]);
-            }
-            std.mem.copyForwards(C, self.cells[0 .. self.cells.len - self.cols], self.cells[self.cols..]);
-            @memset(self.cells[self.cells.len - self.cols ..], .{});
-            for (self.cells[self.cells.len - self.cols ..]) |*c| c.dirty = true;
+            self.offset = (self.offset + 1) & self.ring_mask;
+            const b = self.rowSlice(self.rows - 1);
+            @memset(b, .{});
+            self.dirty_all = true;
         }
 
         pub fn clearScrollback(self: *Self) void {
-            self.sb_head = 0;
             self.sb_len = 0;
             self.view_offset = 0;
         }
 
-        /// Scroll the viewport up (positive) or down (negative), clamped to
-        /// available scrollback. 0 = following live output.
+        pub fn clearScreen(self: *Self, blank: C) void {
+            var r: u16 = 0;
+            while (r < self.rows) : (r += 1) {
+                @memset(self.rowSlice(r), blank);
+            }
+        }
+
+        pub fn markAllDirty(self: *Self) void {
+            var r: u16 = 0;
+            while (r < self.rows) : (r += 1) {
+                for (self.rowSlice(r)) |*c| c.dirty = true;
+            }
+            self.dirty_all = true;
+        }
+
+        pub fn markAllClean(self: *Self) void {
+            var r: u16 = 0;
+            while (r < self.rows) : (r += 1) {
+                for (self.rowSlice(r)) |*c| c.dirty = false;
+            }
+            self.dirty_all = false;
+        }
+
+        pub fn markRowsDirty(self: *Self, top: u16, bot: u16) void {
+            var r: u16 = top;
+            while (r <= bot and r < self.rows) : (r += 1) {
+                for (self.rowSlice(r)) |*c| c.dirty = true;
+            }
+        }
+
+        pub fn swapAlt(self: *Self) void {
+            if (!cfg.alt_screen) return;
+            std.mem.swap([]?[]C, &self.ring, &self.alt_ring);
+            std.mem.swap(usize, &self.ring_mask, &self.alt_ring_mask);
+            std.mem.swap(usize, &self.offset, &self.alt_offset);
+            // Park/restore the scrollback count with its rows: entering
+            // alt shelves the primary history (fresh alt starts at 0),
+            // leaving it restores the count — history is never wiped by
+            // a TUI session.
+            std.mem.swap(usize, &self.sb_len, &self.alt_sb_len);
+            self.view_offset = 0;
+            self.dirty_all = true;
+        }
+
         pub fn scrollView(self: *Self, delta: i32) void {
             if (cfg.scrollback_cap == 0 or self.sb_len == 0) {
                 self.view_offset = 0;
@@ -123,65 +234,120 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
             self.view_offset = @intCast(std.math.clamp(cur + delta, 0, max));
         }
 
-        /// Cell visible at (col, row) through the scrollback viewport.
-        /// Returns null when scrolled past available history (should not
-        /// happen; scrollView clamps).
         pub fn viewCell(self: *Self, col: u16, row: u16) ?*const C {
             if (col >= self.cols or row >= self.rows) return null;
             const off = @min(self.view_offset, self.sb_len);
-            if (off == 0) return &self.cells[self.index(col, row)];
-            const k: usize = off;
-            const r: usize = row;
-            if (r < k) {
-                if (cfg.scrollback_cap == 0) return null;
-                const logical = self.sb_len - k + r;
-                const phys = (self.sb_head + logical) % cfg.scrollback_cap;
-                if (self.sb_rows[phys]) |sb_row| {
-                    if (col < sb_row.len) return &sb_row[col];
+            if (off == 0) return self.at(col, row);
+            if (row < off) {
+                const k = off - row;
+                const phys = (self.offset + self.ring.len - k) & self.ring_mask;
+                if (self.ring[phys]) |r| {
+                    if (col < r.len) return &r[col];
                 }
                 return null;
             }
-            return &self.cells[self.index(col, @intCast(r - k))];
+            const live_r = row - @as(u16, @intCast(off));
+            return self.at(col, live_r);
         }
 
-        /// Resize the grid, preserving the overlapping region top-left without reflow.
-        /// Scrollback history is retained across width changes.
         pub fn resizeCrop(self: *Self, cols: u16, rows: u16) !void {
             if (cols == self.cols and rows == self.rows) return;
-            const CellT = @TypeOf(self.cells[0]);
-            const new_cells = try self.gpa.alloc(CellT, @as(usize, cols) * rows);
-            @memset(new_cells, .{});
+            const needed: usize = if (cfg.scrollback_cap > 0)
+                cfg.scrollback_cap + @as(usize, rows)
+            else
+                @as(usize, rows);
+            const new_ring_cap = std.math.ceilPowerOfTwo(usize, @max(16, needed)) catch return error.OutOfMemory;
+            const new_ring_mask = new_ring_cap - 1;
+            const new_ring = try self.gpa.alloc(?[]C, new_ring_cap);
+            @memset(new_ring, null);
+
             const copy_cols = @min(cols, self.cols);
             const copy_rows = @min(rows, self.rows);
-            var r: u16 = 0;
-            while (r < copy_rows) : (r += 1) {
-                @memcpy(
-                    new_cells[@as(usize, r) * cols ..][0..copy_cols],
-                    self.cells[@as(usize, r) * self.cols ..][0..copy_cols],
-                );
-            }
-            self.gpa.free(self.cells);
-            self.cells = new_cells;
-            if (cfg.alt_screen and self.alt_cells.len > 0) {
-                const new_alt = try self.gpa.alloc(CellT, @as(usize, cols) * rows);
-                @memset(new_alt, .{});
-                var ar: u16 = 0;
-                while (ar < copy_rows) : (ar += 1) {
-                    @memcpy(
-                        new_alt[@as(usize, ar) * cols ..][0..copy_cols],
-                        self.alt_cells[@as(usize, ar) * self.cols ..][0..copy_cols],
-                    );
+            for (0..rows) |r| {
+                const new_r = try self.gpa.alloc(C, cols);
+                @memset(new_r, .{});
+                if (r < copy_rows) {
+                    const old_r = self.rowSlice(@intCast(r));
+                    @memcpy(new_r[0..copy_cols], old_r[0..copy_cols]);
                 }
-                self.gpa.free(self.alt_cells);
-                self.alt_cells = new_alt;
+                new_ring[r] = new_r;
             }
+
+            const copy_sb = @min(self.sb_len, cfg.scrollback_cap);
+            for (0..copy_sb) |i| {
+                const old_sb = self.getScrollbackRow(i);
+                const new_r = try self.gpa.alloc(C, cols);
+                @memset(new_r, .{});
+                const ccols = @min(cols, @as(u16, @intCast(old_sb.len)));
+                @memcpy(new_r[0..ccols], old_sb[0..ccols]);
+                const k = copy_sb - i;
+                const phys = (new_ring_cap - k) & new_ring_mask;
+                new_ring[phys] = new_r;
+            }
+
+            for (self.ring) |maybe_r| {
+                if (maybe_r) |r| self.gpa.free(r);
+            }
+            self.gpa.free(self.ring);
+
+            self.ring = new_ring;
+            self.ring_mask = new_ring_mask;
+            self.offset = 0;
+            self.sb_len = copy_sb;
             self.cols = cols;
             self.rows = rows;
             self.view_offset = @min(self.view_offset, self.sb_len);
             self.markAllDirty();
+
+            if (cfg.alt_screen and self.alt_ring.len > 0) {
+                const alt_needed: usize = if (cfg.scrollback_cap > 0)
+                    cfg.scrollback_cap + @as(usize, rows)
+                else
+                    @as(usize, rows);
+                const alt_cap = std.math.ceilPowerOfTwo(usize, @max(16, alt_needed)) catch return error.OutOfMemory;
+                const alt_mask = alt_cap - 1;
+                const new_alt = try self.gpa.alloc(?[]C, alt_cap);
+                @memset(new_alt, null);
+                for (0..rows) |r| {
+                    const new_r = try self.gpa.alloc(C, cols);
+                    @memset(new_r, .{});
+                    if (r < copy_rows) {
+                        const old_phys = (self.alt_offset + r) & self.alt_ring_mask;
+                        if (self.alt_ring[old_phys]) |old_r| {
+                            const ccols = @min(cols, @as(u16, @intCast(old_r.len)));
+                            @memcpy(new_r[0..ccols], old_r[0..ccols]);
+                        }
+                    }
+                    new_alt[r] = new_r;
+                }
+                // Preserve parked scrollback (primary history while alt is
+                // live, or alt's own — both ride in alt_sb_len slots below
+                // the alt viewport, same layout as the primary ring).
+                const copy_alt_sb = @min(self.alt_sb_len, cfg.scrollback_cap);
+                for (0..copy_alt_sb) |i| {
+                    const k = self.alt_sb_len - i;
+                    const old_phys = (self.alt_offset + self.alt_ring.len - k) & self.alt_ring_mask;
+                    const new_r = try self.gpa.alloc(C, cols);
+                    @memset(new_r, .{});
+                    if (self.alt_ring[old_phys]) |old_sb| {
+                        const ccols = @min(cols, @as(u16, @intCast(old_sb.len)));
+                        @memcpy(new_r[0..ccols], old_sb[0..ccols]);
+                    }
+                    const nk = copy_alt_sb - i;
+                    const phys = (alt_cap - nk) & alt_mask;
+                    new_alt[phys] = new_r;
+                }
+                for (self.alt_ring) |maybe_r| {
+                    if (maybe_r) |r| self.gpa.free(r);
+                }
+                self.gpa.free(self.alt_ring);
+                self.alt_ring = new_alt;
+                self.alt_ring_mask = alt_mask;
+                self.alt_offset = 0;
+                self.alt_sb_len = copy_alt_sb;
+            }
         }
 
-        /// Resize with logical-line reflow when on primary screen.
         pub fn resizeWithReflow(
             self: *Self,
             cols: u16,
@@ -216,15 +382,14 @@ test "grid scroll pushes ring" {
     g.at(0, 0).setRune('A');
     g.scrollUp(true);
     try std.testing.expectEqual(@as(usize, 1), g.sb_len);
-    try std.testing.expectEqual(@as(u32, 'A'), g.sb_rows[0].?[0].rune);
+    try std.testing.expectEqual(@as(u32, 'A'), g.getScrollbackRow(0)[0].rune);
 }
 
 test "minimal grid skips alt-screen and scrollback storage" {
     const G = Grid(.{ .scrollback_cap = 0, .alt_screen = false });
     var g = try G.init(std.testing.allocator, 4, 2);
     defer g.deinit();
-    try std.testing.expectEqual(@as(usize, 0), g.alt_cells.len);
-    try std.testing.expectEqual(@as(usize, 0), g.sb_rows.len);
+    try std.testing.expectEqual(@as(usize, 0), g.alt_ring.len);
 }
 
 test "resize preserves scrollback across crop" {
@@ -238,7 +403,7 @@ test "resize preserves scrollback across crop" {
     try std.testing.expectEqual(@as(u16, 6), g.cols);
     try std.testing.expectEqual(@as(u16, 3), g.rows);
     try std.testing.expectEqual(@as(usize, 1), g.sb_len); // preserved!
-    try std.testing.expectEqual(@as(u32, 'A'), g.sb_rows[0].?[0].rune);
+    try std.testing.expectEqual(@as(u32, 'A'), g.getScrollbackRow(0)[0].rune);
 }
 
 test "viewport shows scrollback when scrolled" {
@@ -256,4 +421,54 @@ test "viewport shows scrollback when scrolled" {
     try std.testing.expectEqual(@as(u32, 'B'), live.rune);
     g.scrollView(-5);
     try std.testing.expectEqual(@as(usize, 0), g.view_offset);
+}
+
+test "dirty flags: scroll sets all, ranges mark, clean clears" {
+    const G = Grid(.{ .scrollback_cap = 4, .alt_screen = false });
+    var g = try G.init(std.testing.allocator, 4, 3);
+    defer g.deinit();
+    g.markAllClean();
+    try std.testing.expect(!g.dirty_all);
+    try std.testing.expect(!g.at(0, 0).dirty);
+    g.scrollUp(true); // every row moved: whole screen repaints
+    try std.testing.expect(g.dirty_all);
+    g.markAllClean();
+    try std.testing.expect(!g.dirty_all);
+    g.markRowsDirty(1, 1);
+    try std.testing.expect(!g.at(0, 0).dirty);
+    try std.testing.expect(g.at(0, 1).dirty);
+    try std.testing.expect(!g.at(0, 2).dirty);
+    g.markAllDirty();
+    try std.testing.expect(g.dirty_all);
+    try std.testing.expect(g.at(3, 2).dirty);
+}
+
+test "alt swap parks and restores scrollback" {
+    const G = Grid(.{ .scrollback_cap = 4, .alt_screen = true });
+    var g = try G.init(std.testing.allocator, 4, 2);
+    defer g.deinit();
+    g.at(0, 0).setRune('A');
+    g.scrollUp(true);
+    try std.testing.expectEqual(@as(usize, 1), g.sb_len);
+    g.swapAlt(); // enter alt: history parked, alt starts clean
+    try std.testing.expectEqual(@as(usize, 0), g.sb_len);
+    try std.testing.expectEqual(@as(usize, 1), g.alt_sb_len);
+    g.at(0, 0).setRune('Z'); // alt writes must not touch parked rows
+    g.swapAlt(); // exit alt: history restored
+    try std.testing.expectEqual(@as(usize, 1), g.sb_len);
+    try std.testing.expectEqual(@as(usize, 0), g.alt_sb_len);
+    try std.testing.expectEqual(@as(u32, 'A'), g.getScrollbackRow(0)[0].rune);
+}
+
+test "resize during alt preserves parked scrollback" {
+    const G = Grid(.{ .scrollback_cap = 4, .alt_screen = true });
+    var g = try G.init(std.testing.allocator, 4, 2);
+    defer g.deinit();
+    g.at(0, 0).setRune('A');
+    g.scrollUp(true);
+    g.swapAlt(); // enter alt
+    try g.resizeCrop(6, 3); // resize with a TUI open
+    g.swapAlt(); // exit alt
+    try std.testing.expectEqual(@as(usize, 1), g.sb_len);
+    try std.testing.expectEqual(@as(u32, 'A'), g.getScrollbackRow(0)[0].rune);
 }
