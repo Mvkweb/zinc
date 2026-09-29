@@ -721,7 +721,13 @@ pub fn Context(comptime cfg: config_mod.Config) type {
 
         /// Feed PTY bytes into the state machine. Snaps view to follow.
         pub fn parse(self: *Self, data: []const u8) void {
-            self.grid.view_offset = 0;
+            // Parked in history (view_offset > 0)? Hold the viewport:
+            // output scrolls underneath and the user returns via wheel,
+            // PgDn, or any keypress (sendToPty re-follows). Only a live
+            // view tracks the cursor.
+            if (self.grid.view_offset != 0) {
+                self.grid.view_offset = @min(self.grid.view_offset, self.grid.sb_len);
+            }
             if (cfg.cursor_blink and data.len > 0) {
                 // Any output keeps the cursor solid while typing/printing.
                 self.blink_visible = true;
@@ -2844,6 +2850,22 @@ test "teleport overwrite plus resize keeps content" {
     try std.testing.expectEqual(@as(u32, '1'), ctx.grid.at(0, 0).rune);
     try std.testing.expectEqual(@as(u32, 'H'), ctx.grid.at(15, 0).rune);
     try std.testing.expectEqual(@as(u32, 'l'), ctx.grid.at(0, 1).rune);
+}
+
+test "parse holds parked viewport on output" {
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("0\r\n1\r\n2\r\n3\r\n4\r\n5\r\n"); // scrolls: sb grows
+    try std.testing.expect(ctx.grid.sb_len > 0);
+    // Park two rows up; fresh output must not yank back to live.
+    ctx.grid.scrollView(2);
+    try std.testing.expectEqual(@as(usize, 2), ctx.grid.view_offset);
+    ctx.parse("new stuff\r\nmore\r\n");
+    try std.testing.expectEqual(@as(usize, 2), ctx.grid.view_offset);
+    // Live view still tracks (offset 0 unaffected).
+    ctx.grid.view_offset = 0;
+    ctx.parse("live\r\n");
+    try std.testing.expectEqual(@as(usize, 0), ctx.grid.view_offset);
 }
 
 test "answerQueries skips ESC-less chunks identically" {

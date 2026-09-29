@@ -80,7 +80,7 @@ pub const DEFAULT_CONFIG_TEMPLATE =
     \\cursor-glide-ms = 120
     \\cursor-trail-ms = 0
     \\smooth-scroll = true
-    \\smooth-scroll-ms = 150
+    \\smooth-scroll-ms = 110
     \\
     \\# --- Selection Settings ---
     \\# If false, single click does not display a 1-cell highlight until dragged.
@@ -240,7 +240,7 @@ test "default template parses valid config" {
     try std.testing.expectEqual(@as(?u16, 120), cfg.cursor_glide_ms);
     try std.testing.expectEqual(@as(?u16, 0), cfg.cursor_trail_ms);
     try std.testing.expectEqual(@as(?bool, true), cfg.smooth_scroll);
-    try std.testing.expectEqual(@as(?u16, 150), cfg.smooth_scroll_ms);
+    try std.testing.expectEqual(@as(?u16, 110), cfg.smooth_scroll_ms);
     try std.testing.expectEqual(@as(?bool, false), cfg.find_match_numbers);
     try std.testing.expectEqual(@as(?u8, 2), cfg.find_number_scale);
 }

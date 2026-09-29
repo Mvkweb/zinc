@@ -57,6 +57,10 @@ pub const Flow = struct {
     view_off_f: f32 = 0,
     glide_moving: bool = false,
     scroll_moving: bool = false,
+    /// End-of-history overshoot, rows (signed): rubber-bands past the
+    /// limit and springs back. Only ever nonzero at a true limit (the
+    /// wheel handler bumps it when scrollView clamps); decays to 0.
+    over: f32 = 0,
     last_ms: i64 = 0,
     now_ms: i64 = 0,
     have_time: bool = false,
@@ -194,20 +198,32 @@ pub const Flow = struct {
 
         // Scrollback offset chases the live view offset.
         self.view_off_f = @floatFromInt(view_off);
+        // Overshoot springs back on its own clock (~120ms), independent
+        // of the glide below: repeated bumps re-arm, never accumulate.
+        self.over *= @exp(-dt_ms / 120.0);
+        if (@abs(self.over) < 0.01) self.over = 0;
         if (!smooth) {
             self.shown_off = self.view_off_f;
+            self.over = 0;
             self.scroll_moving = false;
         } else {
             const sdur: f32 = @max(1.0, @as(f32, @floatFromInt(scroll_ms)));
             const f: f32 = @min(dt_ms / sdur, 1.0);
             self.shown_off += (self.view_off_f - self.shown_off) * f;
-            if (@abs(self.view_off_f - self.shown_off) < 0.02) {
+            if (@abs(self.view_off_f - self.shown_off) < 0.02 and self.over == 0) {
                 self.shown_off = self.view_off_f;
                 self.scroll_moving = false;
             } else {
                 self.scroll_moving = true;
             }
         }
+    }
+
+    /// Rubber-band impulse at a scroll limit (rows sign = push direction).
+    /// Re-arms to half a row; the decay in step() springs it back.
+    pub fn bumpOver(self: *Flow, dir: i32) void {
+        self.over = (if (dir >= 0) @as(f32, 1) else @as(f32, -1)) * 0.5;
+        self.scroll_moving = true;
     }
 
     /// True when nothing is moving, nothing is fading, and no remembered
@@ -225,10 +241,35 @@ pub const Flow = struct {
         };
     }
 
-    /// Vertical content shift in pixels: positive moves content down
-    /// (scrolling up into history), decaying to 0 at rest.
+    /// Vertical content shift in pixels: the fractional part of the
+    /// interpolated offset, always in [0, 1) rows downward. The integer
+    /// viewport (viewEff) steps underneath while this streams the
+    /// in-between, so fast wheel flings read as continuous motion, never
+    /// strobing line-blocks. 0 at rest. Overshoot adds on top while it
+    /// springs back.
     pub fn scrollShiftPx(self: *const Flow, ch: i32) i32 {
-        return @intFromFloat(@round((self.view_off_f - self.shown_off) * @as(f32, @floatFromInt(ch))));
+        const fl = @floor(@max(self.shown_off, 0));
+        const frac = self.shown_off - fl;
+        const px = frac * @as(f32, @floatFromInt(ch)) + self.over * @as(f32, @floatFromInt(ch));
+        return @intFromFloat(@round(px));
+    }
+
+    /// Integer viewport the renderer paints: floor of the interpolated
+    /// offset, clamped to history. Trails the live target during glides
+    /// (that's the smooth part); identical at rest.
+    pub fn viewEff(self: *const Flow, sb_len: usize) usize {
+        const fl = @floor(@max(self.shown_off, 0));
+        return @min(@as(usize, @intFromFloat(fl)), sb_len);
+    }
+
+    /// Snap the glide to an offset (re-follow on keypress, alt-screen
+    /// switch): the prompt must read NOW, not swoop in over 110ms.
+    pub fn snapView(self: *Flow, off: usize) void {
+        const f: f32 = @floatFromInt(off);
+        self.view_off_f = f;
+        self.shown_off = f;
+        self.over = 0;
+        self.scroll_moving = false;
     }
 
     /// Fade alpha for trail entry i (0 = oldest). Linear birth -> gone.
@@ -382,16 +423,80 @@ test "scroll chases view offset" {
     var f = Flow{};
     f.step(1000, 0, 0, 0, true, false, 8, 16, false, 120, 0, true, 150);
     try std.testing.expect(f.settled());
-    // Wheel up 3 rows: shift jumps, then decays to rest.
+    // Wheel up 3 rows: the painted viewport streams 0→1→2→3 while a
+    // sub-row shift carries the in-between — continuous motion, never
+    // strobing line-blocks, shift always in [0, ch).
     f.step(1007, 0, 0, 3, true, false, 8, 16, false, 120, 0, true, 150);
     try std.testing.expect(!f.settled());
-    try std.testing.expect(f.scrollShiftPx(16) > 0);
+    try std.testing.expectEqual(@as(usize, 0), f.viewEff(100));
+    const s0 = f.scrollShiftPx(16);
+    try std.testing.expect(s0 >= 0 and s0 <= 16);
     var t: i64 = 1007;
     var n: usize = 0;
+    var saw_mid = false;
     while (!f.settled() and n < 200) : (n += 1) {
         t += 7;
         f.step(t, 0, 0, 3, true, false, 8, 16, false, 120, 0, true, 150);
+        const e = f.viewEff(100);
+        try std.testing.expect(e <= 3);
+        if (e == 1 or e == 2) saw_mid = true;
+        const s = f.scrollShiftPx(16);
+        try std.testing.expect(s >= 0 and s <= 16);
     }
+    try std.testing.expect(f.settled());
+    try std.testing.expect(saw_mid); // viewport truly traveled, not jumped
+    try std.testing.expectEqual(@as(usize, 3), f.viewEff(100));
+    try std.testing.expectEqual(@as(i32, 0), f.scrollShiftPx(16));
+}
+
+test "snapView lands instantly" {
+    var f = Flow{};
+    f.step(1000, 0, 0, 5, true, false, 8, 16, false, 120, 0, true, 150);
+    f.snapView(0);
+    try std.testing.expect(f.settled());
+    try std.testing.expectEqual(@as(usize, 0), f.viewEff(100));
+    try std.testing.expectEqual(@as(i32, 0), f.scrollShiftPx(16));
+}
+
+test "viewEff clamps to history" {
+    var f = Flow{};
+    f.step(1000, 0, 0, 0, true, false, 8, 16, false, 120, 0, true, 150);
+    f.snapView(0);
+    try std.testing.expectEqual(@as(usize, 0), f.viewEff(0));
+    try std.testing.expectEqual(@as(usize, 0), f.viewEff(100));
+}
+
+test "overshoot rubber-bands then settles" {
+    var f = Flow{};
+    f.step(1000, 0, 0, 5, true, false, 8, 16, false, 120, 0, true, 150);
+    var t: i64 = 1000;
+    var n: usize = 0;
+    while (!f.settled() and n < 300) : (n += 1) {
+        t += 7;
+        f.step(t, 0, 0, 5, true, false, 8, 16, false, 120, 0, true, 150);
+    }
+    try std.testing.expect(f.settled());
+    // Bump at the limit: half-row overshoot, frames alive, then rest.
+    f.bumpOver(1);
+    try std.testing.expect(!f.settled());
+    try std.testing.expect(f.scrollShiftPx(16) > 0);
+    // Re-bump re-arms (never accumulates past half a row).
+    f.bumpOver(1);
+    try std.testing.expect(f.scrollShiftPx(16) <= 8);
+    n = 0;
+    while (!f.settled() and n < 300) : (n += 1) {
+        t += 7;
+        f.step(t, 0, 0, 5, true, false, 8, 16, false, 120, 0, true, 150);
+    }
+    try std.testing.expect(f.settled());
+    try std.testing.expectEqual(@as(i32, 0), f.scrollShiftPx(16));
+}
+
+test "overshoot off snaps with smooth" {
+    var f = Flow{};
+    f.step(1000, 0, 0, 5, true, false, 8, 16, false, 120, 0, false, 150);
+    f.bumpOver(-1);
+    f.step(1016, 0, 0, 5, true, false, 8, 16, false, 120, 0, false, 150);
     try std.testing.expect(f.settled());
     try std.testing.expectEqual(@as(i32, 0), f.scrollShiftPx(16));
 }

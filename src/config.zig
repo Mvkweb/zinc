@@ -23,6 +23,13 @@ pub const Config = struct {
     scrollback_clear_on_ed3: bool = true,
     reflow_on_resize: bool = true,
     scroll_step: u32 = 3,
+    /// Overlay scrollbar (history position + proportion), click/drag to
+    /// scrub. Hidden on alt-screen and under mouse-reporting apps.
+    scrollbar: bool = true,
+    /// Ms after last scroll/drag activity before the bar fades at the
+    /// live view (0 = always show when history exists; parked views and
+    /// drags never fade).
+    scrollbar_fade_ms: u32 = 1200,
 
     // Rendering.
     refresh_rate: u16 = 60,
@@ -52,7 +59,7 @@ pub const Config = struct {
     anim_dur_ms: f32 = 250.0,
     smooth_scroll: bool = true,
     /// Pixel-glide duration for scrollback jumps (wheel, PgUp/Dn).
-    smooth_scroll_ms: u16 = 150,
+    smooth_scroll_ms: u16 = 110,
     scroll_decay: f32 = 0.05,
     cursor_trail_ms: u16 = 0,
     cursor_trail_decay: f32 = 0.01,
@@ -200,6 +207,7 @@ pub const minimal: Config = .{
     .find = false,
     .copy_mode = false,
     .ime = false,
+    .scrollbar = false,
 };
 
 /// Active profile selected by `-Dminimal` / `-Dascii-only`.

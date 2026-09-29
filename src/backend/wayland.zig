@@ -153,6 +153,7 @@ const cell_mod = @import("../term/cell.zig");
 const software = @import("../render/software.zig");
 const box_drawing = @import("../render/box_drawing.zig");
 const flow_mod = @import("../render/flow.zig");
+const scrollbar_mod = @import("../render/scrollbar.zig");
 const placeholder_mod = @import("../gfx/placeholder.zig");
 const search_mod = @import("../term/search.zig");
 const filelink_mod = @import("../term/filelink.zig");
@@ -360,6 +361,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
         },
         ime: ime_mod.Ime = .{},
         ime_rect_sent: [4]i32 = .{ std.math.minInt(i32), 0, 0, 0 },
+        /// Overlay scrollbar: drag capture, last activity (fade clock),
+        /// latched target visibility, displayed opacity, last fade step.
+        sb_dragging: bool = false,
+        sb_active_ms: i64 = 0,
+        sb_show: bool = false,
+        sb_alpha: u8 = 0,
+        sb_last_ms: i64 = 0,
         /// Baked keycap ligatures by base (0-9, '#' = 10, '*' = 11).
         /// Null = not yet attempted; a blank (w == 0) entry = tried and
         /// missing, so frames never re-bake a miss (fallback owns it).
@@ -1457,6 +1465,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const ch = self.cell_h;
             const bg_all = self.themed(self.ctx.bg, true);
             const voff: usize = @min(self.ctx.grid.view_offset, self.ctx.grid.sb_len);
+            // Painted viewport: the interpolated offset while gliding
+            // (floor of the glide; identical to live at rest). All cell
+            // reads below go through it so fast flings stream instead of
+            // strobing.
+            const eff: usize = self.flow.viewEff(self.ctx.grid.sb_len);
             // Dirty-row gate: repaint everything unless the frame is provably
             // a quiet text update (settled flow, live view, no overlays or
             // images). Anything fancy falls back to today's full repaint,
@@ -1473,6 +1486,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 (cfg.copy_mode and self.copy_active) or
                 (self.trail_ms > 0 and self.flow.trail_n > 0) or
                 (cfg.ime and self.ime.focused and self.ime.preedit_len > 0) or
+                (cfg.scrollbar and (self.sb_show or self.sb_alpha > 0)) or
                 (cfg.kitty_gfx and self.ctx.images.placements.items.len > 0);
             if (full) {
                 software.fillRect(self.pool_pixels, W, H, 0, 0, W, H, bg_all, &dmg);
@@ -1519,7 +1533,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 }
                 var col: u16 = 0;
                 while (col < visible_cols) : (col += 1) {
-                    const cell_ptr = self.ctx.grid.viewCell(col, row) orelse continue;
+                    const cell_ptr = self.ctx.grid.viewCellAt(col, row, eff) orelse continue;
                     const cell = cell_ptr.*;
                     const is_selected = self.isCellSelected(col, row);
                     const find_hit = self.findMatchAt(search_mod.absRow(&self.ctx.grid, row), col);
@@ -1562,18 +1576,24 @@ pub fn App(comptime cfg: config_mod.Config) type {
             row = 0;
             while (row < row_end) : (row += 1) {
                 if (!full and !self.rowDirty(row)) continue;
-                for (self.ctx.grid.rowSlice(row)) |*cell| cell.dirty = false;
+                // Fractional glide frames paint an interpolated viewport:
+                // claim nothing clean (flags settle exact at rest).
+                if (!self.flow.scroll_moving) {
+                    for (self.ctx.grid.rowSlice(row)) |*cell| cell.dirty = false;
+                }
                 // Ctrl+hover hyperlink span on this row (if any).
                 const link_hover = link_hover_armed and row == self.hover_row;
                 var col: u16 = 0;
                 while (col < visible_cols) : (col += 1) {
                     // Wide-char follower column belongs to the previous cell.
+                    // Wide-char follower column belongs to the previous cell
+                    // (same interpolated viewport as the glyph below).
                     if (col > 0) {
-                        if (self.ctx.grid.viewCell(col - 1, row)) |prev| {
+                        if (self.ctx.grid.viewCellAt(col - 1, row, eff)) |prev| {
                             if (utf8_mod.isWide(cellCp(prev.rune))) continue;
                         }
                     }
-                    const cell_ptr = self.ctx.grid.viewCell(col, row) orelse continue;
+                    const cell_ptr = self.ctx.grid.viewCellAt(col, row, eff) orelse continue;
                     const cell = cell_ptr.*;
                     // fg stays straight-opaque for the coverage blend. Swap
                     // before converting so reverse video uses bg as fg.
@@ -1831,10 +1851,20 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (cfg.find and self.find_active and visible_rows > 0) {
                 self.drawFindBar(W, H, px, py, cw, ch, visible_cols, visible_rows, &dmg);
             }
+            // Overlay scrollbar: thumb only, theme fg, animated opacity.
+            // Painted on every frame while latched or fading (cheap rect).
+            if (cfg.scrollbar and self.sb_alpha > 0) {
+                const bg = self.sbGeom();
+                if (bg.visible) {
+                    const tcol = self.themed(self.ctx.fg, false);
+                    software.fillRectBlend(self.pool_pixels, W, H, bg.x, bg.thumb_y, @intCast(scrollbar_mod.BAR_W), @intCast(bg.thumb_h), tcol, self.sb_alpha, &dmg);
+                }
+            }
             // Full repaint painted everything: clear all flags so later
             // dirty-row frames stay truthful. (Dirty path clears rows as
-            // it paints them, above.)
-            if (full) self.ctx.grid.markAllClean();
+            // it paints them, above.) Skipped mid-glide: fractional frames
+            // paint interpolated rows, so flags settle exact at rest.
+            if (full and !self.flow.scroll_moving) self.ctx.grid.markAllClean();
             return dmg;
         }
 
@@ -1981,6 +2011,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (cfg.selection and self.sel.active) {
                 self.sel.clear();
             }
+            // Alt screens have no scrollback: snap any parked glide shut
+            // so the TUI lands exact instead of streaming in.
+            self.flow.snapView(self.ctx.grid.view_offset);
             // Find matches reference the other screen's rows; close out.
             if (cfg.find and self.find_active) self.closeFind();
             if (cfg.copy_mode and self.copy_active) self.exitCopyMode();
@@ -2102,6 +2135,23 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     self.ime.serial += 1;
                 }
             }
+            // Overlay scrollbar: visibility target latches per frame;
+            // opacity glides toward it (quick in, slow linger out). Any
+            // travel forces full frames; landing on zero takes one last
+            // full clean so no residue ghosts on a dirty-row frame.
+            if (cfg.scrollbar) {
+                self.sb_show = self.scrollbarVisible(flow_now);
+                const target: u8 = if (self.sb_show) scrollbar_mod.MAX_ALPHA else 0;
+                const tau: i64 = if (self.sb_show) scrollbar_mod.FADE_IN_MS else scrollbar_mod.FADE_OUT_MS;
+                const stepped = scrollbar_mod.stepAlpha(self.sb_alpha, target, flow_now - self.sb_last_ms, tau);
+                if (stepped != self.sb_alpha) {
+                    self.sb_alpha = stepped;
+                    if (self.sb_alpha == 0) self.ctx.grid.markAllDirty();
+                    self.cursor_only_render = false;
+                    self.needs_render = true;
+                }
+                self.sb_last_ms = flow_now;
+            }
             const is_prof = self.profile_on;
             const t0: i64 = if (is_prof) context_mod.nowMs() else 0;
             const is_cursor_only = self.cursor_only_render and self.pending_resize == null and self.resize_settle_ms == 0 and self.flow.settled();
@@ -2181,6 +2231,12 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         poll_timeout = if (poll_timeout < 0) rem else @min(poll_timeout, rem);
                     }
                 }
+                // Scrollbar fade animation: ~30fps frames while the
+                // target flips or opacity travels (expiry while idle is
+                // covered: the target re-evaluates fresh every loop).
+                if (self.sbNeedsFrames(context_mod.nowMs())) {
+                    poll_timeout = if (poll_timeout < 0) 33 else @min(poll_timeout, 33);
+                }
                 const prc = linux.poll(&fds, nfds, poll_timeout);
                 if (linux.errno(prc) == .SUCCESS and (fds[0].revents & linux.POLL.IN) != 0) {
                     _ = c.wl_display_read_events(self.display);
@@ -2250,6 +2306,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     }
                     self.needs_render = true;
                 }
+                // Scrollbar fade/show glide needs frames until the target
+                // latches and opacity lands (present() does both; the
+                // zero landing takes one last full clean).
+                if (self.sbNeedsFrames(context_mod.nowMs())) {
+                    self.cursor_only_render = false;
+                    self.needs_render = true;
+                }
                 if (self.needs_render and self.configured and !self.frame_pending) {
                     self.present();
                 }
@@ -2266,6 +2329,14 @@ pub fn App(comptime cfg: config_mod.Config) type {
         // -- input ----------------------------------------------------------
 
         fn sendToPty(self: *Self, data: []const u8) void {
+            // Typing re-follows live output after scrollback parking:
+            // output holds the viewport, keypresses release it — snapped,
+            // so the prompt reads NOW instead of swooping in over 110ms.
+            if (self.ctx.grid.view_offset != 0) {
+                self.ctx.grid.view_offset = 0;
+                self.flow.snapView(0);
+                self.needs_render = true;
+            }
             pty_mod.writeAll(self.pty_fd, data);
         }
 
@@ -2375,6 +2446,53 @@ pub fn App(comptime cfg: config_mod.Config) type {
         fn repeatDisarm(self: *Self) void {
             self.repeat_armed = false;
             self.repeatSet(0, 0);
+        }
+
+        // -- overlay scrollbar -------------------------------------------------
+        // History position + proportion; click jumps, drag scrubs. Pure
+        // overlay: never touches grid, selection, or Protocol state.
+
+        /// Current bar geometry (interpolated offset, so the thumb glides
+        /// with the content instead of stepping row to row).
+        fn sbGeom(self: *Self) scrollbar_mod.Geom {
+            return scrollbar_mod.layout(
+                self.width,
+                self.height,
+                @intCast(self.currentPadY()),
+                self.cell_h,
+                self.ctx.grid.rows,
+                self.ctx.grid.sb_len,
+                self.flow.shown_off,
+            );
+        }
+
+        /// Bar visibility this frame: history + primary screen + local
+        /// mouse. Drags and parked views never fade; the live view fades
+        /// after scrollbar_fade_ms of calm (0 = always show).
+        fn scrollbarVisible(self: *const Self, now_ms: i64) bool {
+            if (!cfg.scrollbar) return false;
+            if (self.ctx.alt_active or self.ctx.mouse_mode != .off) return false;
+            if (self.ctx.grid.sb_len == 0) return false;
+            if (self.sb_dragging) return true;
+            if (self.ctx.grid.view_offset > 0) return true;
+            if (cfg.scrollbar_fade_ms == 0) return true;
+            return now_ms - self.sb_active_ms < @as(i64, cfg.scrollbar_fade_ms);
+        }
+
+        fn sbBump(self: *Self) void {
+            const now = context_mod.nowMs();
+            self.sb_active_ms = now;
+            self.sb_last_ms = now;
+        }
+
+        /// True while the bar needs frames: the visibility target can
+        /// flip while idle (fade clock), or opacity is still traveling.
+        /// present() latches the target and steps the opacity.
+        fn sbNeedsFrames(self: *const Self, now_ms: i64) bool {
+            if (!cfg.scrollbar) return false;
+            const want = self.scrollbarVisible(now_ms);
+            const tgt: u8 = if (want) scrollbar_mod.MAX_ALPHA else 0;
+            return want != self.sb_show or self.sb_alpha != tgt;
         }
 
         // -- find (Ctrl+Shift+F bottom bar) -----------------------------------
@@ -2765,7 +2883,16 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 // PgUp/PgDn scrolls unless an app owns the screen (alt).
                 if ((k == .page_up or k == .page_down) and (mods.shift or !self.ctx.alt_active)) {
                     const page: i32 = @max(1, @as(i32, self.ctx.grid.rows) - 1);
-                    self.ctx.grid.scrollView(if (k == .page_up) page else -page);
+                    const delta: i32 = if (k == .page_up) page else -page;
+                    const before = self.ctx.grid.view_offset;
+                    self.ctx.grid.scrollView(delta);
+                    if (self.ctx.grid.sb_len > 0 and self.ctx.grid.view_offset == before and delta != 0) {
+                        self.flow.bumpOver(if (delta > 0) 1 else -1);
+                    }
+                    if (cfg.scrollbar) {
+                        self.sbBump();
+                        self.cursor_only_render = false;
+                    }
                     self.needs_render = true;
                     return;
                 }
@@ -3499,6 +3626,19 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.needs_render = true;
                 return;
             }
+            // Scrollbar scrub: owns motion while captured (mouse apps
+            // already returned above; a mid-drag mode grab strands
+            // nothing — the release handler always clears the capture).
+            if (cfg.scrollbar and self.sb_dragging and self.ctx.mouse_mode == .off) {
+                const by: i32 = @divFloor(sy, 256);
+                const bg = self.sbGeom();
+                self.ctx.grid.view_offset = scrollbar_mod.offsetAt(bg, self.ctx.grid.sb_len, by);
+                self.clearHover();
+                self.sbBump();
+                self.cursor_only_render = false;
+                self.needs_render = true;
+                return;
+            }
             const cc = self.ptrCell(sx, sy);
             self.updateHover(cc.col, cc.row);
         }
@@ -3512,6 +3652,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.ptr_serial = serial;
             if (!cfg.mouse) return;
             const mods = self.currentMods();
+            // Scrollbar drag release lands here even if a mouse app
+            // grabbed the screen mid-drag (never strand the capture).
+            if (cfg.scrollbar and self.sb_dragging and button == 0x110 and state == 0) {
+                self.sb_dragging = false;
+                self.needs_render = true;
+                return;
+            }
             // App-owned mouse reports to the PTY (DECSET 1000/1002/1003);
             // Shift bypasses to local selection (foot parity).
             if (self.ctx.mouse_mode != .off and !mods.shift) {
@@ -3539,6 +3686,24 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             switch (button) {
                 0x110 => { // left: Ctrl+click opens links; else multi-click / drag-select
+                    // Overlay scrollbar capture first: the bar owns its
+                    // strip (click jumps, drag scrubs; release ends it).
+                    // Only while latched or fading: a fully faded bar is
+                    // padding, and clicks there must select as usual.
+                    if (state == 1 and cfg.scrollbar and (self.sb_show or self.sb_alpha > 0) and self.ctx.mouse_mode == .off and !self.ctx.alt_active) {
+                        const bx: i32 = @divFloor(self.ptr_sx, 256);
+                        const by: i32 = @divFloor(self.ptr_sy, 256);
+                        const bg = self.sbGeom();
+                        if (scrollbar_mod.hitTest(bg, bx, by)) {
+                            self.sb_dragging = true;
+                            self.ctx.grid.view_offset = scrollbar_mod.offsetAt(bg, self.ctx.grid.sb_len, by);
+                            self.clearHover();
+                            self.sbBump();
+                            self.cursor_only_render = false;
+                            self.needs_render = true;
+                            return;
+                        }
+                    }
                     if (!cfg.selection) return;
                     if (cfg.copy_mode and self.copy_active and state == 1) self.exitCopyMode();
                     const cc = self.ptrCell(self.ptr_sx, self.ptr_sy);
@@ -3627,8 +3792,19 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 return;
             }
             if (self.ctx.alt_active) return; // app owns the screen
-            self.ctx.grid.scrollView(if (value > 0) -3 else 3);
+            // Clamped at a limit with history behind it: rubber-band
+            // instead of a dead stop (no bounce on a history-less view).
+            const before = self.ctx.grid.view_offset;
+            const delta: i32 = if (value > 0) -3 else 3;
+            self.ctx.grid.scrollView(delta);
+            if (self.ctx.grid.sb_len > 0 and self.ctx.grid.view_offset == before and delta != 0) {
+                self.flow.bumpOver(if (delta > 0) 1 else -1);
+            }
             self.clearHover(); // content moved under the cursor
+            if (cfg.scrollbar) {
+                self.sbBump();
+                self.cursor_only_render = false;
+            }
             self.needs_render = true;
         }
 
@@ -3919,10 +4095,20 @@ pub fn App(comptime cfg: config_mod.Config) type {
             _ = serial;
             const self: *Self = @ptrCast(@alignCast(data));
             // group is depressed layout; latched/locked layouts track depressed here.
+            const had_ctrl = self.ctrlHeld();
             _ = xkb_state_update_mask(self.xkb_state, dep, lat, lock, group, group, group);
             // Modifier flip (Ctrl for links, Shift for mouse bypass): link underline
             // visibility and cursor shape may change even with the pointer parked.
-            if (cfg.hyperlinks) self.needs_render = true;
+            if (cfg.hyperlinks) {
+                // Ctrl toggled while parked on a link: the underline row must
+                // repaint (a cursor-only frame would leave it stuck either
+                // painted or missing until the next pointer motion).
+                if (self.hover_active and had_ctrl != self.ctrlHeld()) {
+                    self.ctx.grid.markRowsDirty(self.hover_row, self.hover_row);
+                    self.cursor_only_render = false;
+                }
+                self.needs_render = true;
+            }
             self.refreshCursor();
         }
 

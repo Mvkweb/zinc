@@ -262,18 +262,27 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
         }
 
         pub fn viewCell(self: *Self, col: u16, row: u16) ?*const C {
+            return self.viewCellAt(col, row, @min(self.view_offset, self.sb_len));
+        }
+
+        /// Cell visible at (col, row) through an explicit scrollback
+        /// viewport offset (the renderer paints the interpolated offset
+        /// while gliding; everything else passes the live one).
+        /// Returns null when scrolled past available history (should not
+        /// happen; scrollView clamps).
+        pub fn viewCellAt(self: *Self, col: u16, row: u16, off: usize) ?*const C {
             if (col >= self.cols or row >= self.rows) return null;
-            const off = @min(self.view_offset, self.sb_len);
-            if (off == 0) return self.at(col, row);
-            if (row < off) {
-                const k = off - row;
+            const o = @min(off, self.sb_len);
+            if (o == 0) return self.at(col, row);
+            if (row < o) {
+                const k = o - row;
                 const phys = (self.offset + self.ring.len - k) & self.ring_mask;
                 if (self.ring[phys]) |r| {
                     if (col < r.len) return &r[col];
                 }
                 return null;
             }
-            const live_r = row - @as(u16, @intCast(off));
+            const live_r = row - @as(u16, @intCast(o));
             return self.at(col, live_r);
         }
 
