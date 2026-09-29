@@ -20,7 +20,9 @@ pub fn charClass(cp: u32) CharClass {
     if (cp < 128) {
         return switch (@as(u8, @intCast(cp))) {
             ' ', '\t', 0 => .space,
-            '"', '\'', '`', '(', ')', '[', ']', '{', '}', '<', '>', ',', ';', ':', '=', '|', '\\' => .delim,
+            // ':' is word (not delim): double-click selects whole URLs
+            // (https://…), times, and key:value pairs. ';' stays delim.
+            '"', '\'', '`', '(', ')', '[', ']', '{', '}', '<', '>', ',', ';', '=', '|', '\\' => .delim,
             else => .word,
         };
     }
@@ -398,7 +400,7 @@ test "charClass categorization" {
     try std.testing.expectEqual(CharClass.delim, charClass('('));
     try std.testing.expectEqual(CharClass.delim, charClass(')'));
     try std.testing.expectEqual(CharClass.delim, charClass(';'));
-    try std.testing.expectEqual(CharClass.delim, charClass(':'));
+    try std.testing.expectEqual(CharClass.word, charClass(':')); // URLs stay whole
     try std.testing.expectEqual(CharClass.delim, charClass(0x2500)); // box line
 
     try std.testing.expectEqual(CharClass.word, charClass('a'));
@@ -416,9 +418,11 @@ test "word span and multi-click word selection" {
     var g = try G.init(std.testing.allocator, 25, 4);
     defer g.deinit();
 
-    // Row 0: "echo /path/to/file.zig (ok)"
+    // Row 0: "echo /path/to/file.zig (ok)". The literal is 27 chars;
+    // the 25-col grid only holds the first 25 (flat-grid days silently
+    // bled the tail into row 1; the ring panics on OOB instead).
     const text0 = "echo /path/to/file.zig (ok)";
-    for (text0, 0..) |ch, i| g.at(@intCast(i), 0).setRune(ch);
+    for (text0[0..25], 0..) |ch, i| g.at(@intCast(i), 0).setRune(ch);
 
     // Double-click on 'p' of "/path/to/file.zig" (col 5)
     const span_path = findWordSpan(&g, 5, 0);

@@ -145,18 +145,45 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
         }
 
         /// Push an arbitrary row into the scrollback ring (used by reflow/tests).
+        /// The pushed row is the NEWEST history: it installs adjacent to the
+        /// screen (offset+len-1) and existing rows shift down one slot by
+        /// pointer rotation (no cell copies). A full ring evicts the oldest
+        /// row and recycles its storage. Matches scrollUp's layout, so
+        /// getScrollbackRow(0) stays the oldest under both paths.
         pub fn pushScrollbackRow(self: *Self, src: []const C) void {
             if (cfg.scrollback_cap == 0 or self.ring.len == 0) return;
+            // Full ring: detach the oldest row; its storage is recycled
+            // for the new row below (no fresh allocation in steady state).
+            var recycled: ?[]C = null;
             if (self.sb_len < cfg.scrollback_cap) {
                 self.sb_len += 1;
+            } else {
+                const old = (self.offset + self.ring.len - self.sb_len) & self.ring_mask;
+                recycled = self.ring[old];
+                self.ring[old] = null;
             }
-            const phys = (self.offset + self.ring.len - self.sb_len) & self.ring_mask;
-            if (self.ring[phys] == null or self.ring[phys].?.len != src.len) {
-                if (self.ring[phys]) |r| self.gpa.free(r);
-                self.ring[phys] = self.gpa.alloc(C, src.len) catch null;
+            var k: usize = self.sb_len;
+            while (k > 1) : (k -= 1) {
+                const dst = (self.offset + self.ring.len - k) & self.ring_mask;
+                const up = (self.offset + self.ring.len - k + 1) & self.ring_mask;
+                self.ring[dst] = self.ring[up];
             }
-            if (self.ring[phys]) |r| {
+            const top = (self.offset + self.ring.len - 1) & self.ring_mask;
+            // The pointer moved down; the slot is logically empty (without
+            // this, install would alias-overwrite the row below).
+            self.ring[top] = null;
+            if (recycled) |r| {
+                if (r.len != src.len) {
+                    self.gpa.free(r);
+                    recycled = null;
+                }
+            }
+            if (recycled == null) {
+                recycled = self.gpa.alloc(C, src.len) catch null;
+            }
+            if (recycled) |r| {
                 @memcpy(r, src);
+                self.ring[top] = r;
             }
         }
 
