@@ -145,6 +145,7 @@ const config_loader = @import("../config/loader.zig");
 const context_mod = @import("../context.zig");
 const pty_mod = @import("../pty.zig");
 const input_kb = @import("../input/keyboard.zig");
+const ime_mod = @import("../input/ime.zig");
 const selection_mod = @import("../input/selection.zig");
 const mouse_mod = @import("../input/mouse.zig");
 const hyperlink_mod = @import("../term/hyperlink.zig");
@@ -343,6 +344,26 @@ pub fn App(comptime cfg: config_mod.Config) type {
         ptr_serial: u32 = 0,
         /// Current server cursor shape (0 = unset / needs refresh; see P.cursor_shape.SHAPE_*).
         cursor_shape: u32 = 0,
+        /// IME (text-input-v3, fcitx5/ibus): manager + input objects,
+        /// composition state, last-sent cursor rect (resend on change).
+        /// Logic is gated on cfg.ime; the state itself is a fixed 20KB.
+        name_ti_manager: u32 = 0,
+        ti_manager: ?*anyopaque = null,
+        ti: ?*anyopaque = null,
+        til: TextInputListener = .{
+            .enter = null,
+            .leave = null,
+            .preedit_string = null,
+            .commit_string = null,
+            .delete_surrounding_text = null,
+            .done = null,
+        },
+        ime: ime_mod.Ime = .{},
+        ime_rect_sent: [4]i32 = .{ std.math.minInt(i32), 0, 0, 0 },
+        /// Baked keycap ligatures by base (0-9, '#' = 10, '*' = 11).
+        /// Null = not yet attempted; a blank (w == 0) entry = tried and
+        /// missing, so frames never re-bake a miss (fallback owns it).
+        keycap_baked: [12]?atlas_mod.Baked = [_]?atlas_mod.Baked{null} ** 12,
         /// Debug knobs, read from the environment ONCE at open (never in
         /// the PTY/render hot path: getenv scans environ per call).
         trace_on: bool = false,
@@ -446,7 +467,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (runtime_cfg.fg) |color| ctx.fg = color;
             if (runtime_cfg.cursor_color) |color| ctx.cursor_color = color;
 
-            var ft_face = ft_mod.Face.init(gpa, io, px, font_path, cfg.nerd_font_path) catch {
+            var ft_face = ft_mod.Face.init(gpa, io, px, font_path, cfg.nerd_font_path, cfg.cjk_font_path) catch {
                 ctx.deinit();
                 return error.FontFailed;
             };
@@ -462,6 +483,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 color_atlas = atlas_mod.ColorAtlas.init(gpa) catch atlas_mod.ColorAtlas{};
             }
             ft_face.emoji_enabled = cfg.emoji;
+            // ascii_only runes can't store CJK (setRune maps to '?'):
+            // skip the ~16MB face entirely on that profile.
+            ft_face.cjk_enabled = !cfg.ascii_only;
 
             self.* = Self{
                 .gpa = gpa,
@@ -658,6 +682,43 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.xkb_ctx = xkb_context_new(0);
             }
 
+            // IME (optional): text-input manager + one input object for
+            // the seat. Events arrive on the same dispatch path as keys;
+            // preedit renders inline, commits go straight to the PTY.
+            if (cfg.ime and self.name_ti_manager != 0 and self.seat != null) {
+                const tim_iface = &P.text_input.manager_interface;
+                self.ti_manager = @ptrCast(c.wl_proxy_marshal_constructor(
+                    @ptrCast(reg),
+                    P.core.REGISTRY_BIND,
+                    tim_iface,
+                    self.name_ti_manager,
+                    tim_iface.name,
+                    P.text_input.version,
+                    @as(?*anyopaque, null),
+                ));
+                const seat = self.seat.?;
+                // NOTE: seat passed twice (see DDM comment above): the
+                // 'n' (new_id) marker may or may not consume a vararg
+                // slot; duplicating is safe under both behaviors.
+                self.ti = @ptrCast(c.wl_proxy_marshal_constructor(
+                    @ptrCast(self.ti_manager),
+                    P.text_input.MANAGER_GET_TEXT_INPUT,
+                    &P.text_input.input_interface,
+                    @as(?*anyopaque, @ptrCast(seat)),
+                    @as(?*anyopaque, @ptrCast(seat)),
+                    @as(?*anyopaque, null),
+                ));
+                self.til = TextInputListener{
+                    .enter = appOnTiEnter,
+                    .leave = appOnTiLeave,
+                    .preedit_string = appOnTiPreedit,
+                    .commit_string = appOnTiCommit,
+                    .delete_surrounding_text = appOnTiDelete,
+                    .done = appOnTiDone,
+                };
+                _ = c.wl_proxy_add_listener(@ptrCast(self.ti), @ptrCast(&self.til), @ptrCast(self));
+            }
+
             // Clipboard manager (optional: pastes/copies degrade to no-ops).
             // Seat is unwrapped once so a null seat can never reach the
             // get_data_device call below (libwayland aborts on null objects).
@@ -776,6 +837,14 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (self.ddm) |m| c.wl_proxy_destroy(@ptrCast(m));
             if (self.cursor_shape_dev) |d| c.wl_proxy_destroy(@ptrCast(d));
             if (self.cursor_shape_mgr) |m| c.wl_proxy_destroy(@ptrCast(m));
+            if (cfg.ime) {
+                if (self.ti) |t| {
+                    c.wl_proxy_marshal(@ptrCast(t), P.text_input.DESTROY);
+                    c.wl_proxy_destroy(@ptrCast(t));
+                    self.ti = null;
+                }
+                if (self.ti_manager) |m| c.wl_proxy_destroy(@ptrCast(m));
+            }
             if (self.clip_text) |t| self.gpa.free(t);
             if (self.hover_uri) |u| self.gpa.free(u);
             self.find_matches.deinit(self.gpa);
@@ -1224,6 +1293,159 @@ pub fn App(comptime cfg: config_mod.Config) type {
             return false;
         }
 
+        /// Native keycap ligature (GSUB: base + U+20E3 → one designed
+        /// color glyph, the way browsers render 1️⃣). Replaces the whole
+        /// cell (base + VS16 + mark are all inside the ligature) when the
+        /// emoji face carries the sequence; false = fall back to
+        /// plate+legend. One atlas bake per base, cached (misses cache
+        /// blank so failures never re-bake per frame).
+        fn blitKeycapLigature(
+            self: *Self,
+            base_cp: u21,
+            combining: []const u32,
+            x: u32,
+            y: u32,
+            W: u32,
+            H: u32,
+            dmg: *software.Damage,
+        ) bool {
+            if (!cfg.emoji) return false;
+            var has_mark = false;
+            for (combining) |m| {
+                if (cellCp(m) == 0x20E3) {
+                    has_mark = true;
+                    break;
+                }
+            }
+            if (!has_mark) return false;
+            const s = ft_mod.Face.keycapSlot(base_cp) orelse return false;
+            if (self.keycap_baked[s] == null) {
+                const ca: ?*atlas_mod.ColorAtlas = if (cfg.emoji) &self.color_atlas else null;
+                const blank = atlas_mod.Baked{
+                    .x = 0,
+                    .y = 0,
+                    .w = 0,
+                    .h = 0,
+                    .xoff = 0,
+                    .yoff = 0,
+                    .advance = 0,
+                    .font_slot = 0,
+                };
+                self.keycap_baked[s] = self.ft_face.bakeKeycap(ca, base_cp) orelse blank;
+            }
+            const b = self.keycap_baked[s] orelse return false;
+            if (!b.color or b.w == 0) return false;
+            self.blitCellGlyph(b, x, y, 0xFFFFFFFF, W, H, dmg);
+            return true;
+        }
+
+        /// Keycap plate (U+20E3): its color bitmap is solid-centered, so
+        /// the frame must paint UNDER the digit (browsers do the same) —
+        /// unlike normal combining marks, which overlay the base. Returns
+        /// the baked legend decision when a plate painted (null = none):
+        /// true draws the digit dark, false white, for guaranteed contrast
+        /// against the plate fill. A monochrome fallback frame composes
+        /// correctly too (hollow: legend color is irrelevant but harmless).
+        fn blitKeycapPlate(
+            self: *Self,
+            combining: []const u32,
+            style: ft_mod.Style,
+            x: u32,
+            y: u32,
+            fg: u32,
+            W: u32,
+            H: u32,
+            dmg: *software.Damage,
+        ) ?bool {
+            for (combining) |m| {
+                if (cellCp(m) == 0x20E3) {
+                    if (self.glyphFor(0x20E3, style)) |g| {
+                        self.blitCellGlyph(g, x, y, fg, W, H, dmg);
+                        return g.keycap_dark;
+                    }
+                    return null;
+                }
+            }
+            return null;
+        }
+
+        /// IME preedit overlay: composition preview drawn at the cursor
+        /// (theme fg, single underline), clamped to the visible row. Wide
+        /// chars advance 2; overflow shifts the start left (foot parity).
+        /// Pure overlay: grid cells, scrollback, selection never see it.
+        fn renderPreedit(
+            self: *Self,
+            W: u32,
+            H: u32,
+            px: i32,
+            py: i32,
+            cw: i32,
+            ch: i32,
+            fyshift: i32,
+            visible_cols: u16,
+            visible_rows: u16,
+            dmg: *software.Damage,
+        ) void {
+            if (!self.ime.focused or self.ime.preedit_len == 0) return;
+            // Live view only: in scrollback the cursor row isn't visual.
+            const voff: usize = @min(self.ctx.grid.view_offset, self.ctx.grid.sb_len);
+            if (voff != 0) return;
+            const row = self.ctx.cursor_row;
+            if (row >= visible_rows or cw <= 0 or ch <= 0) return;
+            const t = self.ime.preeditSlice();
+            var cps: [1024]u21 = undefined;
+            var n: usize = 0;
+            var idx: usize = 0;
+            while (idx < t.len and n < cps.len) {
+                cps[n] = utf8_mod.decode(t, &idx);
+                n += 1;
+            }
+            var need: usize = 0;
+            for (cps[0..n]) |cp| need += ime_mod.cellWidth(cp);
+            if (need == 0) return;
+            const col: usize = self.ctx.cursor_col;
+            const space: usize = if (col < visible_cols) visible_cols - col else 0;
+            // Drop leading chars (whole) until the tail fits.
+            var si: usize = 0;
+            var drop = if (need > space) need - space else 0;
+            while (si < n and drop > 0) {
+                const w: usize = ime_mod.cellWidth(cps[si]);
+                if (w > drop) break;
+                drop -= w;
+                si += 1;
+            }
+            var rem: usize = need;
+            for (cps[0..si]) |cp| rem -= ime_mod.cellWidth(cp);
+            var ccol: usize = if (rem >= space) visible_cols -| rem else col;
+            const fg = self.themed(self.ctx.fg, false);
+            const uh: u32 = if (self.ft_face.ul_thick_px > 0)
+                self.ft_face.ul_thick_px
+            else
+                @intCast(@max(1, @divFloor(ch, 14)));
+            const uoff: i32 = if (self.ft_face.ul_thick_px > 0)
+                -@as(i32, self.ft_face.ul_pos_px)
+            else
+                @max(1, @divFloor(ch, 12));
+            const sy: i32 = py + @as(i32, row) * ch + fyshift;
+            if (sy < 0 or sy >= @as(i32, @intCast(H))) return;
+            const y: u32 = @intCast(sy);
+            var i: usize = si;
+            while (i < n) : (i += 1) {
+                const w: usize = ime_mod.cellWidth(cps[i]);
+                if (ccol + w > visible_cols) break;
+                const x: u32 = @intCast(px + @as(i32, @intCast(ccol)) * cw);
+                if (self.glyphFor(cps[i], .regular)) |g| {
+                    self.blitCellGlyph(g, x, y, fg, W, H, dmg);
+                }
+                const ytop: i32 = @as(i32, @intCast(y));
+                const ymax: i32 = ytop + ch - @as(i32, @intCast(uh));
+                var yy: i32 = ytop + ch - uoff - @as(i32, @intCast(uh));
+                yy = @max(ytop, @min(ymax, yy));
+                software.fillRect(self.pool_pixels, W, H, x, @intCast(yy), @intCast(w * @as(usize, @intCast(cw))), uh, fg, dmg);
+                ccol += w;
+            }
+        }
+
         fn renderCells(self: *Self) software.Damage {
             var dmg = software.Damage{};
             const W: u32 = @intCast(self.width);
@@ -1250,6 +1472,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 (cfg.hyperlinks and self.hover_active and self.ctrlHeld()) or
                 (cfg.copy_mode and self.copy_active) or
                 (self.trail_ms > 0 and self.flow.trail_n > 0) or
+                (cfg.ime and self.ime.focused and self.ime.preedit_len > 0) or
                 (cfg.kitty_gfx and self.ctx.images.placements.items.len > 0);
             if (full) {
                 software.fillRect(self.pool_pixels, W, H, 0, 0, W, H, bg_all, &dmg);
@@ -1401,16 +1624,25 @@ pub fn App(comptime cfg: config_mod.Config) type {
                                     .italic
                                 else
                                     .regular;
-                                if (self.glyphFor(cp, style)) |g| {
-                                    self.blitCellGlyph(g, x, y, fg, W, H, &dmg);
-                                } else if (box_drawing.isBoxDrawingOrBlock(cp)) {
-                                    _ = box_drawing.draw(self.pool_pixels, W, H, x, y, cw, ch, cp, fg, &dmg);
-                                }
-                                var ci: u8 = 0;
-                                while (ci < cell.combining_count) : (ci += 1) {
-                                    const ccp = cellCp(cell.combining[ci]);
-                                    if (self.glyphFor(ccp, style)) |g| {
-                                        self.blitCellGlyph(g, x, y, fg, W, H, &dmg);
+                                // Native ligature first (single designed
+                                // glyph); plate+legend fallback below.
+                                if (!self.blitKeycapLigature(cellCp(cell.rune), cell.combining[0..cell.combining_count], x, y, W, H, &dmg)) {
+                                    // Keycap plate under the digit (solid center);
+                                    // the legend takes the baked contrast color.
+                                    const plate = self.blitKeycapPlate(cell.combining[0..cell.combining_count], style, x, y, fg, W, H, &dmg);
+                                    const base_fg = if (plate) |dark| (if (dark) @as(u32, 0xFF000000) else @as(u32, 0xFFFFFFFF)) else fg;
+                                    if (self.glyphFor(cp, style)) |g| {
+                                        self.blitCellGlyph(g, x, y, base_fg, W, H, &dmg);
+                                    } else if (box_drawing.isBoxDrawingOrBlock(cp)) {
+                                        _ = box_drawing.draw(self.pool_pixels, W, H, x, y, cw, ch, cp, base_fg, &dmg);
+                                    }
+                                    var ci: u8 = 0;
+                                    while (ci < cell.combining_count) : (ci += 1) {
+                                        const ccp = cellCp(cell.combining[ci]);
+                                        if (plate != null and ccp == 0x20E3) continue;
+                                        if (self.glyphFor(ccp, style)) |g| {
+                                            self.blitCellGlyph(g, x, y, fg, W, H, &dmg);
+                                        }
                                     }
                                 }
                             }
@@ -1555,6 +1787,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     software.fillRect(self.pool_pixels, W, H, ox + ow - ot, oy, ot, oh, cur, &dmg);
                 }
             }
+            // IME preedit: inline composition preview at the cursor (theme
+            // fg, single underline). Overlay only — never touches the grid.
+            if (cfg.ime) self.renderPreedit(W, H, px, py, cw, ch, fyshift, visible_cols, visible_rows, &dmg);
             // Copy cursor: solid block in cursor color + COPY tag. The
             // normal cursor stays hidden while copy mode owns the screen.
             if (cfg.copy_mode and self.copy_active) {
@@ -1668,8 +1903,18 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         .italic
                     else
                         .regular;
-                    if (self.glyphFor(cp, style)) |g| {
-                        self.blitCellGlyph(g, ccx, ccy, fg_color, W, H, &dmg);
+                    // Native ligature or the base digit below (plate and
+                    // legend handled in the full-frame path; cursor-only
+                    // repaints of a ligature cell redraw it whole here).
+                    const lig = self.blitKeycapLigature(cellCp(cell.rune), cell.combining[0..cell.combining_count], ccx, ccy, W, H, &dmg);
+                    if (!lig) {
+                        const plate_dark = self.blitKeycapPlate(cell.combining[0..cell.combining_count], style, ccx, ccy, fg_color, W, H, &dmg);
+                        if (self.glyphFor(cp, style)) |g| {
+                            // Keycap legend keeps its baked contrast color here
+                            // too (cursor-only repaints must match full frames).
+                            const legend_fg = if (plate_dark) |dark| (if (dark) @as(u32, 0xFF000000) else @as(u32, 0xFFFFFFFF)) else fg_color;
+                            self.blitCellGlyph(g, ccx, ccy, legend_fg, W, H, &dmg);
+                        }
                     }
                 }
             }
@@ -1849,6 +2094,14 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.last_cur_col = self.ctx.cursor_col;
                 self.last_cur_row = self.ctx.cursor_row;
             }
+            // IME candidate window tracks the cursor (moves, scrolls,
+            // resizes). Sealed only when the rect actually moved.
+            if (cfg.ime and self.ime.focused) {
+                if (self.imePushRect()) {
+                    c.wl_proxy_marshal(@ptrCast(self.ti), P.text_input.COMMIT);
+                    self.ime.serial += 1;
+                }
+            }
             const is_prof = self.profile_on;
             const t0: i64 = if (is_prof) context_mod.nowMs() else 0;
             const is_cursor_only = self.cursor_only_render and self.pending_resize == null and self.resize_settle_ms == 0 and self.flow.settled();
@@ -2021,6 +2274,85 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const u = user orelse return;
             const fd: i32 = @intCast(@intFromPtr(u));
             pty_mod.writeAll(fd, data);
+        }
+
+        // -- IME (text-input-v3) -------------------------------------------------
+        // fcitx5/ibus composition: preedit renders inline (never touches the
+        // grid), commits go verbatim to the shell. Foot-measured behavior:
+        // enable on ti-enter, serial-checked done batches, candidate rect
+        // at the cursor (preedit end while composing).
+
+        /// Surface coords of the candidate anchor: cursor cell, or the
+        /// preedit visual end while composing (foot parity).
+        fn imeRectNow(self: *const Self) [4]i32 {
+            const px: i32 = @intCast(self.currentPadX());
+            const py: i32 = @intCast(self.currentPadY());
+            var col: i32 = self.ctx.cursor_col;
+            if (self.ime.preedit_len > 0) {
+                const t = self.ime.preeditSlice();
+                var idx: usize = 0;
+                while (idx < t.len) {
+                    const len = std.unicode.utf8ByteSequenceLength(t[idx]) catch break;
+                    if (len == 0 or idx + len > t.len) break;
+                    const cp = std.unicode.utf8Decode(t[idx..][0..len]) catch break;
+                    col += @as(i32, @intCast(ime_mod.cellWidth(cp)));
+                    idx += len;
+                }
+            }
+            col = @min(col, @as(i32, self.ctx.grid.cols));
+            return .{
+                px + col * self.cell_w,
+                py + @as(i32, self.ctx.cursor_row) * self.cell_h,
+                self.cell_w,
+                self.cell_h,
+            };
+        }
+
+        /// Marshal a cursor rectangle when it moved. No commit here; the
+        /// caller seals the batch (enable/done paths commit + bump serial).
+        fn imePushRect(self: *Self) bool {
+            if (!cfg.ime or self.ti == null) return false;
+            const r = self.imeRectNow();
+            if (r[0] == self.ime_rect_sent[0] and r[1] == self.ime_rect_sent[1] and
+                r[2] == self.ime_rect_sent[2] and r[3] == self.ime_rect_sent[3]) return false;
+            c.wl_proxy_marshal(@ptrCast(self.ti), P.text_input.SET_CURSOR_RECTANGLE, r[0], r[1], r[2], r[3]);
+            self.ime_rect_sent = r;
+            return true;
+        }
+
+        /// State commit: surrounding text + rect, sealed. Bumps the serial
+        /// that done() must echo (stale batches are dropped whole).
+        fn imeSendState(self: *Self) void {
+            if (!cfg.ime or self.ti == null or !self.ime.focused) return;
+            var buf: [ime_mod.MAX_TEXT]u8 = undefined;
+            const s = ime_mod.surroundingText(&self.ctx.grid, self.ctx.cursor_col, self.ctx.cursor_row, &buf);
+            var z: [ime_mod.MAX_TEXT + 1]u8 = undefined;
+            @memcpy(z[0..s.len], buf[0..s.len]);
+            z[s.len] = 0;
+            const zs: [*:0]const u8 = @ptrCast(&z);
+            c.wl_proxy_marshal(@ptrCast(self.ti), P.text_input.SET_SURROUNDING_TEXT, zs, @as(i32, @intCast(s.cursor)), @as(i32, @intCast(s.cursor)));
+            self.ime.setSent(buf[0..s.cursor], buf[s.cursor..s.len]);
+            _ = self.imePushRect();
+            c.wl_proxy_marshal(@ptrCast(self.ti), P.text_input.COMMIT);
+            self.ime.serial += 1;
+        }
+
+        fn imeEnable(self: *Self) void {
+            if (!cfg.ime or self.ti == null or !self.ime.focused) return;
+            self.ime.resetAll();
+            c.wl_proxy_marshal(@ptrCast(self.ti), P.text_input.ENABLE);
+            c.wl_proxy_marshal(@ptrCast(self.ti), P.text_input.SET_CONTENT_TYPE, P.text_input.HINT_NONE, P.text_input.PURPOSE_TERMINAL);
+            self.imeSendState();
+        }
+
+        fn imeDisable(self: *Self) void {
+            if (!cfg.ime or self.ti == null) return;
+            self.ime.resetAll();
+            self.ime.focused = false;
+            c.wl_proxy_marshal(@ptrCast(self.ti), P.text_input.DISABLE);
+            c.wl_proxy_marshal(@ptrCast(self.ti), P.text_input.COMMIT);
+            self.ime.serial += 1;
+            self.needs_render = true;
         }
 
         /// (Re)arm the repeat timer: first fire after value_ms, then every
@@ -3362,6 +3694,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.want_ddm_v = @min(version, 3);
             } else if (std.mem.eql(u8, iname, "wp_cursor_shape_manager_v1")) {
                 self.name_cursor_shape = name;
+            } else if (std.mem.eql(u8, iname, "zwp_text_input_manager_v3")) {
+                self.name_ti_manager = name;
             }
         }
 
@@ -3477,6 +3811,68 @@ pub fn App(comptime cfg: config_mod.Config) type {
             _ = surface;
             const self: *Self = @ptrCast(@alignCast(data));
             self.ctx.setFocus(false);
+            // Safety: some compositors skip ti-leave on focus loss.
+            if (cfg.ime) self.imeDisable();
+        }
+
+        fn appOnTiEnter(data: ?*anyopaque, ti_obj: ?*anyopaque, surface: ?*P.Surface) callconv(.c) void {
+            if (!cfg.ime) return;
+            const self: *Self = @ptrCast(@alignCast(data));
+            if (ti_obj != self.ti) return;
+            if (surface == null) return; // seen on Hyprland (foot parity)
+            self.ime.focused = true;
+            self.imeEnable();
+            self.needs_render = true;
+        }
+
+        fn appOnTiLeave(data: ?*anyopaque, ti_obj: ?*anyopaque) callconv(.c) void {
+            if (!cfg.ime) return;
+            const self: *Self = @ptrCast(@alignCast(data));
+            if (ti_obj != self.ti) return;
+            self.imeDisable();
+        }
+
+        fn appOnTiPreedit(data: ?*anyopaque, ti_obj: ?*anyopaque, text: ?[*:0]const u8, begin: i32, end: i32) callconv(.c) void {
+            if (!cfg.ime) return;
+            const self: *Self = @ptrCast(@alignCast(data));
+            if (ti_obj != self.ti) return;
+            if (text) |t| self.ime.stagePreedit(std.mem.span(t), begin, end);
+        }
+
+        fn appOnTiCommit(data: ?*anyopaque, ti_obj: ?*anyopaque, text: ?[*:0]const u8) callconv(.c) void {
+            if (!cfg.ime) return;
+            const self: *Self = @ptrCast(@alignCast(data));
+            if (ti_obj != self.ti) return;
+            if (text) |t| self.ime.stageCommit(std.mem.span(t));
+        }
+
+        fn appOnTiDelete(data: ?*anyopaque, ti_obj: ?*anyopaque, before: u32, after: u32) callconv(.c) void {
+            if (!cfg.ime) return;
+            const self: *Self = @ptrCast(@alignCast(data));
+            if (ti_obj != self.ti) return;
+            self.ime.pend_del_before = before;
+            self.ime.pend_del_after = after;
+        }
+
+        fn appOnTiDone(data: ?*anyopaque, ti_obj: ?*anyopaque, serial: u32) callconv(.c) void {
+            if (!cfg.ime) return;
+            const self: *Self = @ptrCast(@alignCast(data));
+            if (ti_obj != self.ti) return;
+            const act = self.ime.finish(serial);
+            // Commit bytes go verbatim to the shell (it echoes); deletes
+            // become keys (backspace before, Delete after) since shell
+            // state is the only buffer that matters.
+            if (act.commit.len > 0) self.sendToPty(act.commit);
+            var k: usize = 0;
+            while (k < act.del_before_chars) : (k += 1) self.sendToPty("\x7f");
+            k = 0;
+            while (k < act.del_after_chars) : (k += 1) self.sendToPty("\x1b[3~");
+            if (act.commit.len > 0 or act.del_before_chars > 0 or act.del_after_chars > 0 or act.preedit_changed) {
+                self.ctx.grid.markRowsDirty(self.ctx.cursor_row, self.ctx.cursor_row);
+                self.needs_render = true;
+            }
+            // Refresh surrounding context for the IME's next batch.
+            self.imeSendState();
         }
 
         fn appOnKey(data: ?*anyopaque, kb: ?*P.Keyboard, serial: u32, time: u32, key: u32, key_state: u32) callconv(.c) void {
@@ -3617,6 +4013,17 @@ const DataSourceListener = extern struct {
     target: ?*const fn (?*anyopaque, ?*P.DataSource, ?[*:0]const u8) callconv(.c) void,
     send: ?*const fn (?*anyopaque, ?*P.DataSource, [*:0]const u8, i32) callconv(.c) void,
     cancelled: ?*const fn (?*anyopaque, ?*P.DataSource) callconv(.c) void,
+};
+
+/// zwp_text_input_v3 event set. Slots match wl_proto.text_input order
+/// (enter..done); libwayland indexes by opcode.
+const TextInputListener = extern struct {
+    enter: ?*const fn (?*anyopaque, ?*anyopaque, ?*P.Surface) callconv(.c) void,
+    leave: ?*const fn (?*anyopaque, ?*anyopaque) callconv(.c) void,
+    preedit_string: ?*const fn (?*anyopaque, ?*anyopaque, ?[*:0]const u8, i32, i32) callconv(.c) void,
+    commit_string: ?*const fn (?*anyopaque, ?*anyopaque, ?[*:0]const u8) callconv(.c) void,
+    delete_surrounding_text: ?*const fn (?*anyopaque, ?*anyopaque, u32, u32) callconv(.c) void,
+    done: ?*const fn (?*anyopaque, ?*anyopaque, u32) callconv(.c) void,
 };
 test "shm buffer resize" {
     var b = ShmBuffer{};

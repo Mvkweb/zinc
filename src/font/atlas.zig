@@ -16,7 +16,14 @@ pub const Baked = struct {
     xoff: i8,
     yoff: i8,
     advance: u8,
-    font_slot: u2,
+    /// Face lane that baked this glyph: 0 = primary/style, 1-3 =
+    /// generic fallbacks, 4 = CJK. Metadata only (render looks the
+    /// pixels up by atlas position).
+    font_slot: u3,
+    /// Keycap plates (U+20E3): the frame's center is solid, so the digit
+    /// legend needs guaranteed contrast. Sampled from the plate interior
+    /// at bake: true = light plate = draw the legend dark (and vice versa).
+    keycap_dark: bool = false,
     /// Color emoji (CBDT/COLR): pixels live in ColorAtlas at (cx, cy).
     color: bool = false,
     cx: u16 = 0,

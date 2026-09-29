@@ -71,6 +71,11 @@ pub const Config = struct {
     /// Nerd-symbols fallback face (icons). Same discovery with
     /// ZINC_FONT_NERD override; silently absent when not found.
     nerd_font_path: []const u8 = "",
+    /// CJK fallback face (Chinese/Japanese/Korean wide glyphs). Same
+    /// discovery with ZINC_FONT_CJK override (fontconfig Noto Sans CJK
+    /// families first); silently absent when not found. ascii_only
+    /// builds never load it (runes can't store CJK anyway).
+    cjk_font_path: []const u8 = "",
     font_min_size: f32 = 1.0,
     font_max_size: f32 = 96.0,
     font_atlas_size: u16 = 512,
@@ -124,6 +129,9 @@ pub const Config = struct {
     clipboard: bool = true,
     clipboard_osc52: bool = true,
     clipboard_buf_size: u32 = 4096,
+    /// Wayland IME (text-input-v3): preedit + commit for CJK input via
+    /// fcitx5/ibus. Needs a compositor advertising the protocol.
+    ime: bool = true,
     /// Editor for Ctrl+click file paths. Empty = automatic: $EDITOR, then
     /// xdg-open desktop default. Template honors {file}/{line}/{col}.
     editor_command: []const u8 = "",
@@ -191,6 +199,7 @@ pub const minimal: Config = .{
     .hyperlinks = false,
     .find = false,
     .copy_mode = false,
+    .ime = false,
 };
 
 /// Active profile selected by `-Dminimal` / `-Dascii-only`.

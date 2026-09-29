@@ -458,6 +458,7 @@ test {
     _ = @import("input/keyboard.zig");
     _ = @import("input/mouse.zig");
     _ = @import("input/selection.zig");
+    _ = @import("input/ime.zig");
     _ = @import("util/utf8.zig");
     _ = @import("util/base64.zig");
     _ = @import("util/inflate.zig");

@@ -62,6 +62,36 @@ pub fn isEmoji(cp: u21) bool {
     return cp >= 0x1F000 and cp <= 0x1FAFF;
 }
 
+/// Keycap-sequence base (UTS#51): ASCII digits, '#', '*'. With an
+/// optional VS16 and U+20E3 they compose one 2-cell emoji (1️⃣).
+pub fn isKeycapBase(cp: u21) bool {
+    return (cp >= '0' and cp <= '9') or cp == '#' or cp == '*';
+}
+
+/// CJK font-coverage test: codepoints a CJK fallback face is expected to
+/// serve (bake fast lane). Han ideographs + extensions, kana, bopomofo,
+/// hangul, CJK symbols/punctuation, fullwidth forms. Superset of the
+/// double-width CJK arms in isWide (1-cell kana punct etc. included:
+/// coverage, not width).
+pub fn isCjk(cp: u21) bool {
+    return (cp >= 0x1100 and cp <= 0x11FF) or // Hangul Jamo
+        (cp >= 0x2E80 and cp <= 0x303F) or // Radicals .. CJK symbols/punct
+        (cp >= 0x3040 and cp <= 0x30FF) or // Hiragana + Katakana
+        (cp >= 0x3100 and cp <= 0x312F) or // Bopomofo
+        (cp >= 0x3130 and cp <= 0x318F) or // Hangul compat jamo
+        (cp >= 0x3190 and cp <= 0x319F) or // Kanbun
+        (cp >= 0x31F0 and cp <= 0x31FF) or // Katakana phonetic ext
+        (cp >= 0x3200 and cp <= 0x33FF) or // Enclosed CJK + compat
+        (cp >= 0x3400 and cp <= 0x4DBF) or // Ext A
+        (cp >= 0x4E00 and cp <= 0x9FFF) or // Unified ideographs
+        (cp >= 0xAC00 and cp <= 0xD7AF) or // Hangul syllables
+        (cp >= 0xF900 and cp <= 0xFAFF) or // Compat ideographs
+        (cp >= 0xFE30 and cp <= 0xFE4F) or // CJK compat forms
+        (cp >= 0xFF00 and cp <= 0xFFEF) or // Fullwidth / halfwidth
+        (cp >= 0x20000 and cp <= 0x3134F) or // Ext B..G
+        (cp >= 0x2F800 and cp <= 0x2FA1F); // Compat ideographs suppl
+}
+
 pub fn isCombining(cp: u21) bool {
     return (cp >= 0x0300 and cp <= 0x036F) or
         (cp >= 0x1AB0 and cp <= 0x1AFF) or
@@ -96,4 +126,34 @@ test "wide/box/combining classes" {
     try std.testing.expect(!isEmoji('x'));
     try std.testing.expect(isBoxDraw(0x2500));
     try std.testing.expect(isCombining(0x0301));
+    try std.testing.expect(isKeycapBase('1'));
+    try std.testing.expect(isKeycapBase('#'));
+    try std.testing.expect(isKeycapBase('*'));
+    try std.testing.expect(!isKeycapBase('A'));
+    try std.testing.expect(!isKeycapBase(0x20E3));
+}
+
+test "cjk coverage classes" {
+    // Han + extensions across planes.
+    try std.testing.expect(isCjk(0x4E2D)); // 中
+    try std.testing.expect(isCjk(0x3400)); // Ext A start
+    try std.testing.expect(isCjk(0x20000)); // Ext B start
+    try std.testing.expect(isCjk(0x2A6D6)); // 龜 Ext C
+    // Japanese: hiragana, katakana, kanbun.
+    try std.testing.expect(isCjk(0x3042)); // あ
+    try std.testing.expect(isCjk(0x30A2)); // ア
+    try std.testing.expect(isCjk(0x3192)); // Kanbun
+    // Korean: jamo, compat jamo, syllables.
+    try std.testing.expect(isCjk(0x1100));
+    try std.testing.expect(isCjk(0x3131)); // ㄱ
+    try std.testing.expect(isCjk(0xAC00)); // 가
+    // Symbols, punctuation, fullwidth.
+    try std.testing.expect(isCjk(0x3001)); // 、
+    try std.testing.expect(isCjk(0xFF01)); // ！
+    try std.testing.expect(isCjk(0x3296)); // ㊖ enclosed
+    // Non-CJK stays out (emoji has its own lane, Latin is primary).
+    try std.testing.expect(!isCjk(0x1F631));
+    try std.testing.expect(!isCjk('x'));
+    try std.testing.expect(!isCjk(0x00E9));
+    try std.testing.expect(!isCjk(0x2500));
 }

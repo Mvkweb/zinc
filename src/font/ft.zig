@@ -150,6 +150,34 @@ const EMOJI_FAMILIES = [_][]const u8{
     "Segoe UI Emoji",
 };
 
+/// CJK candidates (distro layouts vary; .ttc probed per face index).
+/// Noto Sans CJK first (clean 2-cell metrics), WenQuanYi as fallback.
+const CJK_CANDIDATES = [_][]const u8{
+    "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/TTF/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansMonoCJK-Regular.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
+    "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
+    "/usr/share/fonts/wenquanyi/wqy-microhei/wqy-microhei.ttc",
+};
+
+const CJK_HOME_SUFFIXES = [_][]const u8{
+    "/.local/share/fonts/NotoSansCJK-Regular.ttc",
+    "/.local/share/fonts/NotoSansMonoCJK-Regular.ttc",
+    "/.local/share/fonts/wqy-microhei.ttc",
+    "/.fonts/NotoSansCJK-Regular.ttc",
+    "/.fonts/wqy-microhei.ttc",
+};
+
+const CJK_FAMILIES = [_][]const u8{
+    "Noto Sans CJK SC",
+    "Noto Sans CJK JP",
+    "Noto Sans CJK TC",
+    "Noto Sans Mono CJK SC",
+    "WenQuanYi Micro Hei",
+};
+
 /// Fontconfig C API wrapper for font discovery, variant resolution, and fallback sorting.
 pub const fc = struct {
     var initialized: bool = false;
@@ -342,6 +370,10 @@ pub const Face = struct {
     ppath_len: usize = 0,
     nerd_path_buf: [1024]u8 = undefined,
     nerd_path_len: usize = 0,
+    cjk_path_buf: [1024]u8 = undefined,
+    cjk_path_len: usize = 0,
+    keycap_gsub_done: bool = false,
+    keycap_lig: [12]u32 = .{0} ** 12,
     bold_tried: bool = false,
     italic_tried: bool = false,
     bold_italic_tried: bool = false,
@@ -351,6 +383,12 @@ pub const Face = struct {
     emoji_face: ?c.FT_Face = null,
     emoji_tried: bool = false,
     emoji_enabled: bool = true,
+    /// CJK face, lazy-loaded on first CJK bake (~16MB/weight, never at
+    /// startup). Null = absent or unwanted; cjk_enabled=false (ascii_only
+    /// profile) skips loading entirely.
+    cjk_face: ?c.FT_Face = null,
+    cjk_tried: bool = false,
+    cjk_enabled: bool = true,
 
     pub fn ensureBold(self: *Face) ?c.FT_Face {
         if (self.bold != null or self.bold_tried) return self.bold;
@@ -416,7 +454,7 @@ pub const Face = struct {
         return self.emoji_face;
     }
 
-    pub fn init(gpa: std.mem.Allocator, io: std.Io, px: u16, config_path: []const u8, nerd_path: []const u8) Error!Face {
+    pub fn init(gpa: std.mem.Allocator, io: std.Io, px: u16, config_path: []const u8, nerd_path: []const u8, cjk_path: []const u8) Error!Face {
         defer fc.deinit();
 
         var lib: c.FT_Library = undefined;
@@ -506,6 +544,10 @@ pub const Face = struct {
         if (nerd_path.len <= self.nerd_path_buf.len) {
             @memcpy(self.nerd_path_buf[0..nerd_path.len], nerd_path);
             self.nerd_path_len = nerd_path.len;
+        }
+        if (cjk_path.len <= self.cjk_path_buf.len) {
+            @memcpy(self.cjk_path_buf[0..cjk_path.len], cjk_path);
+            self.cjk_path_len = cjk_path.len;
         }
         return self;
     }
@@ -750,6 +792,237 @@ pub const Face = struct {
         return null;
     }
 
+    /// CJK face: ZINC_FONT_CJK env > explicit config path > well-known
+    /// files > $HOME fonts > fontconfig families. Acceptance = resolves
+    /// U+4E2D (proves Han coverage, not just a valid container). .ttc
+    /// collections are probed per face index (Noto CJK ships the SC/JP/TC
+    /// variants in one file; index 0 is not always the wanted one).
+    fn loadCjk(lib: c.FT_Library, px: u16, cjk_path: []const u8, primary_path: []const u8) ?c.FT_Face {
+        if (std.c.getenv("ZINC_FONT_CJK")) |p| {
+            if (loadCjkFace(lib, px, std.mem.span(p))) |f| {
+                std.debug.print("[zinc] font cjk: {s}\n", .{std.mem.span(p)});
+                return f;
+            }
+        }
+        if (cjk_path.len > 0 and !std.mem.eql(u8, cjk_path, primary_path)) {
+            if (loadCjkFace(lib, px, cjk_path)) |f| {
+                std.debug.print("[zinc] font cjk: {s}\n", .{cjk_path});
+                return f;
+            }
+        }
+        for (CJK_CANDIDATES) |cand| {
+            if (std.mem.eql(u8, cand, primary_path)) continue;
+            if (loadCjkFace(lib, px, cand)) |f| {
+                std.debug.print("[zinc] font cjk: {s}\n", .{cand});
+                return f;
+            }
+        }
+        if (std.c.getenv("HOME")) |h| {
+            const home = std.mem.span(h);
+            for (CJK_HOME_SUFFIXES) |suf| {
+                var buf: [512]u8 = undefined;
+                if (home.len + suf.len + 1 > buf.len) continue;
+                @memcpy(buf[0..home.len], home);
+                @memcpy(buf[home.len..][0..suf.len], suf);
+                const full = buf[0 .. home.len + suf.len];
+                if (std.mem.eql(u8, full, primary_path)) continue;
+                if (loadCjkFace(lib, px, full)) |f| {
+                    std.debug.print("[zinc] font cjk: {s}\n", .{full});
+                    return f;
+                }
+            }
+        }
+        // Non-monospace match: CJK faces carry proportional Latin, and
+        // FC_MONO would reject them (same reason as the emoji families).
+        for (CJK_FAMILIES) |fam| {
+            var fc_buf: [1024]u8 = undefined;
+            if (fc.match(fam, null, null, false, &fc_buf)) |m| {
+                if (std.mem.eql(u8, m.path, primary_path)) continue;
+                if (loadCjkFace(lib, px, m.path)) |f| {
+                    std.debug.print("[zinc] font cjk: {s}\n", .{m.path});
+                    return f;
+                }
+            }
+        }
+        return null;
+    }
+
+    /// Raw CJK load: walk face indices (cheap for .ttf: index 0 hits, the
+    /// rest fail fast on open), keep the first face whose charmap resolves
+    /// U+4E2D with a real glyph count. UCS-4 charmap handles the SMP
+    /// extensions (Ext B+); a BMP-only table would tofu half of CJK.
+    fn loadCjkFace(lib: c.FT_Library, px: u16, path: []const u8) ?c.FT_Face {
+        var path_buf: [512]u8 = undefined;
+        if (path.len + 1 > path_buf.len) return null;
+        @memcpy(path_buf[0..path.len], path);
+        path_buf[path.len] = 0;
+        const zpath: [*:0]u8 = @ptrCast(&path_buf);
+        var idx: c_long = 0;
+        while (idx < 8) : (idx += 1) {
+            var face: c.FT_Face = undefined;
+            if (c.FT_New_Face(lib, zpath, idx, &face) != 0) break;
+            // Freed on every miss below; committed on success.
+            var keep = false;
+            defer {
+                if (!keep) _ = c.FT_Done_Face(face);
+            }
+            if (c.FT_Set_Pixel_Sizes(face, 0, @intCast(px)) != 0) continue;
+            _ = c.FT_Select_Charmap(face, c.FT_ENCODING_UNICODE);
+            if (face.*.num_glyphs == 0) continue;
+            if (c.FT_Get_Char_Index(face, 0x4E2D) == 0) continue;
+            keep = true;
+            return face;
+        }
+        return null;
+    }
+
+    /// Lazily load the CJK face (once; null when absent or disabled).
+    /// Zero cost until the first CJK bake attempt; ascii_only builds
+    /// never reach here (bake lane gated on cjk_enabled).
+    pub fn ensureCjk(self: *Face) ?c.FT_Face {
+        if (!self.cjk_enabled) return null;
+        if (self.cjk_face != null or self.cjk_tried) return self.cjk_face;
+        self.cjk_tried = true;
+        const ppath = self.ppath_buf[0..self.ppath_len];
+        self.cjk_face = loadCjk(self.lib, self.px, self.cjk_path_buf[0..self.cjk_path_len], ppath);
+        return self.cjk_face;
+    }
+
+    /// GSUB keycap ligature glyph indices in the emoji face, by base:
+    /// 0-9 = digits, 10 = '#', 11 = '*'. 0 = none/absent. Parsed once
+    /// from LigatureSubst lookups ([base, U+20E3] pairs); any malformed
+    /// table yields zeros and the plate+legend fallback owns rendering.
+    /// Storage lives in the Face field block above (keycap_gsub_done,
+    /// keycap_lig); lookup + bake helpers follow.
+    /// Keycap base slot (UTS#51): digits 0-9, '#' = 10, '*' = 11.
+    pub fn keycapSlot(base: u21) ?usize {
+        if (base >= '0' and base <= '9') return base - '0';
+        if (base == '#') return 10;
+        if (base == '*') return 11;
+        return null;
+    }
+
+    /// Ligature glyph index for [base, U+20E3] in the emoji face
+    /// (0 = none). The single scan fills all 12 slots.
+    pub fn keycapLigature(self: *Face, base: u21) u32 {
+        const slot = keycapSlot(base) orelse return 0;
+        if (self.keycap_gsub_done) return self.keycap_lig[slot];
+        self.keycap_gsub_done = true;
+        const ef = self.ensureEmoji() orelse return 0;
+        const gpa = self.gpa orelse return 0;
+        const mark_gid = c.FT_Get_Char_Index(ef, 0x20E3);
+        if (mark_gid == 0) return 0;
+        const bases = [_]u21{ '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '#', '*' };
+        var base_gids: [12]u32 = .{0} ** 12;
+        for (bases, 0..) |b, i| base_gids[i] = c.FT_Get_Char_Index(ef, @intCast(b));
+        const table = loadSfntTable(gpa, ef, 0x47535542) orelse return 0; // 'GSUB'
+        defer gpa.free(table);
+        scanKeycapLigatures(table, base_gids, mark_gid, &self.keycap_lig);
+        return self.keycap_lig[slot];
+    }
+
+    /// Raw sfnt table bytes (bounded 4MB); null when absent/unreadable.
+    fn loadSfntTable(gpa: std.mem.Allocator, face: c.FT_Face, tag: c_ulong) ?[]u8 {
+        var len: c_ulong = 0;
+        if (c.FT_Load_Sfnt_Table(face, tag, 0, null, &len) != 0) return null;
+        if (len == 0 or len > 4 * 1024 * 1024) return null;
+        const buf = gpa.alloc(u8, @intCast(len)) catch return null;
+        errdefer gpa.free(buf);
+        var got: c_ulong = len;
+        if (c.FT_Load_Sfnt_Table(face, tag, 0, buf.ptr, &got) != 0 or got != len) {
+            gpa.free(buf);
+            return null;
+        }
+        return buf;
+    }
+
+    fn ru16(data: []const u8, off: usize) ?u16 {
+        if (off + 2 > data.len) return null;
+        return (@as(u16, data[off]) << 8) | data[off + 1];
+    }
+
+    fn coverageGlyph(data: []const u8, cov: usize, index: usize) ?u32 {
+        const fmt = ru16(data, cov) orelse return null;
+        if (fmt == 1) {
+            const count = ru16(data, cov + 2) orelse return null;
+            if (index >= count) return null;
+            const gid = ru16(data, cov + 4 + 2 * index) orelse return null;
+            return @as(u32, gid);
+        } else if (fmt == 2) {
+            const range_count = ru16(data, cov + 2) orelse return null;
+            var r: usize = 0;
+            while (r < range_count) : (r += 1) {
+                const b = cov + 4 + 6 * r;
+                const start = ru16(data, b) orelse return null;
+                const end = ru16(data, b + 2) orelse return null;
+                const sci = ru16(data, b + 4) orelse return null;
+                if (end >= start and index >= sci) {
+                    const d = index - sci;
+                    if (d <= end - start) return @as(u32, start) + @as(u32, @intCast(d));
+                }
+            }
+            return null;
+        }
+        return null;
+    }
+
+    /// Fill lig[12] from GSUB LigatureSubst subtables matching
+    /// [base_gid, mark_gid]. First match per slot wins. Every offset is
+    /// bounds-checked: garbage in, zeros out (fallback path renders).
+    fn scanKeycapLigatures(data: []const u8, base_gids: [12]u32, mark_gid: u32, lig: *[12]u32) void {
+        if (data.len < 10) return;
+        const version: u32 = (@as(u32, data[0]) << 24) | (@as(u32, data[1]) << 16) | (@as(u32, data[2]) << 8) | data[3];
+        if (version != 0x00010000) return;
+        const ll = ru16(data, 8) orelse return;
+        const lookup_count = ru16(data, ll) orelse return;
+        var li: usize = 0;
+        while (li < lookup_count) : (li += 1) {
+            const lo_off = ru16(data, ll + 2 + 2 * li) orelse continue;
+            const lo = ll + lo_off;
+            if (ru16(data, lo) orelse 0 != 4) continue; // LigatureSubst
+            const sub_count = ru16(data, lo + 4) orelse continue;
+            var si: usize = 0;
+            while (si < sub_count) : (si += 1) {
+                const sub_off = ru16(data, lo + 6 + 2 * si) orelse continue;
+                const sub = lo + sub_off;
+                if (ru16(data, sub) orelse 0 != 1) continue; // LigatureSet list
+                const cov = sub + (ru16(data, sub + 2) orelse continue);
+                const lig_count = ru16(data, sub + 4) orelse continue;
+                var k: usize = 0;
+                while (k < lig_count) : (k += 1) {
+                    const set_off = ru16(data, sub + 6 + 2 * k) orelse continue;
+                    const set = sub + set_off;
+                    const cov_gid = coverageGlyph(data, cov, k) orelse continue;
+                    const n = ru16(data, set) orelse continue;
+                    var m: usize = 0;
+                    while (m < n) : (m += 1) {
+                        const lig_off = ru16(data, set + 2 + 2 * m) orelse continue;
+                        const l = set + lig_off;
+                        if (ru16(data, l + 2) orelse 0 != 2) continue; // compCount
+                        if (ru16(data, l + 4) orelse 0 != mark_gid) continue; // [., mark]
+                        const lg = ru16(data, l) orelse continue;
+                        if (lg == 0) continue;
+                        var s: usize = 0;
+                        while (s < 12) : (s += 1) {
+                            if (lig[s] == 0 and base_gids[s] != 0 and base_gids[s] == cov_gid) lig[s] = lg;
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Bake a designed keycap ligature ([base, U+20E3] single glyph).
+    /// Null when the face has no ligature (caller falls back to
+    /// plate+legend). Color only: mono fonts carry no such sequences.
+    pub fn bakeKeycap(self: *Face, color_atlas: ?*atlas_mod.ColorAtlas, base: u21) ?atlas_mod.Baked {
+        const ca = color_atlas orelse return null;
+        const gid = self.keycapLigature(base);
+        if (gid == 0) return null;
+        const ef = self.emoji_face orelse return null;
+        return self.bakeColorGid(ca, ef, gid, true) catch null;
+    }
+
     /// Size an emoji face: fixed-strike (CBDT) faces need FT_Select_Size
     /// (FT_Set_Pixel_Sizes fails on them); scalable faces (COLR) take
     /// pixel sizes. Prefers the smallest strike at/above target, else
@@ -934,6 +1207,7 @@ pub const Face = struct {
         for (self.fallbacks) |fb| {
             if (fb) |f| _ = c.FT_Set_Pixel_Sizes(f, 0, @intCast(px));
         }
+        if (self.cjk_face) |f| _ = c.FT_Set_Pixel_Sizes(f, 0, @intCast(px));
         if (self.emoji_face) |f| _ = sizeEmojiFace(f, px);
         try self.updateMetrics();
     }
@@ -961,6 +1235,7 @@ pub const Face = struct {
         for (self.fallbacks) |fb| {
             if (fb) |f| _ = c.FT_Done_Face(f);
         }
+        if (self.cjk_face) |f| _ = c.FT_Done_Face(f);
         if (self.emoji_face) |f| _ = c.FT_Done_Face(f);
         _ = c.FT_Done_Face(self.face);
         _ = c.FT_Done_FreeType(self.lib);
@@ -972,7 +1247,10 @@ pub const Face = struct {
     /// Emoji-range codepoints try the color face first (dedicated store);
     /// any color failure falls through to the monochrome chain below.
     pub fn bake(self: *Face, atlas: *atlas_mod.Atlas, color_atlas: ?*atlas_mod.ColorAtlas, cp: u21, style: Style) Error!atlas_mod.Baked {
-        if (self.emoji_enabled and utf8_mod.isEmoji(cp)) {
+        // U+20E3 rides the color lane: Noto Color Emoji carries the
+        // enclosing keycap frame, which blits over the digit base that
+        // putCodepoint composed it onto (1️⃣). Falls through on miss.
+        if (self.emoji_enabled and (utf8_mod.isEmoji(cp) or cp == 0x20E3)) {
             if (self.ensureEmoji()) |ef| {
                 if (c.FT_Get_Char_Index(ef, @intCast(cp)) != 0) {
                     if (color_atlas) |ca| {
@@ -991,7 +1269,7 @@ pub const Face = struct {
             .bold_italic => style_face = self.ensureBoldItalic(),
         }
         var target: ?c.FT_Face = null;
-        var slot_n: u2 = 0;
+        var slot_n: u3 = 0;
         if (style_face) |f| {
             if (cp == 0 or c.FT_Get_Char_Index(f, @intCast(cp)) != 0) {
                 target = f;
@@ -1002,6 +1280,18 @@ pub const Face = struct {
             if (cp == 0 or c.FT_Get_Char_Index(self.face, @intCast(cp)) != 0) {
                 target = self.face;
                 slot_n = 0;
+            }
+        }
+        // CJK fast lane: Han/kana/hangul go straight to the CJK face
+        // instead of probing symbol fonts glyph-by-glyph (a 30k-glyph
+        // .ttc answers in one charmap lookup). Primary/style already had
+        // first refusal above, so this only fires on genuine misses.
+        if (target == null and self.cjk_enabled and utf8_mod.isCjk(cp)) {
+            if (self.ensureCjk()) |f| {
+                if (cp == 0 or c.FT_Get_Char_Index(f, @intCast(cp)) != 0) {
+                    target = f;
+                    slot_n = 4;
+                }
             }
         }
         if (target == null) {
@@ -1090,10 +1380,18 @@ pub const Face = struct {
     /// atlases); anything else falls back to the monochrome chain
     /// (blank, as today).
     fn bakeColor(self: *Face, color_atlas: *atlas_mod.ColorAtlas, face: c.FT_Face, cp: u21) Error!atlas_mod.Baked {
+        const idx = c.FT_Get_Char_Index(face, @intCast(cp));
+        if (idx == 0) return error.RenderFailed;
+        return self.bakeColorGid(color_atlas, face, idx, cp == 0x20E3);
+    }
+
+    /// Bake one color glyph by index (keycap ligatures address glyphs
+    /// with no codepoint of their own). sample_legend samples the plate
+    /// interior for the legend-contrast flag (keycap only).
+    fn bakeColorGid(self: *Face, color_atlas: *atlas_mod.ColorAtlas, face: c.FT_Face, idx: u32, sample_legend: bool) Error!atlas_mod.Baked {
         // FT_LOAD_COLOR is bit 20 (NOT 0x20, which is FORCE_AUTOHINT and
         // yields a grayscale conversion instead of BGRA).
         const FT_LOAD_COLOR: i32 = 0x100000;
-        const idx = c.FT_Get_Char_Index(face, @intCast(cp));
         if (idx == 0) return error.RenderFailed;
         if (c.FT_Load_Glyph(face, idx, FT_LOAD_COLOR) != 0) return error.RenderFailed;
         const slot = face.*.glyph;
@@ -1132,6 +1430,26 @@ pub const Face = struct {
         defer gpa.free(scratch);
         kitty_mod.scaleRgbaMipmap(src_tmp[0 .. sw * sh], sw, sh, dst_tmp[0 .. dw * dh], dw, dh, scratch);
         const pos = color_atlas.pack(@intCast(dw), @intCast(dh)) orelse return error.AtlasFull;
+        // Keycap legend contrast (U+20E3 only; other emoji ignore the
+        // flag): sample the plate interior (center third, opaque pixels
+        // only — transparent areas show terminal bg, where the normal fg
+        // already works). A light plate needs a dark digit.
+        var dark_legend = false;
+        if (sample_legend) {
+            var pl_sum: u64 = 0;
+            var pl_cnt: u64 = 0;
+            var psy: u32 = dh / 3;
+            while (psy < dh - dh / 3) : (psy += 1) {
+                var psx: u32 = dw / 3;
+                while (psx < dw - dw / 3) : (psx += 1) {
+                    const p = dst_tmp[psy * dw + psx];
+                    if (((p >> 24) & 0xFF) < 128) continue;
+                    pl_sum += ((p >> 16) & 0xFF) * 30 + ((p >> 8) & 0xFF) * 59 + (p & 0xFF) * 11;
+                    pl_cnt += 1;
+                }
+            }
+            dark_legend = pl_cnt > 0 and pl_sum / pl_cnt > 128 * 100;
+        }
         var dy: u32 = 0;
         while (dy < dh) : (dy += 1) {
             const doff = (@as(usize, pos.y) + dy) * atlas_mod.ColorAtlas.SIZE + pos.x;
@@ -1155,6 +1473,7 @@ pub const Face = struct {
             .advance = @as(u8, @intCast(@min(@as(u32, self.cell_w) * 2, 255))),
             .font_slot = 0,
             .color = true,
+            .keycap_dark = dark_legend,
             .cx = pos.x,
             .cy = pos.y,
         };
@@ -1222,6 +1541,66 @@ test "fontconfig init and match" {
     if (fc.match("monospace", null, null, true, &buf)) |m| {
         try std.testing.expect(m.path.len > 0);
     }
+}
+
+test "keycap resolves through the color lane" {
+    // U+20E3 must bake from the color-emoji face (solid-centered plate),
+    // not a 2px mono fallback. Skips where no color-emoji font exists.
+    // (tryFace leaves gpa null; bakeColor needs the scratch allocator
+    // that init() always provides in production.)
+    defer fc.deinit();
+    var buf: [1024]u8 = undefined;
+    const m = fc.match("monospace", null, null, true, &buf) orelse return;
+    var lib: c.FT_Library = undefined;
+    if (c.FT_Init_FreeType(&lib) != 0) return;
+    defer _ = c.FT_Done_FreeType(lib);
+    var face = Face.tryFace(lib, 16, m.path) orelse return;
+    defer _ = c.FT_Done_Face(face.face);
+    face.gpa = std.testing.allocator;
+    face.emoji_enabled = true;
+    if (face.ensureEmoji() == null) return;
+    if (c.FT_Get_Char_Index(face.emoji_face.?, 0x20E3) == 0) return;
+    var atlas = try atlas_mod.Atlas.init(std.testing.allocator, 512);
+    defer atlas.deinit(std.testing.allocator);
+    var ca = try atlas_mod.ColorAtlas.init(std.testing.allocator);
+    defer ca.deinit(std.testing.allocator);
+    const b = try face.bake(&atlas, &ca, 0x20E3, .regular);
+    try std.testing.expect(b.color);
+    try std.testing.expect(b.w > 4);
+    // Noto's plate is light blue-gray: legend must go dark.
+    try std.testing.expect(b.keycap_dark);
+}
+
+test "keycap GSUB ligatures resolve" {
+    // [base, U+20E3] single-glyph lookups (Noto's uFE82E family).
+    // Skips where no color-emoji font exists.
+    try std.testing.expectEqual(@as(?usize, 1), Face.keycapSlot('1'));
+    try std.testing.expectEqual(@as(?usize, 10), Face.keycapSlot('#'));
+    try std.testing.expectEqual(@as(?usize, 11), Face.keycapSlot('*'));
+    try std.testing.expect(Face.keycapSlot('A') == null);
+    defer fc.deinit();
+    var buf: [1024]u8 = undefined;
+    const m = fc.match("monospace", null, null, true, &buf) orelse return;
+    var lib: c.FT_Library = undefined;
+    if (c.FT_Init_FreeType(&lib) != 0) return;
+    defer _ = c.FT_Done_FreeType(lib);
+    var face = Face.tryFace(lib, 16, m.path) orelse return;
+    defer _ = c.FT_Done_Face(face.face);
+    face.gpa = std.testing.allocator;
+    face.emoji_enabled = true;
+    if (face.ensureEmoji() == null) return;
+    if (c.FT_Get_Char_Index(face.emoji_face.?, 0x20E3) == 0) return;
+    try std.testing.expect(face.keycapLigature('1') != 0);
+    try std.testing.expect(face.keycapLigature('0') != 0);
+    try std.testing.expect(face.keycapLigature('#') != 0);
+    try std.testing.expect(face.keycapLigature('A') == 0);
+    var atlas = try atlas_mod.Atlas.init(std.testing.allocator, 512);
+    defer atlas.deinit(std.testing.allocator);
+    var ca = try atlas_mod.ColorAtlas.init(std.testing.allocator);
+    defer ca.deinit(std.testing.allocator);
+    const b = face.bakeKeycap(&ca, '1') orelse return error.Fail;
+    try std.testing.expect(b.color);
+    try std.testing.expect(b.w > 4);
 }
 
 test "fontconfig sort fallbacks" {

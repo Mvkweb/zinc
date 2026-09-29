@@ -1425,7 +1425,84 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
         }
 
+        /// Compose U+20E3 onto a keycap base (0-9/#/*, optional VS16
+        /// between) into one 2-cell emoji unit: the mark rides the base
+        /// cell's combining store (rendered from the color-emoji lane),
+        /// a VS16 placeholder collapses into the blank follower, and the
+        /// cursor advances past the unit. A wrap already pending at line
+        /// end composes in place instead of splitting the cluster.
+        /// Returns false for lone marks (generic combining path owns them).
+        fn composeKeycap(self: *Self) bool {
+            const cols = self.grid.cols;
+            if (cols == 0) return false;
+            const row = self.cursor_row;
+            if (self.pending_wrap) {
+                const last = self.grid.at(cols - 1, row);
+                if (utf8_mod.isKeycapBase(cellCp(last.rune)) and last.combining_count < cfg.font_max_combining) {
+                    last.combining[last.combining_count] = 0x20E3;
+                    last.combining_count += 1;
+                    last.dirty = true;
+                    return true;
+                }
+                return false;
+            }
+            if (self.cursor_col == 0) return false;
+            var base_col: usize = self.cursor_col - 1;
+            var base = self.grid.at(@intCast(base_col), row);
+            if (cellCp(base.rune) == 0xFE0F and base_col > 0) {
+                base_col -= 1;
+                base = self.grid.at(@intCast(base_col), row);
+            }
+            if (!utf8_mod.isKeycapBase(cellCp(base.rune))) return false;
+            if (base.combining_count < cfg.font_max_combining) {
+                base.combining[base.combining_count] = 0x20E3;
+                base.combining_count += 1;
+            }
+            base.dirty = true;
+            const fol_col = base_col + 1;
+            if (fol_col < cols) {
+                const fol = self.grid.at(@intCast(fol_col), row);
+                fol.* = self.penBlank();
+                fol.dirty = true;
+            }
+            if (base_col + 2 < cols) {
+                self.cursor_col = @intCast(base_col + 2);
+                // Short overwrite voids a stale wrap flag (fastfetch rule).
+                self.grid.at(cols - 1, row).wrapped = false;
+            } else {
+                self.cursor_col = cols - 1;
+                self.pending_wrap = true;
+            }
+            return true;
+        }
+
         fn putCodepoint(self: *Self, cp: u21) void {
+            // Keycap pieces never split across lines: VS16 attaches to a
+            // digit/#/* base (in place at line end, silently, no advance);
+            // U+20E3 composes via composeKeycap, which owns the
+            // pending-wrap case itself. Anything else falls through.
+            if (cp == 0xFE0F) {
+                if (self.pending_wrap) {
+                    const last = self.grid.at(self.grid.cols - 1, self.cursor_row);
+                    if (utf8_mod.isKeycapBase(cellCp(last.rune)) and last.combining_count < cfg.font_max_combining) {
+                        last.combining[last.combining_count] = cp;
+                        last.combining_count += 1;
+                        last.dirty = true;
+                        return;
+                    }
+                } else if (self.cursor_col > 0) {
+                    const prev = self.grid.at(self.cursor_col - 1, self.cursor_row);
+                    if (utf8_mod.isKeycapBase(cellCp(prev.rune))) {
+                        if (prev.combining_count < cfg.font_max_combining) {
+                            prev.combining[prev.combining_count] = cp;
+                            prev.combining_count += 1;
+                        }
+                        prev.dirty = true;
+                        return;
+                    }
+                }
+            }
+            if (cp == 0x20E3 and self.composeKeycap()) return;
             if (self.pending_wrap or self.cursor_col >= self.grid.cols) {
                 // Deferred soft-wrap: the previous print filled the last
                 // column. Mark it and start a fresh row (Ghostty LCF parity).
@@ -2901,6 +2978,107 @@ test "ascii run fills to line end then wraps on next char" {
     try std.testing.expect(ctx.grid.at(3, 0).wrapped);
     try std.testing.expectEqual(@as(u32, 'e'), ctx.grid.at(0, 1).rune);
     try std.testing.expectEqual(@as(u32, 'f'), ctx.grid.at(1, 1).rune);
+}
+
+test "vietnamese precomposed takes one cell each" {
+    var ctx = try Context(.{ .cols = 16, .rows = 2 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("Tiếng Việt"); // ế=U+1EBF, ệ=U+1EC7, all narrow
+    try std.testing.expectEqual(@as(u32, 'T'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u21, 0x1EBF), ctx.grid.at(2, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'n'), ctx.grid.at(3, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'V'), ctx.grid.at(6, 0).rune);
+    try std.testing.expectEqual(@as(u21, 0x1EC7), ctx.grid.at(8, 0).rune);
+    try std.testing.expectEqual(@as(u16, 10), ctx.cursor_col);
+}
+
+test "vietnamese decomposed tones stack on one cell" {
+    var ctx = try Context(.{ .cols = 16, .rows = 2 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("a\xCC\x86\xCC\x81"); // a + breve U+0306 + acute U+0301 = ắ
+    try std.testing.expectEqual(@as(u32, 'a'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u8, 2), ctx.grid.at(0, 0).combining_count);
+    try std.testing.expectEqual(@as(u32, 0x0306), ctx.grid.at(0, 0).combining[0]);
+    try std.testing.expectEqual(@as(u32, 0x0301), ctx.grid.at(0, 0).combining[1]);
+    try std.testing.expectEqual(@as(u16, 1), ctx.cursor_col); // zero advance
+    ctx.parse("e\xCC\x83"); // e + dot below U+0323 = ẹ
+    try std.testing.expectEqual(@as(u32, 'e'), ctx.grid.at(1, 0).rune);
+    try std.testing.expectEqual(@as(u8, 1), ctx.grid.at(1, 0).combining_count);
+    try std.testing.expectEqual(@as(u16, 2), ctx.cursor_col);
+}
+
+test "vietnamese D-stroke and hook tone" {
+    var ctx = try Context(.{ .cols = 16, .rows = 2 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("Đặng"); // Đ=U+0110, ặ=U+1EB7
+    try std.testing.expectEqual(@as(u21, 0x0110), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u21, 0x1EB7), ctx.grid.at(1, 0).rune);
+    ctx.parse("o\xCC\x89"); // o + hook above U+0309 = ỏ
+    try std.testing.expectEqual(@as(u32, 'o'), ctx.grid.at(4, 0).rune);
+    try std.testing.expectEqual(@as(u8, 1), ctx.grid.at(4, 0).combining_count);
+    try std.testing.expectEqual(@as(u16, 5), ctx.cursor_col);
+}
+
+test "keycap sequence composes one 2-cell unit" {
+    var ctx = try Context(.{ .cols = 8, .rows = 2 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("1\xEF\xB8\x8F\xE2\x83\xA3"); // 1 + VS16 + U+20E3
+    try std.testing.expectEqual(@as(u32, '1'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u8, 2), ctx.grid.at(0, 0).combining_count);
+    try std.testing.expectEqual(@as(u32, 0xFE0F), ctx.grid.at(0, 0).combining[0]);
+    try std.testing.expectEqual(@as(u32, 0x20E3), ctx.grid.at(0, 0).combining[1]);
+    try std.testing.expectEqual(@as(u32, ' '), ctx.grid.at(1, 0).rune); // follower
+    try std.testing.expectEqual(@as(u16, 2), ctx.cursor_col);
+    ctx.parse("OK");
+    try std.testing.expectEqual(@as(u32, 'O'), ctx.grid.at(2, 0).rune);
+}
+
+test "keycap without VS16 composes too" {
+    var ctx = try Context(.{ .cols = 8, .rows = 2 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("5\xE2\x83\xA3"); // 5 + U+20E3
+    try std.testing.expectEqual(@as(u32, '5'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u8, 1), ctx.grid.at(0, 0).combining_count);
+    try std.testing.expectEqual(@as(u32, 0x20E3), ctx.grid.at(0, 0).combining[0]);
+    try std.testing.expectEqual(@as(u16, 2), ctx.cursor_col);
+}
+
+test "lone keycap mark falls back to combining" {
+    var ctx = try Context(.{ .cols = 8, .rows = 2 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("A\xE2\x83\xA3"); // A is no keycap base
+    try std.testing.expectEqual(@as(u32, 'A'), ctx.grid.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u8, 1), ctx.grid.at(0, 0).combining_count);
+    try std.testing.expectEqual(@as(u32, 0x20E3), ctx.grid.at(0, 0).combining[0]);
+    try std.testing.expectEqual(@as(u16, 1), ctx.cursor_col); // no advance
+}
+
+test "keycap at line end composes in place" {
+    var ctx = try Context(.{ .cols = 4, .rows = 2 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("ab1"); // cols 0-2
+    ctx.parse("2"); // fills last col, wrap pending
+    try std.testing.expect(ctx.pending_wrap);
+    ctx.parse("\xE2\x83\xA3"); // U+20E3 composes onto the 2, no split
+    try std.testing.expectEqual(@as(u32, '2'), ctx.grid.at(3, 0).rune);
+    try std.testing.expectEqual(@as(u8, 1), ctx.grid.at(3, 0).combining_count);
+    try std.testing.expect(ctx.pending_wrap);
+    try std.testing.expectEqual(@as(u16, 3), ctx.cursor_col);
+}
+
+test "keycap VS16 at line end attaches in place" {
+    var ctx = try Context(.{ .cols = 4, .rows = 2 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("ab1");
+    ctx.parse("2"); // fills last col, wrap pending
+    ctx.parse("\xEF\xB8\x8F"); // VS16 attaches to the 2, no split
+    try std.testing.expect(ctx.pending_wrap);
+    try std.testing.expectEqual(@as(u8, 1), ctx.grid.at(3, 0).combining_count);
+    try std.testing.expectEqual(@as(u32, 0xFE0F), ctx.grid.at(3, 0).combining[0]);
+    ctx.parse("\xE2\x83\xA3"); // U+20E3 completes the cluster in place
+    try std.testing.expectEqual(@as(u8, 2), ctx.grid.at(3, 0).combining_count);
+    try std.testing.expectEqual(@as(u32, 0x20E3), ctx.grid.at(3, 0).combining[1]);
+    try std.testing.expect(ctx.pending_wrap);
 }
 
 test "ascii fast path preconditions hold" {

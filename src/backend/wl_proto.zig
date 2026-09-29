@@ -217,6 +217,7 @@ pub fn linkAll() void {
     xdg_surface.link(&xdg_toplevel.interface);
     wm_base.link(core.surface);
     cursor_shape.link(core.pointer);
+    text_input.link(core.seat, core.surface);
 }
 
 // ---------------------------------------------------------------------------
@@ -264,6 +265,92 @@ pub const cursor_shape = struct {
     pub fn link(pointer_iface: *const c.wl_interface) void {
         types_get_pointer[0] = @ptrCast(&device_interface);
         types_get_pointer[1] = pointer_iface;
+    }
+};
+
+// ---------------------------------------------------------------------------
+// zwp_text_input_manager_v3 / zwp_text_input_v3 (text-input-unstable-v3,
+// version 1; IME composition for CJK input via fcitx5/ibus).
+// Opcodes cross-checked against references/zt (native Zig implementation)
+// and references/foot usage; both agree with the upstream protocol.
+// manager requests: destroy=0, get_text_input=1 ("no": [text_input, seat])
+// input requests: destroy=0, enable=1, disable=2, set_surrounding_text=3
+//   ("sii"), set_text_change_cause=4 ("u"), set_content_type=5 ("uu"),
+//   set_cursor_rectangle=6 ("iiii"), commit=7
+// input events: enter=0 ("o": [surface]), leave=1,
+//   preedit_string=2 ("?sii"), commit_string=3 ("?s"),
+//   delete_surrounding_text=4 ("uu"), done=5 ("u")
+// ---------------------------------------------------------------------------
+
+pub const text_input = struct {
+    pub const version: c_int = 1;
+    pub const MANAGER_DESTROY: u32 = 0;
+    pub const MANAGER_GET_TEXT_INPUT: u32 = 1;
+    pub const DESTROY: u32 = 0;
+    pub const ENABLE: u32 = 1;
+    pub const DISABLE: u32 = 2;
+    pub const SET_SURROUNDING_TEXT: u32 = 3;
+    pub const SET_TEXT_CHANGE_CAUSE: u32 = 4;
+    pub const SET_CONTENT_TYPE: u32 = 5;
+    pub const SET_CURSOR_RECTANGLE: u32 = 6;
+    pub const COMMIT: u32 = 7;
+    pub const EVENT_ENTER: u32 = 0;
+    pub const EVENT_LEAVE: u32 = 1;
+    pub const EVENT_PREEDIT_STRING: u32 = 2;
+    pub const EVENT_COMMIT_STRING: u32 = 3;
+    pub const EVENT_DELETE_SURROUNDING_TEXT: u32 = 4;
+    pub const EVENT_DONE: u32 = 5;
+    /// Content hints (bitmask) and purposes; terminals use NONE/TERMINAL
+    /// (foot parity: tells the IME not to offer autocorrect-style help).
+    pub const HINT_NONE: u32 = 0;
+    pub const PURPOSE_TERMINAL: u32 = 13;
+    pub const CHANGE_CAUSE_INPUT_METHOD: u32 = 1;
+
+    var types_get_text_input = [_]?*const c.wl_interface{ null, null };
+    var manager_methods = [_]c.wl_message{
+        .{ .name = "destroy", .signature = "", .types = null },
+        .{ .name = "get_text_input", .signature = "no", .types = &types_get_text_input },
+    };
+    pub var manager_interface: c.wl_interface = .{
+        .name = "zwp_text_input_manager_v3",
+        .version = version,
+        .method_count = 2,
+        .methods = &manager_methods,
+        .event_count = 0,
+        .events = null,
+    };
+    var input_methods = [_]c.wl_message{
+        .{ .name = "destroy", .signature = "", .types = null },
+        .{ .name = "enable", .signature = "", .types = null },
+        .{ .name = "disable", .signature = "", .types = null },
+        .{ .name = "set_surrounding_text", .signature = "sii", .types = null },
+        .{ .name = "set_text_change_cause", .signature = "u", .types = null },
+        .{ .name = "set_content_type", .signature = "uu", .types = null },
+        .{ .name = "set_cursor_rectangle", .signature = "iiii", .types = null },
+        .{ .name = "commit", .signature = "", .types = null },
+    };
+    var types_enter = [_]?*const c.wl_interface{null};
+    var input_events = [_]c.wl_message{
+        .{ .name = "enter", .signature = "o", .types = &types_enter },
+        .{ .name = "leave", .signature = "", .types = null },
+        .{ .name = "preedit_string", .signature = "?sii", .types = null },
+        .{ .name = "commit_string", .signature = "?s", .types = null },
+        .{ .name = "delete_surrounding_text", .signature = "uu", .types = null },
+        .{ .name = "done", .signature = "u", .types = null },
+    };
+    pub var input_interface: c.wl_interface = .{
+        .name = "zwp_text_input_v3",
+        .version = version,
+        .method_count = 8,
+        .methods = &input_methods,
+        .event_count = 6,
+        .events = &input_events,
+    };
+
+    pub fn link(seat_iface: *const c.wl_interface, surface_iface: *const c.wl_interface) void {
+        types_get_text_input[0] = @ptrCast(&input_interface);
+        types_get_text_input[1] = seat_iface;
+        types_enter[0] = surface_iface;
     }
 };
 
@@ -320,4 +407,24 @@ test "xdg tables sane + linked" {
     try expectName(cursor_shape.types_get_pointer[1].?, "wl_pointer");
     try std.testing.expectEqual(@as(u32, 1), cursor_shape.MANAGER_GET_POINTER);
     try std.testing.expectEqual(@as(u32, 1), cursor_shape.DEVICE_SET_SHAPE);
+    // text-input-v3 tables: names, counts, linkage, opcode order.
+    try expectName(&text_input.manager_interface, "zwp_text_input_manager_v3");
+    try expectName(&text_input.input_interface, "zwp_text_input_v3");
+    try std.testing.expectEqual(@as(c_int, 2), text_input.manager_interface.method_count);
+    try std.testing.expectEqual(@as(c_int, 8), text_input.input_interface.method_count);
+    try std.testing.expectEqual(@as(c_int, 6), text_input.input_interface.event_count);
+    try std.testing.expect(text_input.types_get_text_input[0] != null);
+    try std.testing.expect(text_input.types_get_text_input[1] != null);
+    try expectName(text_input.types_get_text_input[0].?, "zwp_text_input_v3");
+    try expectName(text_input.types_enter[0].?, "wl_surface");
+    try std.testing.expectEqual(@as(u32, 1), text_input.MANAGER_GET_TEXT_INPUT);
+    try std.testing.expectEqual(@as(u32, 1), text_input.ENABLE);
+    try std.testing.expectEqual(@as(u32, 3), text_input.SET_SURROUNDING_TEXT);
+    try std.testing.expectEqual(@as(u32, 5), text_input.SET_CONTENT_TYPE);
+    try std.testing.expectEqual(@as(u32, 6), text_input.SET_CURSOR_RECTANGLE);
+    try std.testing.expectEqual(@as(u32, 7), text_input.COMMIT);
+    try std.testing.expectEqual(@as(u32, 2), text_input.EVENT_PREEDIT_STRING);
+    try std.testing.expectEqual(@as(u32, 5), text_input.EVENT_DONE);
+    try std.testing.expectEqualStrings("sii", std.mem.span(text_input.input_methods[3].signature));
+    try std.testing.expectEqualStrings("?sii", std.mem.span(text_input.input_events[2].signature));
 }
