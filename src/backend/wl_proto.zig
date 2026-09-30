@@ -234,6 +234,8 @@ pub const cursor_shape = struct {
     pub const SHAPE_DEFAULT: u32 = 1;
     pub const SHAPE_POINTER: u32 = 4;
     pub const SHAPE_TEXT: u32 = 9;
+    pub const SHAPE_GRAB: u32 = 16;
+    pub const SHAPE_GRABBING: u32 = 17;
 
     var types_get_pointer = [_]?*const c.wl_interface{ null, null };
     var manager_methods = [_]c.wl_message{
@@ -407,6 +409,10 @@ test "xdg tables sane + linked" {
     try expectName(cursor_shape.types_get_pointer[1].?, "wl_pointer");
     try std.testing.expectEqual(@as(u32, 1), cursor_shape.MANAGER_GET_POINTER);
     try std.testing.expectEqual(@as(u32, 1), cursor_shape.DEVICE_SET_SHAPE);
+    try std.testing.expectEqual(@as(u32, 4), cursor_shape.SHAPE_POINTER);
+    try std.testing.expectEqual(@as(u32, 9), cursor_shape.SHAPE_TEXT);
+    try std.testing.expectEqual(@as(u32, 16), cursor_shape.SHAPE_GRAB);
+    try std.testing.expectEqual(@as(u32, 17), cursor_shape.SHAPE_GRABBING);
     // text-input-v3 tables: names, counts, linkage, opcode order.
     try expectName(&text_input.manager_interface, "zwp_text_input_manager_v3");
     try expectName(&text_input.input_interface, "zwp_text_input_v3");

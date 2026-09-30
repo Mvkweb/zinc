@@ -307,6 +307,14 @@ pub fn App(comptime cfg: config_mod.Config) type {
         trail_ms: u16 = cfg.cursor_trail_ms,
         smooth_scroll: bool = cfg.smooth_scroll,
         smooth_scroll_ms: u16 = cfg.smooth_scroll_ms,
+        /// Scrollback rows per wheel notch (runtime scroll-step orelse
+        /// comptime default; touchpads scale proportionally off it).
+        wheel_step: u32 = cfg.scroll_step,
+        /// High-res scroll accumulation (120ths remainder) + whether the
+        /// compositor speaks value120 (then it owns scrolling, and the
+        /// legacy axis path stands down to avoid double steps).
+        axis_accum: i32 = 0,
+        axis_has_v120: bool = false,
         flow: flow_mod.Flow = .{},
         last_click_time: u32 = 0,
         last_click_col: u16 = 0,
@@ -368,6 +376,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
         sb_show: bool = false,
         sb_alpha: u8 = 0,
         sb_last_ms: i64 = 0,
+        /// Pointer over the scrollbar strip (grab cursor while shown).
+        sb_hover: bool = false,
         /// Baked keycap ligatures by base (0-9, '#' = 10, '*' = 11).
         /// Null = not yet attempted; a blank (w == 0) entry = tried and
         /// missing, so frames never re-bake a miss (fallback owns it).
@@ -529,6 +539,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .trail_ms = runtime_cfg.cursor_trail_ms orelse cfg.cursor_trail_ms,
                 .smooth_scroll = runtime_cfg.smooth_scroll orelse cfg.smooth_scroll,
                 .smooth_scroll_ms = runtime_cfg.smooth_scroll_ms orelse cfg.smooth_scroll_ms,
+                .wheel_step = runtime_cfg.scroll_step orelse cfg.scroll_step,
             };
             errdefer {
                 self.deinit();
@@ -1020,7 +1031,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
         fn isCellSelected(self: *const Self, col: u16, row: u16) bool {
             if (!cfg.selection) return false;
             if (!self.selection_single_cell and self.sel.isSingleCell()) return false;
-            return self.sel.contains(col, row);
+            const abs: usize = selection_mod.Selection.toAbs(&self.ctx.grid, row);
+            return self.sel.contains(col, abs);
         }
 
         fn resolveFg(self: *const Self, raw: u32) u32 {
@@ -2011,6 +2023,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (cfg.selection and self.sel.active) {
                 self.sel.clear();
             }
+            // A screen switch invalidates parked hover state: without this
+            // the old link span repaints under Ctrl on the new screen
+            // (e.g. open nano via Ctrl+click, spam Ctrl, stale underline).
+            self.clearHover();
             // Alt screens have no scrollback: snap any parked glide shut
             // so the TUI lands exact instead of streaming in.
             self.flow.snapView(self.ctx.grid.view_offset);
@@ -2886,6 +2902,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     const delta: i32 = if (k == .page_up) page else -page;
                     const before = self.ctx.grid.view_offset;
                     self.ctx.grid.scrollView(delta);
+                    self.extendSelByView(before);
                     if (self.ctx.grid.sb_len > 0 and self.ctx.grid.view_offset == before and delta != 0) {
                         self.flow.bumpOver(if (delta > 0) 1 else -1);
                     }
@@ -3537,8 +3554,14 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         fn currentShape(self: *Self) u32 {
             const mods = self.currentMods();
+            if (cfg.scrollbar and self.sb_dragging) {
+                return P.cursor_shape.SHAPE_GRABBING;
+            }
             if (cfg.hyperlinks and self.hover_active and mods.ctrl) {
                 return P.cursor_shape.SHAPE_POINTER;
+            }
+            if (cfg.scrollbar and self.sb_hover) {
+                return P.cursor_shape.SHAPE_GRAB;
             }
             if (cfg.mouse and self.ctx.mouse_mode != .off and !mods.shift) {
                 return P.cursor_shape.SHAPE_DEFAULT;
@@ -3547,7 +3570,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
         }
 
         /// Sync the server cursor with current terminal state:
+        /// - Grabbing fist while scrubbing the scrollbar
         /// - Pointer hand (SHAPE_POINTER) over a Ctrl-hovered link
+        /// - Grab hand over the scrollbar strip
         /// - Standard pointer arrow (SHAPE_DEFAULT) when app captures mouse
         /// - Text beam (SHAPE_TEXT) for normal shell / Shift-bypass selection
         /// No-op without cursor-shape protocol; transition-only so no per-frame traffic.
@@ -3581,6 +3606,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const self: *Self = @ptrCast(@alignCast(data));
             self.ptr_inside = false;
             self.cursor_shape = 0;
+            self.sb_hover = false;
+            // A release outside the window never arrives: end a drag here
+            // rather than strand the capture (re-enter starts clean).
+            self.sb_dragging = false;
             self.clearHover();
         }
 
@@ -3592,6 +3621,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.ptr_sx = sx;
             self.ptr_sy = sy;
             const mods = self.currentMods();
+            // Scrollbar hover tracks the strip (grab cursor) while the bar
+            // is latched or fading; a faded strip keeps the text beam.
+            if (cfg.scrollbar) {
+                const bx: i32 = @divFloor(sx, 256);
+                const by: i32 = @divFloor(sy, 256);
+                const over = (self.sb_show or self.sb_alpha > 0) and scrollbar_mod.hitTest(self.sbGeom(), bx, by);
+                if (over != self.sb_hover) {
+                    self.sb_hover = over;
+                    self.refreshCursor();
+                }
+            }
             // App-owned mouse reports to the PTY; Shift bypasses to local
             // handling (foot parity: select/copy out of mouse apps).
             if (self.ctx.mouse_mode != .off and !mods.shift) {
@@ -3618,8 +3658,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             if (self.sel_drag) {
                 const cc = self.ptrCell(sx, sy);
+                const abs_row: u16 = @intCast(selection_mod.Selection.toAbs(&self.ctx.grid, cc.row));
                 switch (self.sel.mode) {
-                    .cell => self.sel.update(cc.col, cc.row),
+                    .cell => self.sel.update(cc.col, abs_row),
                     .word => self.sel.updateWordDrag(&self.ctx.grid, cc.col, cc.row),
                     .line => self.sel.updateLineDrag(&self.ctx.grid, cc.row),
                 }
@@ -3632,7 +3673,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (cfg.scrollbar and self.sb_dragging and self.ctx.mouse_mode == .off) {
                 const by: i32 = @divFloor(sy, 256);
                 const bg = self.sbGeom();
+                const before = self.ctx.grid.view_offset;
                 self.ctx.grid.view_offset = scrollbar_mod.offsetAt(bg, self.ctx.grid.sb_len, by);
+                self.extendSelByView(before);
                 self.clearHover();
                 self.sbBump();
                 self.cursor_only_render = false;
@@ -3656,6 +3699,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // grabbed the screen mid-drag (never strand the capture).
             if (cfg.scrollbar and self.sb_dragging and button == 0x110 and state == 0) {
                 self.sb_dragging = false;
+                self.refreshCursor();
                 self.needs_render = true;
                 return;
             }
@@ -3696,10 +3740,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         const bg = self.sbGeom();
                         if (scrollbar_mod.hitTest(bg, bx, by)) {
                             self.sb_dragging = true;
+                            const before = self.ctx.grid.view_offset;
                             self.ctx.grid.view_offset = scrollbar_mod.offsetAt(bg, self.ctx.grid.sb_len, by);
+                            self.extendSelByView(before);
                             self.clearHover();
                             self.sbBump();
                             self.cursor_only_render = false;
+                            self.refreshCursor();
                             self.needs_render = true;
                             return;
                         }
@@ -3739,14 +3786,14 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         switch (self.click_count) {
                             2 => {
                                 const span = selection_mod.findWordSpan(&self.ctx.grid, cc.col, cc.row);
-                                self.sel.beginWord(span);
+                                self.sel.beginWord(selection_mod.Selection.spanToAbs(&self.ctx.grid, span));
                             },
                             3 => {
                                 const span = selection_mod.findLineSpan(&self.ctx.grid, cc.row);
-                                self.sel.beginLine(span);
+                                self.sel.beginLine(selection_mod.Selection.spanToAbs(&self.ctx.grid, span));
                             },
                             else => {
-                                self.sel.begin(cc.col, cc.row);
+                                self.sel.begin(cc.col, @intCast(selection_mod.Selection.toAbs(&self.ctx.grid, cc.row)));
                             },
                         }
                         self.sel_drag = true;
@@ -3766,6 +3813,29 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
         }
 
+        /// Drag-select + viewport scroll: extend the focus end to the edge
+        /// in the scroll direction, so the span grows over newly revealed
+        /// lines while the anchor stays glued to its text. Completed
+        /// selections (button released) only ever track content.
+        fn extendSelByView(self: *Self, before: usize) void {
+            if (!self.sel_drag or !self.sel.active) return;
+            const after: i64 = @intCast(self.ctx.grid.view_offset);
+            const moved = after - @as(i64, @intCast(before));
+            if (moved == 0) return;
+            const sb = self.ctx.grid.sb_len;
+            const off: usize = @min(self.ctx.grid.view_offset, sb);
+            const rows = self.ctx.grid.rows;
+            if (rows == 0) return;
+            if (moved > 0) {
+                // Up into history: focus rides the top edge (abs row).
+                self.sel.focus_row = @intCast(sb - off);
+            } else {
+                // Down toward live: focus rides the bottom edge.
+                self.sel.focus_row = @intCast(sb - off + rows - 1);
+            }
+            self.needs_render = true;
+        }
+
         fn appOnPointerAxis(data: ?*anyopaque, pointer: ?*P.Pointer, time: u32, axis: u32, value: i32) callconv(.c) void {
             _ = pointer;
             _ = time;
@@ -3774,6 +3844,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.cursor_only_render = false;
             if (!cfg.mouse) return;
             if (axis != 0) return; // vertical only
+            // Modern compositors pair every scroll with value120 (notches
+            // and touchpads alike); once seen, it owns scrolling and this
+            // legacy path stands down so notches never step twice.
+            if (self.axis_has_v120) return;
             const mods = self.currentMods();
             // Ctrl+Wheel zoom: up (<0) zooms in, down (>0) zooms out.
             if (cfg.font_zoom and mods.ctrl and !mods.alt) {
@@ -3794,9 +3868,12 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (self.ctx.alt_active) return; // app owns the screen
             // Clamped at a limit with history behind it: rubber-band
             // instead of a dead stop (no bounce on a history-less view).
+            // scroll-step (runtime orelse default) rows per wheel notch.
+            const step: u32 = @max(1, self.wheel_step);
             const before = self.ctx.grid.view_offset;
-            const delta: i32 = if (value > 0) -3 else 3;
+            const delta: i32 = if (value > 0) -@as(i32, @intCast(step)) else @as(i32, @intCast(step));
             self.ctx.grid.scrollView(delta);
+            self.extendSelByView(before);
             if (self.ctx.grid.sb_len > 0 and self.ctx.grid.view_offset == before and delta != 0) {
                 self.flow.bumpOver(if (delta > 0) 1 else -1);
             }
@@ -3820,10 +3897,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
         }
 
         fn appOnPointerAxisStop(data: ?*anyopaque, pointer: ?*P.Pointer, time: u32, axis: u32) callconv(.c) void {
-            _ = data;
             _ = pointer;
             _ = time;
-            _ = axis;
+            const self: *Self = @ptrCast(@alignCast(data));
+            if (axis != 0) return; // vertical only
+            // Gesture ended (finger lifted): drop the sub-notch remainder
+            // so the next gesture starts clean instead of inheriting drift.
+            self.axis_accum = 0;
         }
 
         fn appOnPointerAxisDiscrete(data: ?*anyopaque, pointer: ?*P.Pointer, axis: u32, discrete: i32) callconv(.c) void {
@@ -3834,10 +3914,55 @@ pub fn App(comptime cfg: config_mod.Config) type {
         }
 
         fn appOnPointerAxisValue120(data: ?*anyopaque, pointer: ?*P.Pointer, axis: u32, value120: i32) callconv(.c) void {
-            _ = data;
             _ = pointer;
-            _ = axis;
-            _ = value120;
+            const self: *Self = @ptrCast(@alignCast(data));
+            self.markActivity();
+            self.cursor_only_render = false;
+            if (!cfg.mouse) return;
+            if (axis != 0) return; // vertical only
+            // First sighting promotes value120 to the single scroll
+            // authority (wheel notches arrive as ±120; touchpads stream
+            // proportionally; the legacy axis path stands down after this
+            // so nothing ever steps twice).
+            self.axis_has_v120 = true;
+            const mods = self.currentMods();
+            const step: u32 = @max(1, self.wheel_step);
+            const rows = scrollbar_mod.consume120(&self.axis_accum, value120, step);
+            if (rows == 0) return; // sub-notch: still accumulating
+            // Wayland value120 > 0 scrolls content down (legacy parity).
+            const delta: i32 = -rows;
+            // Ctrl+Wheel zoom: one step per notch-equivalent (up zooms
+            // in, legacy parity: value120 < 0 means up, delta > 0).
+            if (cfg.font_zoom and mods.ctrl and !mods.alt) {
+                if (delta > 0) {
+                    self.zoomIn();
+                } else {
+                    self.zoomOut();
+                }
+                return;
+            }
+            if (self.ctx.mouse_mode != .off and !mods.shift) {
+                // Wheel to the app: 64 up, 65 down (press only).
+                const cc = self.ptrCell(self.ptr_sx, self.ptr_sy);
+                const code: u8 = if (delta < 0) 65 else 64;
+                var k: usize = 0;
+                const n: usize = @intCast(@min(@abs(delta), 32));
+                while (k < n) : (k += 1) self.reportMouse(code, true, false, cc.col, cc.row);
+                return;
+            }
+            if (self.ctx.alt_active) return; // app owns the screen
+            const before = self.ctx.grid.view_offset;
+            self.ctx.grid.scrollView(delta);
+            self.extendSelByView(before);
+            if (self.ctx.grid.sb_len > 0 and self.ctx.grid.view_offset == before and delta != 0) {
+                self.flow.bumpOver(if (delta > 0) 1 else -1);
+            }
+            self.clearHover(); // content moved under the cursor
+            if (cfg.scrollbar) {
+                self.sbBump();
+                self.cursor_only_render = false;
+            }
+            self.needs_render = true;
         }
 
         fn appOnPointerAxisRelativeDirection(data: ?*anyopaque, pointer: ?*P.Pointer, axis: u32, direction: u32) callconv(.c) void {

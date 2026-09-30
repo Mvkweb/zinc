@@ -22,7 +22,7 @@ pub const Config = struct {
     scrollback_cap: u32 = 10000,
     scrollback_clear_on_ed3: bool = true,
     reflow_on_resize: bool = true,
-    scroll_step: u32 = 3,
+    scroll_step: u32 = 5,
     /// Overlay scrollbar (history position + proportion), click/drag to
     /// scrub. Hidden on alt-screen and under mouse-reporting apps.
     scrollbar: bool = true,
@@ -66,7 +66,7 @@ pub const Config = struct {
     /// Cursor glide: the visible cursor flows to its cell instead of
     /// teleporting (exponential ease-out, ~glide_ms to settle).
     cursor_glide: bool = true,
-    cursor_glide_ms: u16 = 120,
+    cursor_glide_ms: u16 = 60,
 
     // Font. Size is points at font_dpi (foot parity: size=12 with
     // dpi-aware=no renders 12pt @ 96dpi = 16px, never 12px).

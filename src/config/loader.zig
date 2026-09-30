@@ -77,10 +77,13 @@ pub const DEFAULT_CONFIG_TEMPLATE =
     \\# glide-ms: settle time per move (lower = snappier). trail-ms: fading
     \\# afterimage lifetime, 0 = off. smooth-scroll glides scrollback jumps.
     \\cursor-glide = true
-    \\cursor-glide-ms = 120
+    \\cursor-glide-ms = 60
     \\cursor-trail-ms = 0
     \\smooth-scroll = true
     \\smooth-scroll-ms = 110
+    \\# scroll-step: scrollback rows per wheel notch (touchpads scale
+    \\# proportionally off the same step; 1-100).
+    \\scroll-step = 5
     \\
     \\# --- Selection Settings ---
     \\# If false, single click does not display a 1-cell highlight until dragged.
@@ -237,10 +240,11 @@ test "default template parses valid config" {
     try std.testing.expectEqual(@as(?f32, 1.5), cfg.cursor_thick_px);
     try std.testing.expectEqual(@as(?bool, false), cfg.selection_single_cell);
     try std.testing.expectEqual(@as(?bool, true), cfg.cursor_glide);
-    try std.testing.expectEqual(@as(?u16, 120), cfg.cursor_glide_ms);
+    try std.testing.expectEqual(@as(?u16, 60), cfg.cursor_glide_ms);
     try std.testing.expectEqual(@as(?u16, 0), cfg.cursor_trail_ms);
     try std.testing.expectEqual(@as(?bool, true), cfg.smooth_scroll);
     try std.testing.expectEqual(@as(?u16, 110), cfg.smooth_scroll_ms);
+    try std.testing.expectEqual(@as(?u32, 5), cfg.scroll_step);
     try std.testing.expectEqual(@as(?bool, false), cfg.find_match_numbers);
     try std.testing.expectEqual(@as(?u8, 2), cfg.find_number_scale);
 }
@@ -339,15 +343,16 @@ test "template stamp matches CURRENT_CONFIG_VERSION" {
 
 test "template documents every supported key" {
     const keys = [_][]const u8{
-        "font-size",             "font-family",             "padding-x",
-        "padding-y",             "alt-padding-x",           "alt-padding-y",
-        "background",            "foreground",              "selection-background",
-        "selection-foreground",  "cursor-color",            "link-color",
-        "background-opacity",    "cursor-style",            "cursor-blink",
-        "cursor-thickness",      "cursor-glide",            "cursor-glide-ms",
-        "cursor-trail-ms",       "smooth-scroll",           "smooth-scroll-ms",
-        "selection-single-cell", "find-match-numbers",      "find-number-scale",
-        "editor-command",        "editor-command-terminal", "config-version",
+        "font-size",            "font-family",           "padding-x",
+        "padding-y",            "alt-padding-x",         "alt-padding-y",
+        "background",           "foreground",            "selection-background",
+        "selection-foreground", "cursor-color",          "link-color",
+        "background-opacity",   "cursor-style",          "cursor-blink",
+        "cursor-thickness",     "cursor-glide",          "cursor-glide-ms",
+        "cursor-trail-ms",      "smooth-scroll",         "smooth-scroll-ms",
+        "scroll-step",          "selection-single-cell", "find-match-numbers",
+        "find-number-scale",    "editor-command",        "editor-command-terminal",
+        "config-version",
     };
     for (keys) |k| {
         try std.testing.expect(std.mem.indexOf(u8, DEFAULT_CONFIG_TEMPLATE, k) != null);

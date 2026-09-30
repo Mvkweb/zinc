@@ -28,6 +28,7 @@ pub const RuntimeConfig = struct {
     cursor_trail_ms: ?u16 = null,
     smooth_scroll: ?bool = null,
     smooth_scroll_ms: ?u16 = null,
+    scroll_step: ?u32 = null,
     find_match_numbers: ?bool = null,
     find_number_scale: ?u8 = null,
     editor_command: ?[]const u8 = null,
@@ -203,6 +204,10 @@ pub fn parse(content: []const u8, cfg: *RuntimeConfig, gpa: std.mem.Allocator) v
             if (std.fmt.parseInt(u16, trimQuotes(val), 10)) |m| {
                 if (m <= 1000) cfg.smooth_scroll_ms = m;
             } else |_| {}
+        } else if (std.ascii.eqlIgnoreCase(key, "scroll-step") or std.ascii.eqlIgnoreCase(key, "scroll_step")) {
+            if (std.fmt.parseInt(u32, trimQuotes(val), 10)) |s| {
+                if (s >= 1 and s <= 100) cfg.scroll_step = s;
+            } else |_| {}
         } else if (std.ascii.eqlIgnoreCase(key, "find-match-numbers") or std.ascii.eqlIgnoreCase(key, "find_match_numbers")) {
             if (parseBool(val)) |b| cfg.find_match_numbers = b;
         } else if (std.ascii.eqlIgnoreCase(key, "find-number-scale") or std.ascii.eqlIgnoreCase(key, "find_number_scale")) {
@@ -276,6 +281,7 @@ test "parse complete config content" {
         \\cursor-trail-ms = 250
         \\smooth-scroll = false
         \\smooth-scroll-ms = 200
+        \\scroll-step = 5
     ;
 
     var cfg = RuntimeConfig{};
@@ -304,6 +310,7 @@ test "parse complete config content" {
     try std.testing.expectEqual(@as(?u16, 250), cfg.cursor_trail_ms);
     try std.testing.expectEqual(@as(?bool, false), cfg.smooth_scroll);
     try std.testing.expectEqual(@as(?u16, 200), cfg.smooth_scroll_ms);
+    try std.testing.expectEqual(@as(?u32, 5), cfg.scroll_step);
 }
 
 test "parse find scale clamps + version-agnostic keys" {

@@ -126,6 +126,11 @@ pub fn findLineSpan(grid: anytype, row: u16) Span {
 }
 
 pub const Selection = struct {
+    /// Rows here are ABSOLUTE (0 = oldest scrollback, sb_len + r = live
+    /// row r), stable across viewport scrolls — selections stick to
+    /// their text instead of the glass. Callers convert viewport rows
+    /// via toAbs at press/drag time; out-of-range rows (evicted history
+    /// past the cap, resized grids) simply don't intersect at use.
     active: bool = false,
     mode: Mode = .cell,
     anchor_col: u16 = 0,
@@ -137,6 +142,41 @@ pub const Selection = struct {
     init_start_row: u16 = 0,
     init_end_col: u16 = 0,
     init_end_row: u16 = 0,
+
+    /// Viewport row -> absolute (stable across scrolls by construction:
+    /// live row r sits at sb_len + r, scrollback row i at i, and both
+    /// survive scrollUp/rotation; only cap eviction drifts, clamped).
+    pub fn toAbs(grid: anytype, vis_row: u16) usize {
+        const sb: usize = grid.sb_len;
+        const off: usize = @min(grid.view_offset, sb);
+        return sb - off + vis_row;
+    }
+
+    /// Viewport span -> absolute span (backend boundary conversion).
+    pub fn spanToAbs(grid: anytype, span: Span) Span {
+        return .{
+            .start_col = span.start_col,
+            .start_row = @intCast(@min(toAbs(grid, span.start_row), 65535)),
+            .end_col = span.end_col,
+            .end_row = @intCast(@min(toAbs(grid, span.end_row), 65535)),
+        };
+    }
+
+    /// Cell at an absolute row (null past available history/end).
+    /// Returned by value: callers only read (rune, combining, wrapped).
+    fn absCell(grid: anytype, abs_row: usize, col: u16) ?@TypeOf(grid.at(0, 0).*) {
+        const cols: usize = grid.cols;
+        if (col >= cols) return null;
+        const sb: usize = grid.sb_len;
+        if (abs_row < sb) {
+            const slice = grid.getScrollbackRow(abs_row);
+            if (col >= slice.len) return null;
+            return slice[col];
+        }
+        const live = abs_row - sb;
+        if (live >= grid.rows) return null;
+        return grid.at(col, @intCast(live)).*;
+    }
 
     pub fn begin(self: *Selection, col: u16, row: u16) void {
         self.* = .{
@@ -189,7 +229,7 @@ pub const Selection = struct {
     }
 
     pub fn updateWordDrag(self: *Selection, grid: anytype, col: u16, row: u16) void {
-        const span = findWordSpan(grid, col, row);
+        const span = Selection.spanToAbs(grid, findWordSpan(grid, col, row));
         if (span.end_row > self.init_end_row or (span.end_row == self.init_end_row and span.end_col >= self.init_end_col)) {
             self.anchor_col = self.init_start_col;
             self.anchor_row = self.init_start_row;
@@ -209,17 +249,22 @@ pub const Selection = struct {
     }
 
     pub fn updateLineDrag(self: *Selection, grid: anytype, row: u16) void {
-        const span = findLineSpan(grid, row);
+        const span = Selection.spanToAbs(grid, findLineSpan(grid, row));
         if (span.end_row >= self.init_end_row) {
             self.anchor_col = self.init_start_col;
             self.anchor_row = self.init_start_row;
             self.focus_col = span.end_col;
             self.focus_row = span.end_row;
-        } else {
+        } else if (span.start_row < self.init_start_row or (span.start_row == self.init_start_row and span.start_col <= self.init_start_col)) {
             self.anchor_col = self.init_end_col;
             self.anchor_row = self.init_end_row;
             self.focus_col = span.start_col;
             self.focus_row = span.start_row;
+        } else {
+            self.anchor_col = self.init_start_col;
+            self.anchor_row = self.init_start_row;
+            self.focus_col = self.init_end_col;
+            self.focus_row = self.init_end_row;
         }
     }
 
@@ -241,61 +286,66 @@ pub const Selection = struct {
         };
     }
 
-    /// True when (col, row) in screen space is covered (inclusive both ends).
-    pub fn contains(self: *const Selection, col: u16, row: u16) bool {
+    /// True when (col, abs_row) is covered (inclusive both ends).
+    /// Rows are absolute: callers map viewport rows via toAbs (out of
+    /// range simply never intersects — evicted/resized content can't
+    /// highlight or copy).
+    pub fn contains(self: *const Selection, col: u16, abs_row: usize) bool {
         if (!self.active) return false;
         var sc = self.anchor_col;
-        var sr = self.anchor_row;
+        var sr: usize = self.anchor_row;
         var ec = self.focus_col;
-        var er = self.focus_row;
+        var er: usize = self.focus_row;
         if (sr > er or (sr == er and sc > ec)) {
             sc = self.focus_col;
             sr = self.focus_row;
             ec = self.anchor_col;
             er = self.anchor_row;
         }
-        if (row < sr or row > er) return false;
+        if (abs_row < sr or abs_row > er) return false;
         if (sr == er) return col >= sc and col <= ec;
-        if (row == sr) return col >= sc;
-        if (row == er) return col <= ec;
+        if (abs_row == sr) return col >= sc;
+        if (abs_row == er) return col <= ec;
         return true;
     }
 
     /// Extract selected text as owned UTF-8, or null when empty/inactive.
     /// Wrapped rows join without newlines; other row breaks emit '\n'
     /// (none trailing). Wide-char follower columns are skipped like the
-    /// renderer does; combining marks ride along. Coordinates are screen
-    /// space; grid.viewCell maps any scrollback offset.
+    /// renderer does; combining marks ride along. Rows are absolute, so
+    /// extraction is viewport-independent: scrolling mid-drag (or after
+    /// release) copies the same content, and evicted rows just clip.
     pub fn extract(self: *const Selection, gpa: std.mem.Allocator, grid: anytype) !?[]u8 {
         if (!self.active) return null;
         var sc = self.anchor_col;
-        var sr = self.anchor_row;
+        var sr: usize = self.anchor_row;
         var ec = self.focus_col;
-        var er = self.focus_row;
+        var er: usize = self.focus_row;
         if (sr > er or (sr == er and sc > ec)) {
             sc = self.focus_col;
             sr = self.focus_row;
             ec = self.anchor_col;
             er = self.anchor_row;
         }
-        const rows: u16 = grid.rows;
-        const cols: u16 = grid.cols;
-        if (rows == 0 or cols == 0 or sr >= rows) return null;
-        er = @min(er, rows - 1);
+        const rows: usize = grid.rows;
+        const cols: usize = grid.cols;
+        if (rows == 0 or cols == 0) return null;
+        const total: usize = grid.sb_len + rows;
+        if (sr >= total) return null;
+        er = @min(er, total - 1);
         var out = try std.ArrayList(u8).initCapacity(gpa, 256);
         errdefer out.deinit(gpa);
-        var r: u16 = sr;
+        var r: usize = sr;
         while (true) {
             const first = r == sr;
             const last = r == er;
-            const c0: u16 = if (first) @min(sc, cols - 1) else 0;
-            const c1: u16 = if (last) @min(ec, cols - 1) else cols - 1;
+            const c0: usize = if (first) @min(@as(usize, sc), cols - 1) else 0;
+            const c1: usize = if (last) @min(@as(usize, ec), cols - 1) else cols - 1;
             const row_start = out.items.len;
             var prev_wide = false;
-            var c: u16 = c0;
+            var c: usize = c0;
             while (c <= c1) : (c += 1) {
-                const cell_ptr = grid.viewCell(c, r) orelse break;
-                const cell = cell_ptr.*;
+                const cell = absCell(grid, r, @intCast(c)) orelse break;
                 const v: u32 = cell.rune;
                 const wide_here = utf8_mod.isWide(@intCast(v));
                 if (prev_wide) {
@@ -322,7 +372,7 @@ pub const Selection = struct {
             }
             if (!last) {
                 var nl = true;
-                if (grid.viewCell(cols - 1, r)) |lc| nl = !lc.wrapped;
+                if (absCell(grid, r, @intCast(cols - 1))) |lc| nl = !lc.wrapped;
                 if (nl) try out.append(gpa, '\n');
             }
             if (last) break;
@@ -446,6 +496,33 @@ test "word span and multi-click word selection" {
     const span_delim = findWordSpan(&g, 23, 0);
     try std.testing.expectEqual(@as(u16, 23), span_delim.start_col);
     try std.testing.expectEqual(@as(u16, 23), span_delim.end_col);
+}
+
+test "absolute rows track content across scrolls" {
+    const grid_mod = @import("../term/grid.zig");
+    const G = grid_mod.Grid(.{});
+    var g = try G.init(std.testing.allocator, 8, 4);
+    defer g.deinit();
+    // Live rows 0-3: mark row 1.
+    g.at(0, 1).setRune('X');
+    var s = Selection{};
+    // Select viewport row 1 with the live view (abs == 1, sb empty).
+    s.begin(0, @intCast(Selection.toAbs(&g, 1)));
+    s.update(0, @intCast(Selection.toAbs(&g, 1)));
+    // Scroll two lines up into history: the stored abs row still
+    // addresses the X (live row 1 -> sb row 1; abs indices are stable
+    // across scrollUp rotation).
+    g.scrollUp(true);
+    g.scrollUp(true);
+    try std.testing.expectEqual(@as(usize, 2), g.sb_len);
+    const got = try s.extract(std.testing.allocator, &g) orelse return error.Fail;
+    defer std.testing.allocator.free(got);
+    try std.testing.expectEqualStrings("X", got);
+    // Highlight maps through the parked viewport (view 2, row 0 on
+    // screen is abs 0; the X at abs 1 shows at viewport row 1).
+    g.scrollView(2);
+    try std.testing.expect(s.contains(0, Selection.toAbs(&g, 1)));
+    try std.testing.expect(!s.contains(0, Selection.toAbs(&g, 0)));
 }
 
 test "word span across wrapped lines" {

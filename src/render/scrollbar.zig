@@ -16,8 +16,7 @@ pub const MAX_ALPHA: u8 = 180;
 pub const FADE_IN_MS: i64 = 120;
 pub const FADE_OUT_MS: i64 = 450;
 
-/// Step an opacity toward its target over dt_ms with a tau_ms time
-/// constant, snapping on arrival (no endless epsilon frames).
+/// Step an opacity toward its target over dt_ms with a tau_ms time/// constant, snapping on arrival (no endless epsilon frames).
 pub fn stepAlpha(cur: u8, target: u8, dt_ms: i64, tau_ms: i64) u8 {
     if (cur == target or tau_ms <= 0) return target;
     const dt = @min(@max(dt_ms, 0), 50);
@@ -28,6 +27,19 @@ pub fn stepAlpha(cur: u8, target: u8, dt_ms: i64, tau_ms: i64) u8 {
     // Snap when the step would stall (sub-1px creep near the target).
     if (r == cur) return target;
     return @intCast(@min(@max(r, 0), 255));
+}
+
+/// Fold high-res scroll units (120ths, pointer value120) into whole
+/// rows at `step` rows per 120 units, keeping the sub-notch remainder
+/// in accum across events so touchpad gestures never lose or duplicate
+/// motion. Truncates toward zero (symmetric both directions). Returns
+/// the signed rows to move now (0 = still accumulating).
+pub fn consume120(accum: *i32, v120: i32, step: u32) i32 {
+    const s: i32 = @intCast(@max(1, step));
+    accum.* += v120;
+    const rows = @divTrunc(accum.* * s, 120);
+    accum.* -= @divTrunc(rows * 120, s);
+    return rows;
 }
 
 pub const Geom = struct {
@@ -157,4 +169,31 @@ test "alpha steps fast in, slow out, snaps on arrival" {
     n = 0;
     while (a != 0 and n < 500) : (n += 1) a = stepAlpha(a, 0, 16, FADE_OUT_MS);
     try std.testing.expectEqual(@as(u8, 0), a);
+}
+
+test "consume120 notches, accumulates, mirrors" {
+    var acc: i32 = 0;
+    // One wheel notch (120 units) = full step.
+    try std.testing.expectEqual(@as(i32, 3), consume120(&acc, 120, 3));
+    try std.testing.expectEqual(@as(i32, 0), acc);
+    // Touchpad dribble: sub-notch events accumulate losslessly
+    // (90 units @ step 3 = 2 rows + 10 kept, streamed 0+1+1).
+    try std.testing.expectEqual(@as(i32, 0), consume120(&acc, 30, 3));
+    try std.testing.expectEqual(@as(i32, 30), acc);
+    try std.testing.expectEqual(@as(i32, 1), consume120(&acc, 30, 3));
+    try std.testing.expectEqual(@as(i32, 20), acc);
+    try std.testing.expectEqual(@as(i32, 1), consume120(&acc, 30, 3));
+    try std.testing.expectEqual(@as(i32, 10), acc);
+    // Negative mirrors positive (truncate toward zero, symmetric).
+    acc = 0;
+    try std.testing.expectEqual(@as(i32, -3), consume120(&acc, -120, 3));
+    try std.testing.expectEqual(@as(i32, 0), acc);
+    try std.testing.expectEqual(@as(i32, 0), consume120(&acc, -30, 3));
+    try std.testing.expectEqual(@as(i32, -1), consume120(&acc, -30, 3));
+    try std.testing.expectEqual(@as(i32, -20), acc);
+    // Step scales proportionally; step 0 clamps to 1 (never dead).
+    acc = 0;
+    try std.testing.expectEqual(@as(i32, 5), consume120(&acc, 120, 5));
+    acc = 0;
+    try std.testing.expectEqual(@as(i32, 1), consume120(&acc, 120, 0));
 }
