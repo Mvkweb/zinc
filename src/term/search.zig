@@ -30,6 +30,14 @@ pub fn absRow(grid: anytype, vis_row: u16) usize {
     return sb - off + vis_row;
 }
 
+/// Absolute row through an explicit viewport offset (the renderer
+/// paints the interpolated offset mid-glide; overlays must use the
+/// same one or highlight and content visibly detach, then snap).
+pub fn absRowAt(grid: anytype, vis_row: u16, off: usize) usize {
+    const sb: usize = grid.sb_len;
+    return sb - @min(off, sb) + vis_row;
+}
+
 /// Scroll the minimum to show abs_row (edge-follow for stepwise cursor
 /// motion). Unlike ensureVisible (which centers for jumps), this never
 /// moves the viewport when the row is already visible.
@@ -425,6 +433,19 @@ test "find covers scrollback + caps + empty" {
     var c = try findAll(std.testing.allocator, &g, "needle", 1);
     defer c.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 1), c.items.len);
+}
+
+test "absRowAt follows an explicit offset" {
+    var g = try grid_mod.Grid(.{}).init(std.testing.allocator, 4, 2);
+    defer g.deinit();
+    g.at(0, 0).setRune('A');
+    g.scrollUp(true);
+    g.scrollUp(true);
+    // sb = 2, live = 2: viewport row 1 at parked view 2 reads sb
+    // row 1 (abs 1); at the live view it reads live row 1 (abs 3).
+    try std.testing.expectEqual(@as(usize, 1), absRowAt(&g, 1, 2));
+    try std.testing.expectEqual(@as(usize, 3), absRowAt(&g, 1, 0));
+    try std.testing.expectEqual(absRow(&g, 1), absRowAt(&g, 1, g.view_offset));
 }
 
 test "ensureVisible centers matches" {

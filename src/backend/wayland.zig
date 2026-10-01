@@ -1028,11 +1028,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
             };
         }
 
-        fn isCellSelected(self: *const Self, col: u16, row: u16) bool {
+        fn isCellSelected(self: *const Self, col: u16, row: u16, off: usize) bool {
             if (!cfg.selection) return false;
             if (!self.selection_single_cell and self.sel.isSingleCell()) return false;
-            const abs: usize = selection_mod.Selection.toAbs(&self.ctx.grid, row);
-            return self.sel.contains(col, abs);
+            // Viewport-locked: callers pass the same offset the cells
+            // were painted with (interpolated mid-glide), so highlight
+            // and text never detach and snap.
+            return self.sel.contains(col, search_mod.absRowAt(&self.ctx.grid, row, off));
         }
 
         fn resolveFg(self: *const Self, raw: u32) u32 {
@@ -1510,7 +1512,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // to its target (0 at rest). Text passes shift with it; image
             // tiers and bottom overlays stay pinned.
             const fyshift: i32 = self.flow.scrollShiftPx(ch);
-            const row_end: u16 = if (fyshift != 0) visible_rows +| 1 else visible_rows;
+            // The travel row always exists (clamped to grid rows): a
+            // glide that gains/loses its edge row mid-flight pops a full
+            // row at the settle instant. Painting it unconditionally costs
+            // one null row at rest and kills the pop everywhere.
+            const row_end: u16 = @min(visible_rows +| 1, self.ctx.grid.rows);
             // Find: visible match subset for per-cell highlight checks.
             if (cfg.find and self.find_active and visible_rows > 0) {
                 const v0 = search_mod.absRow(&self.ctx.grid, 0);
@@ -1547,7 +1553,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 while (col < visible_cols) : (col += 1) {
                     const cell_ptr = self.ctx.grid.viewCellAt(col, row, eff) orelse continue;
                     const cell = cell_ptr.*;
-                    const is_selected = self.isCellSelected(col, row);
+                    const is_selected = self.isCellSelected(col, row, eff);
                     const find_hit = self.findMatchAt(search_mod.absRow(&self.ctx.grid, row), col);
                     const is_current = find_hit == 1;
                     const is_other = find_hit == 2;
@@ -1610,7 +1616,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     // fg stays straight-opaque for the coverage blend. Swap
                     // before converting so reverse video uses bg as fg.
                     var fg_raw: u32 = undefined;
-                    if (self.isCellSelected(col, row) or self.findMatchAt(search_mod.absRow(&self.ctx.grid, row), col) == 1) {
+                    if (self.isCellSelected(col, row, eff) or self.findMatchAt(search_mod.absRowAt(&self.ctx.grid, row, eff), col) == 1) {
                         fg_raw = self.selection_fg & 0xFFFFFF;
                     } else if (cell.attr.reverse) {
                         fg_raw = self.resolveBg(cell.bg) & 0xFFFFFF;
@@ -1825,7 +1831,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Copy cursor: solid block in cursor color + COPY tag. The
             // normal cursor stays hidden while copy mode owns the screen.
             if (cfg.copy_mode and self.copy_active) {
-                const coff: usize = @min(self.ctx.grid.view_offset, self.ctx.grid.sb_len);
+                const coff: usize = @min(eff, self.ctx.grid.sb_len);
                 const csb: usize = self.ctx.grid.sb_len;
                 if (self.copy_arow >= csb - coff) {
                     const sr = self.copy_arow - (csb - coff);
@@ -1837,7 +1843,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         const chu: u32 = @intCast(ch);
                         // Occupied cell: hollow outline so the character
                         // stays readable; empty cell: solid block.
-                        const occ = if (self.ctx.grid.viewCell(self.copy_acol, @intCast(sr))) |cell| blk: {
+                        const occ = if (self.ctx.grid.viewCellAt(self.copy_acol, @intCast(sr), eff)) |cell| blk: {
                             const cp = cellCp(cell.rune);
                             break :blk cp != ' ' and cp != 0;
                         } else false;
@@ -1903,7 +1909,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // 1. Fill the cursor cell background
             const cell_ptr = self.ctx.grid.viewCell(col, row);
             const cell = if (cell_ptr) |cp| cp.* else cell_mod.Cell(cfg){};
-            const is_selected = self.isCellSelected(col, row);
+            const is_selected = self.isCellSelected(col, row, @min(self.ctx.grid.view_offset, self.ctx.grid.sb_len));
             const is_reversed = cell.attr.reverse;
             const is_def_bg = cell_mod.isDefaultColor(cell.bg) and !is_reversed and !is_selected;
 

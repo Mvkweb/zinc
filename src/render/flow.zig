@@ -209,9 +209,35 @@ pub const Flow = struct {
         } else {
             const sdur: f32 = @max(1.0, @as(f32, @floatFromInt(scroll_ms)));
             const f: f32 = @min(dt_ms / sdur, 1.0);
-            self.shown_off += (self.view_off_f - self.shown_off) * f;
-            if (@abs(self.view_off_f - self.shown_off) < 0.02 and self.over == 0) {
-                self.shown_off = self.view_off_f;
+            const chf: f32 = @floatFromInt(@max(ch, 1));
+            const px_rows: f32 = 1.0 / chf; // one rendered pixel, in rows
+            const diff = self.view_off_f - self.shown_off;
+            if (self.over == 0 and dt_ms > 0 and diff != 0) {
+                // Tail discipline: exponential crawls sub-pixel amounts
+                // for ~100ms, which quantizes as stall-tick-stall on the
+                // rounded shift (and any threshold snap pops by whole
+                // pixels). Instead guarantee ≥1px progress per frame so
+                // the landing streams ...3,2,1,0, and snap only what
+                // rounds to nothing (<0.5px, invisible). Attack curve
+                // untouched: lerp dominates until it drops under 1px.
+                if (@abs(diff) * chf < 0.5) {
+                    self.shown_off = self.view_off_f;
+                } else {
+                    var adv = diff * f;
+                    if (@abs(adv) < px_rows) adv = if (diff > 0) px_rows else -px_rows;
+                    self.shown_off += adv;
+                    // The push never passes the target (exact landing,
+                    // never a corrective snap back).
+                    if ((diff > 0 and self.shown_off > self.view_off_f) or
+                        (diff < 0 and self.shown_off < self.view_off_f))
+                    {
+                        self.shown_off = self.view_off_f;
+                    }
+                }
+            } else {
+                self.shown_off += (self.view_off_f - self.shown_off) * f;
+            }
+            if (self.shown_off == self.view_off_f and self.over == 0) {
                 self.scroll_moving = false;
             } else {
                 self.scroll_moving = true;
@@ -455,6 +481,31 @@ test "snapView lands instantly" {
     f.snapView(0);
     try std.testing.expect(f.settled());
     try std.testing.expectEqual(@as(usize, 0), f.viewEff(100));
+    try std.testing.expectEqual(@as(i32, 0), f.scrollShiftPx(16));
+}
+
+test "tail streams one pixel per frame then lands" {
+    var f = Flow{};
+    f.step(1000, 0, 0, 0, true, false, 8, 16, false, 120, 0, true, 150);
+    // Park the glide ~1.6px short: every frame must advance rendered
+    // position (no stalls), steps stay tiny, landing is exact.
+    f.view_off_f = 3;
+    f.shown_off = 2.9;
+    f.scroll_moving = true;
+    var prev_pos: i32 = @intFromFloat(2.9 * 16);
+    var t: i64 = 1016;
+    var n: usize = 0;
+    while (!f.settled() and n < 50) : (n += 1) {
+        f.step(t, 0, 0, 3, true, false, 8, 16, false, 120, 0, true, 150);
+        t += 7;
+        const pos: i32 = @as(i32, @intCast(f.viewEff(100))) * 16 + f.scrollShiftPx(16);
+        // Monotonic, at least a pixel while moving, never a leap.
+        try std.testing.expect(pos >= prev_pos);
+        try std.testing.expect(pos - prev_pos <= 2);
+        prev_pos = pos;
+    }
+    try std.testing.expect(f.settled());
+    try std.testing.expectEqual(@as(usize, 3), f.viewEff(100));
     try std.testing.expectEqual(@as(i32, 0), f.scrollShiftPx(16));
 }
 
