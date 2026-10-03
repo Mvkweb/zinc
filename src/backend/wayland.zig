@@ -422,8 +422,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
         pending_resize: ?struct { w: i32, h: i32 } = null,
         resize_settle_ms: i64 = 0,
         is_resizing: bool = false,
-        pending_cols: u16 = 0,
-        pending_rows: u16 = 0,
         last_activity_ms: i64 = 0,
         idle_trimmed: bool = false,
         cursor_only_render: bool = false,
@@ -789,7 +787,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.handleResize(p.w, p.h);
             }
             if (self.resize_settle_ms > 0) {
-                self.settleResize(self.pending_cols, self.pending_rows);
+                self.settleResize();
             }
             // Default pixel size from font metrics until configure says otherwise.
             if (self.width == 0) {
@@ -2010,8 +2008,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
             if (cols == self.ctx.grid.cols and rows == self.ctx.grid.rows) return;
 
-            self.pending_cols = cols;
-            self.pending_rows = rows;
             // Debounce all interactive resizes by 100ms (Foot parity: resize-delay-ms = 100).
             // Compositors like Hyprland and Sway omit XDG_TOPLEVEL_STATE_RESIZING,
             // so we debounce all size changes while the main loop runs.
@@ -2020,8 +2016,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.needs_render = true;
         }
 
-        fn settleResize(self: *Self, cols: u16, rows: u16) void {
+        fn settleResize(self: *Self) void {
             self.resize_settle_ms = 0;
+            // Re-derive from the latest pixel size: a rapid A->B configure
+            // overwrites pending_resize while parked cols still hold A, so
+            // settling parked values would reflow + SIGWINCH at a stale
+            // intermediate width (the shell repaints against it, then the
+            // real size lands mid-repaint and strands erased spans).
+            const pad_x = self.currentPadX();
+            const pad_y = self.currentPadY();
+            const cols: u16 = @intCast(@max(15, @divFloor(self.width - 2 * @as(i32, @intCast(pad_x)), self.cell_w)));
+            const rows: u16 = @intCast(@max(3, @divFloor(self.height - 2 * @as(i32, @intCast(pad_y)), self.cell_h)));
             if (cols == self.ctx.grid.cols and rows == self.ctx.grid.rows) return;
             self.ctx.resize(cols, rows);
             if (self.pty_fd >= 0) {
@@ -2274,7 +2279,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 _ = c.wl_display_dispatch_pending(self.display);
 
                 if (self.resize_settle_ms > 0 and context_mod.nowMs() >= self.resize_settle_ms) {
-                    self.settleResize(self.pending_cols, self.pending_rows);
+                    self.settleResize();
                 }
 
                 if ((fds[1].revents & linux.POLL.IN) != 0) {
@@ -4055,7 +4060,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.pending_resize = .{ .w = w, .h = h };
                 self.needs_render = true;
             } else if (drag_ended and self.resize_settle_ms > 0) {
-                self.settleResize(self.pending_cols, self.pending_rows);
+                self.settleResize();
             }
         }
 
