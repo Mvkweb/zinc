@@ -15,6 +15,12 @@ jobs:
           # Install-only: no Cachix account, cache, or extra secrets.
           extra_nix_config: |
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+      # Pull-only until the cache owner adds CACHIX_AUTH_TOKEN; then it
+      # also pushes fresh builds for testers to substitute.
+      - uses: cachix/cachix-action@v15
+        with:
+          name: zinc
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - name: build
         run: nix build --print-build-logs
       - name: verify

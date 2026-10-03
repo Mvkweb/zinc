@@ -27,6 +27,10 @@ jobs:
           # Install-only: no Cachix account, cache, or extra secrets.
           extra_nix_config: |
             access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+      - uses: cachix/cachix-action@v15
+        with:
+          name: zinc
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
       - name: zon version matches tag
         run: |
           zon="$(sed -n 's/^[[:space:]]*\.version = "\(.*\)".*/\1/p' build.zig.zon)"
