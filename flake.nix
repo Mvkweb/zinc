@@ -7,10 +7,15 @@
     systems = [ "x86_64-linux" "aarch64-linux" ];
     forSystems = nixpkgs.lib.genAttrs systems;
 
-    # Release line. Bump together with build.zig.zon `.version` in the
-    # release commit; everything else (suffix, tarballs) derives from git,
-    # so tagged releases need no other hardcoding.
-    baseVersion = "0.1.0";
+    # Release line lives ONLY in build.zig.zon `.version` (mandatory there).
+    # The flake reads it, so a release commit bumps exactly one literal;
+    # suffixes and tarballs derive from git.
+    zonText = builtins.readFile ./build.zig.zon;
+    zonMatch = builtins.match "[[:space:][:print:]]*\\.version = \"([0-9]+\\.[0-9]+\\.[0-9]+)\"[[:space:][:print:]]*" zonText;
+    baseVersion =
+      if zonMatch == null
+      then throw "flake.nix: could not parse .version from build.zig.zon"
+      else builtins.head zonMatch;
     versionFor = src:
       if src ? shortRev
       then "${baseVersion}+g${src.shortRev}"
@@ -46,7 +51,15 @@
       pname = "zinc";
       version = versionFor src;
       inherit src;
-      nativeBuildInputs = [ (zigToolchain pkgs system) pkgs.pkg-config pkgs.makeWrapper ];
+      nativeBuildInputs = [
+        (zigToolchain pkgs system)
+        pkgs.pkg-config
+        pkgs.makeWrapper
+        # Zig bakes a stock /lib64 dynamic linker into the binary, which
+        # does not exist on NixOS. Rewrite INTERP/RPATH to the nix glibc
+        # before wrapping; without this the binary fails at exec time.
+        pkgs.autoPatchelfHook
+      ];
       buildInputs = zincLibs pkgs;
       # Zero zon dependencies, so no network or vendoring step is needed.
       buildPhase = ''

@@ -1,7 +1,7 @@
 name: Release
-# Cut a release: bump `baseVersion` in flake.nix AND `.version` in
-# build.zig.zon together, commit, then `git tag vX.Y.Z && git push
-# origin vX.Y.Z`. This workflow builds both arches and attaches
+# Cut a release: bump `.version` in build.zig.zon (the flake reads it
+# from there — single source of truth), commit, then `git tag vX.Y.Z &&
+# git push origin vX.Y.Z`. This workflow builds both arches and attaches
 # tarballs to the GitHub release. Nothing else to hardcode.
 on:
   push:
