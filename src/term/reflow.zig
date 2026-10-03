@@ -205,23 +205,26 @@ pub fn reflowGrid(
                     }
                 }
 
-                // Prompt-zone right-decoration trim: on the cursor line and
-                // the two lines above it, drop right-aligned text sitting
-                // behind a wide blank gap (Starship $fill/$git_metrics, fish
-                // rprompt). The shell repaints those for the new width on
-                // SIGWINCH; stale margins would wrap the prompt onto extra
-                // rows and strand orphan lines (diagonal staircase cascade).
-                // Box rows (leading U+2502) are exempt: fastfetch/neofetch
-                // value columns look identical to decorations but repaint
-                // never — trimming them deletes real content. The trim only
-                // ever runs when narrowing: widening cannot strand orphans,
-                // and unbordered content (fastfetch logos) must survive a
-                // fresh-window widen untouched.
+                // Prompt-zone right-decoration trim: on the cursor line only,
+                // drop right-aligned text sitting behind a wide blank gap
+                // (Starship $fill/$git_metrics, fish rprompt). The shell
+                // repaints those for the new width on SIGWINCH; a stale
+                // margin would wrap the prompt onto extra rows and strand
+                // orphan lines (diagonal staircase cascade). History rows
+                // above are never repainted, so trimming them is pure loss.
+                // Box rows (any U+2500..U+257F lead: │ borders, ╭╰ corners)
+                // are exempt: fastfetch/neofetch value columns look
+                // identical to decorations but repaint never — trimming them
+                // deletes real content. The trim only ever runs when
+                // narrowing: widening cannot strand orphans, and unbordered
+                // content (fastfetch logos) must survive a fresh-window
+                // widen untouched.
                 const r0: u32 = if (ir.cells.len > 0) ir.cells[0].rune else ' ';
                 const cursor_input_row = sb_count + @as(usize, cursor_row.*);
                 const ir_idx = line_start + line_row_idx;
                 const is_prompt_zone = (ir_idx + 2 >= cursor_input_row and ir_idx <= cursor_input_row);
-                if (!ir.wrapped and is_prompt_zone and last_non_blank > 0 and r0 != 0x2502 and new_cols < old_cols) {
+                const r0_box = r0 >= 0x2500 and r0 <= 0x257F;
+                if (!ir.wrapped and is_prompt_zone and ir.is_cursor and last_non_blank > 0 and !r0_box and new_cols < old_cols) {
                     const min_col_for_gap = if (ir.is_cursor) @as(usize, cursor_col.*) else 0;
                     if (last_non_blank > min_col_for_gap) {
                         var scan = last_non_blank;
@@ -885,6 +888,57 @@ test "extreme narrow 3-column squeeze restores box byte-identical at top" {
     // Assert prompt is at row 4
     try std.testing.expectEqual(@as(u16, 4), cur_row);
     try std.testing.expectEqual(@as(u32, '>'), g.at(0, 4).rune);
+}
+
+test "prompt trim spares history rows, still fires on cursor row" {
+    // Narrowing must not eat right-aligned text on rows above the cursor
+    // (fastfetch value columns are never repainted); the cursor row itself
+    // keeps the Starship/fish decoration trim (staircase fix).
+    const grid_mod = @import("grid.zig");
+    const cfg = config_mod.Config{ .scrollback_cap = 8, .alt_screen = false };
+    const G = grid_mod.Grid(cfg);
+    var g = try G.init(std.testing.allocator, 20, 3);
+    defer g.deinit();
+
+    for ("AB    CD", 0..) |ch, c| g.at(@intCast(c), 0).setRune(ch);
+    for ("p1    p2", 0..) |ch, c| g.at(@intCast(c), 1).setRune(ch);
+    var cur_col: u16 = 1; // just past "p1", left of the gap
+    var cur_row: u16 = 1;
+
+    try reflowGrid(cfg, std.testing.allocator, &g, 12, 3, &cur_col, &cur_row, cfg.bg);
+    // History row intact, gap and all.
+    try std.testing.expectEqual(@as(u32, 'A'), g.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'B'), g.at(1, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'C'), g.at(6, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'D'), g.at(7, 0).rune);
+    // Cursor row trimmed behind the gap.
+    try std.testing.expectEqual(@as(u32, 'p'), g.at(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, '1'), g.at(1, 1).rune);
+    try std.testing.expect(g.at(6, 1).rune != 'p');
+    try std.testing.expect(g.at(7, 1).rune != '2');
+}
+
+test "prompt trim exempts all box-drawing leads" {
+    // ╭ corners (not just │ borders) must survive a narrow: fastfetch
+    // top/bottom borders never repaint.
+    const grid_mod = @import("grid.zig");
+    const cfg = config_mod.Config{ .scrollback_cap = 8, .alt_screen = false };
+    const G = grid_mod.Grid(cfg);
+    var g = try G.init(std.testing.allocator, 20, 3);
+    defer g.deinit();
+
+    g.at(0, 0).setRune(0x256D);
+    g.at(1, 0).setRune(0x2500);
+    for ("hi", 0..) |ch, c| g.at(@intCast(9 + c), 0).setRune(ch);
+    g.at(0, 1).setRune('>');
+    g.at(1, 1).setRune(' ');
+    var cur_col: u16 = 2;
+    var cur_row: u16 = 1;
+
+    try reflowGrid(cfg, std.testing.allocator, &g, 12, 3, &cur_col, &cur_row, cfg.bg);
+    try std.testing.expectEqual(@as(u32, 0x256D), g.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'h'), g.at(9, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'i'), g.at(10, 0).rune);
 }
 
 test "widen keeps gapped content rows intact" {
