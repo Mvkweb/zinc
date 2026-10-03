@@ -9,8 +9,8 @@
   # --accept-flake-config once. The CI cachix-action covers runners instead.
   # TODO(cache-owner): replace with the real cache name + public key.
   nixConfig = {
-    extra-substituters = [ "https://zinc.cachix.org" ];
-    extra-trusted-public-keys = [ "zinc.cachix.org-1:REPLACE-WITH-CACHE-PUBLIC-KEY" ];
+    extra-substituters = [ "https://zinc-term.cachix.org" ];
+    extra-trusted-public-keys = [ "zinc-term.cachix.org-1:tmQ02H/zTCa6EjFoNsOpRIIgYETxRdZ/7mkz69ffgzc=" ];
   };
 
   # Release line lives ONLY in build.zig.zon `.version` (mandatory there).

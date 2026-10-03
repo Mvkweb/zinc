@@ -22,3 +22,14 @@ FEATURES.md
 
 # Local manual test scripts (kitty harness, not shipped)
 scripts/
+
+# Devenv
+.devenv*
+devenv.local.nix
+devenv.local.yaml
+
+# direnv
+.direnv
+
+# pre-commit
+.pre-commit-config.yaml
