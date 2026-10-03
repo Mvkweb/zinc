@@ -1408,9 +1408,11 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             const col: usize = self.cursor_col;
             const n = bytes.len; // <= cols - col by contract
             const row = self.grid.rowSlice(self.cursor_row);
-            if (col == 0) {
-                row[cols - 1].wrapped = false;
-            } else {
+            // Short overwrite voids a stale wrap flag (fastfetch rule,
+            // putCodepoint parity): reflow joins rows on the last cell
+            // only. Genuine wraps re-arm via pending_wrap regardless.
+            if (col == 0 or col + n < cols) row[cols - 1].wrapped = false;
+            if (col != 0) {
                 const pv = row[col - 1].rune;
                 if (cellCp(pv) >= 0x1100 and utf8_mod.isWide(cellCp(pv))) row[col - 1] = self.penBlank();
             }
@@ -2948,6 +2950,18 @@ test "ascii run voids stale wrap flag at col 0" {
     try std.testing.expectEqual(@as(u32, 'Y'), ctx.grid.at(1, 0).rune);
     try std.testing.expect(!ctx.grid.at(3, 0).wrapped);
     try std.testing.expectEqual(@as(u16, 2), ctx.cursor_col);
+}
+
+test "ascii run voids stale wrap flag mid-row" {
+    var ctx = try Context(.{ .cols = 4, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("abcde"); // row 0 full + wrap flag, 'e' on row 1
+    try std.testing.expect(ctx.grid.at(3, 0).wrapped);
+    ctx.parse("\x1b[1;2H"); // onto col 1
+    ctx.parse("XY"); // short run at cols 1-2, stops short of the end
+    try std.testing.expectEqual(@as(u32, 'X'), ctx.grid.at(1, 0).rune);
+    try std.testing.expect(!ctx.grid.at(3, 0).wrapped);
+    try std.testing.expectEqual(@as(u16, 3), ctx.cursor_col);
 }
 
 test "ascii run stops at control bytes and resumes" {
