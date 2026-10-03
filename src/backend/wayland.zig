@@ -1670,7 +1670,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
                                     const plate = self.blitKeycapPlate(cell.combining[0..cell.combining_count], style, x, y, fg, W, H, &dmg);
                                     const base_fg = if (plate) |dark| (if (dark) @as(u32, 0xFF000000) else @as(u32, 0xFFFFFFFF)) else fg;
                                     if (self.glyphFor(cp, style)) |g| {
-                                        self.blitCellGlyph(g, x, y, base_fg, W, H, &dmg);
+                                        if ((g.w == 0 or g.h == 0) and box_drawing.isBoxDrawingOrBlock(cp)) {
+                                            // Cached tofu-blank must not shadow the
+                                            // procedural fallback: borders always draw.
+                                            _ = box_drawing.draw(self.pool_pixels, W, H, x, y, cw, ch, cp, base_fg, &dmg);
+                                        } else {
+                                            self.blitCellGlyph(g, x, y, base_fg, W, H, &dmg);
+                                        }
                                     } else if (box_drawing.isBoxDrawingOrBlock(cp)) {
                                         _ = box_drawing.draw(self.pool_pixels, W, H, x, y, cw, ch, cp, base_fg, &dmg);
                                     }
