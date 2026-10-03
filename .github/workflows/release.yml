@@ -1,0 +1,46 @@
+name: Release
+# Cut a release: bump `baseVersion` in flake.nix AND `.version` in
+# build.zig.zon together, commit, then `git tag vX.Y.Z && git push
+# origin vX.Y.Z`. This workflow builds both arches and attaches
+# tarballs to the GitHub release. Nothing else to hardcode.
+on:
+  push:
+    tags: ["v*"]
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            system: x86_64-linux
+          - runner: ubuntu-24.04-arm
+            system: aarch64-linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          # Avoids GitHub rate limiting; uses the automatic repo token.
+          # Install-only: no Cachix account, cache, or extra secrets.
+          extra_nix_config: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+      - name: zon version matches tag
+        run: |
+          zon="$(sed -n 's/^[[:space:]]*\.version = "\(.*\)".*/\1/p' build.zig.zon)"
+          test "v$zon" = "${{ github.ref_name }}" || {
+            echo "build.zig.zon version ($zon) != tag (${{ github.ref_name }})"
+            exit 1
+          }
+      - name: build
+        run: nix build --print-build-logs
+      - name: smoke version stamp
+        run: ./result/bin/zinc --version
+      - name: tarball
+        run: tar czf "zinc-${{ github.ref_name }}-${{ matrix.system }}.tar.gz" -C result/bin zinc
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: zinc-*.tar.gz
+          generate_release_notes: true

@@ -2,6 +2,10 @@
 zig-out/
 .zig-cache/
 
+# Nix build result symlinks
+result
+result-*
+
 # Upstream reference code
 references/
 

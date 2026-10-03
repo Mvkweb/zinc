@@ -1,0 +1,21 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  nix:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          # Avoids GitHub rate limiting; uses the automatic repo token.
+          # Install-only: no Cachix account, cache, or extra secrets.
+          extra_nix_config: |
+            access-tokens = github.com=${{ secrets.GITHUB_TOKEN }}
+      - name: build
+        run: nix build --print-build-logs
+      - name: verify
+        run: nix flake check --print-build-logs

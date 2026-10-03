@@ -8,10 +8,12 @@ pub fn build(b: *std.Build) void {
     // images / eye-candy / alt-screen at compile time (sfte-macro equivalent).
     const minimal = b.option(bool, "minimal", "Minimal build: no images, eye-candy, or alt-screen") orelse false;
     const ascii_only = b.option(bool, "ascii-only", "Store cells as u8 (ASCII only, halves grid memory)") orelse false;
+    const version = b.option([]const u8, "version", "Release version string baked into --version") orelse "0.1.0-dev";
 
     const options = b.addOptions();
     options.addOption(bool, "minimal", minimal);
     options.addOption(bool, "ascii_only", ascii_only);
+    options.addOption([]const u8, "version", version);
 
     // Wayland core C decls (translateC over wayland-client-core.h).
     // xdg-shell tables are hand-written in Zig (no scanner step).
