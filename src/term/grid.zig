@@ -12,6 +12,14 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
     return struct {
         pub const Cell = C;
 
+        pub const CwdEntry = struct {
+            gen: u16,
+            path: []u8,
+        };
+
+        /// Max remembered cwd generations (click-time linear scan).
+        const cwd_hist_cap: usize = 64;
+
         gpa: std.mem.Allocator,
         cols: u16,
         rows: u16,
@@ -29,6 +37,20 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
         /// The oldest scrollback row is at:
         /// `(offset + ring.len - sb_len) & ring_mask`.
         sb_len: usize = 0,
+
+        /// Per-row cwd generation stamps, parallel to ring slots (same
+        /// phys indexing, so scrollUp rotation carries them for free).
+        /// 0 with no history means "current"; otherwise rowCwdGen
+        /// resolves them for click/hit paths. Zero hot-path cost:
+        /// stamped on row-switch in Context, rotated or carried
+        /// explicitly everywhere else, never per char.
+        row_cwd: []u16 = &.{},
+        alt_cwd: []u16 = &.{},
+        /// Current cwd generation (bumps on real changes only).
+        cwd_cur: u16 = 0,
+        /// Old generation -> path table (deduped, capped; evicted or
+        /// missing generations fall back to the live cwd buffer).
+        cwd_hist: std.ArrayListUnmanaged(CwdEntry) = .empty,
 
         /// Viewport offset (0 = following live screen; >0 = scrolled up into history).
         view_offset: usize = 0,
@@ -60,6 +82,8 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
             self.ring_mask = ring_cap - 1;
             self.ring = try gpa.alloc(?[]C, ring_cap);
             @memset(self.ring, null);
+            self.row_cwd = try gpa.alloc(u16, ring_cap);
+            @memset(self.row_cwd, 0);
 
             for (0..rows) |r| {
                 const row_slice = try gpa.alloc(C, cols);
@@ -78,6 +102,8 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
                 self.alt_ring_mask = alt_cap - 1;
                 self.alt_ring = try gpa.alloc(?[]C, alt_cap);
                 @memset(self.alt_ring, null);
+                self.alt_cwd = try gpa.alloc(u16, alt_cap);
+                @memset(self.alt_cwd, 0);
                 for (0..rows) |r| {
                     const row_slice = try gpa.alloc(C, cols);
                     @memset(row_slice, .{});
@@ -101,6 +127,10 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
                 }
                 self.gpa.free(self.alt_ring);
             }
+            if (self.row_cwd.len > 0) self.gpa.free(self.row_cwd);
+            if (self.alt_cwd.len > 0) self.gpa.free(self.alt_cwd);
+            for (self.cwd_hist.items) |e| self.gpa.free(e.path);
+            self.cwd_hist.deinit(self.gpa);
             self.* = undefined;
         }
 
@@ -120,6 +150,8 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
                 if (self.ring[phys]) |old_r| self.gpa.free(old_r);
                 self.ring[phys] = self.gpa.alloc(C, self.cols) catch null;
                 if (self.ring[phys]) |r| @memset(r, .{});
+                // Fresh blank row: new content era (old content discarded).
+                if (self.row_cwd.len == self.ring.len) self.row_cwd[phys] = self.cwd_cur;
             }
             return self.ring[phys].?;
         }
@@ -142,6 +174,76 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
             const k = self.sb_len - i;
             const phys = (self.offset + self.ring.len - k) & self.ring_mask;
             return self.ring[phys];
+        }
+
+        /// Stamp a viewport row with a cwd generation (Context calls this
+        /// on row-switch while printing).
+        pub fn stampVisRow(self: *Self, vis_row: u16, gen: u16) void {
+            if (self.row_cwd.len != self.ring.len or vis_row >= self.rows) return;
+            const phys = (self.offset + vis_row) & self.ring_mask;
+            self.row_cwd[phys] = gen;
+        }
+
+        /// Cwd generation for a viewport row under an explicit scrollback
+        /// offset, mirroring viewCellAt. Out-of-range answers current.
+        pub fn rowCwdGen(self: *const Self, vis_row: u16, off: usize) u16 {
+            if (self.row_cwd.len != self.ring.len or vis_row >= self.rows) return self.cwd_cur;
+            const o = @min(off, self.sb_len);
+            const phys = if (o == 0)
+                (self.offset + vis_row) & self.ring_mask
+            else if (vis_row < o)
+                (self.offset + self.ring.len - (o - @as(usize, vis_row))) & self.ring_mask
+            else
+                (self.offset + (@as(usize, vis_row) - o)) & self.ring_mask;
+            return self.row_cwd[phys];
+        }
+
+        /// Cwd generation for scrollback row i (0 = oldest), mirroring
+        /// getScrollbackRow. Out-of-range answers current.
+        pub fn sbCwdGen(self: *const Self, i: usize) u16 {
+            if (self.row_cwd.len != self.ring.len or i >= self.sb_len) return self.cwd_cur;
+            const k = self.sb_len - i;
+            const phys = (self.offset + self.ring.len - k) & self.ring_mask;
+            return self.row_cwd[phys];
+        }
+
+        /// Record a cwd change: store the old path under the outgoing
+        /// generation (same-path reports are no-ops), bump, and report
+        /// whether anything changed. Callers reset write tracking.
+        pub fn noteCwdChange(self: *Self, old_path: []const u8, new_path: []const u8) !bool {
+            if (new_path.len == 0) return false;
+            if (old_path.len > 0 and std.mem.eql(u8, old_path, new_path)) return false;
+            if (self.cwd_cur == 65535) {
+                // Generation wrap (one per 65k cds): rebase everything.
+                if (self.row_cwd.len > 0) @memset(self.row_cwd, 0);
+                if (self.alt_cwd.len > 0) @memset(self.alt_cwd, 0);
+                for (self.cwd_hist.items) |e| self.gpa.free(e.path);
+                self.cwd_hist.clearRetainingCapacity();
+                self.cwd_cur = 0;
+            }
+            if (old_path.len > 0) {
+                while (self.cwd_hist.items.len >= cwd_hist_cap) {
+                    const e = self.cwd_hist.orderedRemove(0);
+                    self.gpa.free(e.path);
+                }
+                const duped = try self.gpa.dupe(u8, old_path);
+                errdefer self.gpa.free(duped);
+                try self.cwd_hist.append(self.gpa, .{ .gen = self.cwd_cur, .path = duped });
+            }
+            self.cwd_cur += 1;
+            return true;
+        }
+
+        /// Path for a generation, or null when it means "live" (== current)
+        /// or was evicted/never stored (caller falls back to live cwd).
+        pub fn cwdPathFor(self: *const Self, gen: u16) ?[]const u8 {
+            if (gen == self.cwd_cur) return null;
+            var i = self.cwd_hist.items.len;
+            while (i > 0) {
+                i -= 1;
+                if (self.cwd_hist.items[i].gen == gen) return self.cwd_hist.items[i].path;
+            }
+            return null;
         }
 
         /// Push an arbitrary row into the scrollback ring (used by reflow/tests).
@@ -167,6 +269,7 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
                 const dst = (self.offset + self.ring.len - k) & self.ring_mask;
                 const up = (self.offset + self.ring.len - k + 1) & self.ring_mask;
                 self.ring[dst] = self.ring[up];
+                if (self.row_cwd.len == self.ring.len) self.row_cwd[dst] = self.row_cwd[up];
             }
             const top = (self.offset + self.ring.len - 1) & self.ring_mask;
             // The pointer moved down; the slot is logically empty (without
@@ -184,6 +287,8 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
             if (recycled) |r| {
                 @memcpy(r, src);
                 self.ring[top] = r;
+                // Pushed history is just-written content: current era.
+                if (self.row_cwd.len == self.ring.len) self.row_cwd[top] = self.cwd_cur;
             }
         }
 
@@ -247,6 +352,7 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
             // leaving it restores the count — history is never wiped by
             // a TUI session.
             std.mem.swap(usize, &self.sb_len, &self.alt_sb_len);
+            std.mem.swap([]u16, &self.row_cwd, &self.alt_cwd);
             self.view_offset = 0;
             self.dirty_all = true;
         }
@@ -296,6 +402,8 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
             const new_ring_mask = new_ring_cap - 1;
             const new_ring = try self.gpa.alloc(?[]C, new_ring_cap);
             @memset(new_ring, null);
+            const new_cwd = try self.gpa.alloc(u16, new_ring_cap);
+            @memset(new_cwd, self.cwd_cur);
 
             const copy_cols = @min(cols, self.cols);
             const copy_rows = @min(rows, self.rows);
@@ -303,8 +411,13 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
                 const new_r = try self.gpa.alloc(C, cols);
                 @memset(new_r, .{});
                 if (r < copy_rows) {
+                    // Read the stamp before rowSlice (a width mismatch
+                    // realloc would clobber the source slot).
+                    const ophys = (self.offset + r) & self.ring_mask;
+                    const ostamp = if (self.row_cwd.len == self.ring.len) self.row_cwd[ophys] else self.cwd_cur;
                     const old_r = self.rowSlice(@intCast(r));
                     @memcpy(new_r[0..copy_cols], old_r[0..copy_cols]);
+                    new_cwd[r] = ostamp;
                 }
                 new_ring[r] = new_r;
             }
@@ -319,15 +432,18 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
                 const k = copy_sb - i;
                 const phys = (new_ring_cap - k) & new_ring_mask;
                 new_ring[phys] = new_r;
+                new_cwd[phys] = self.sbCwdGen(i);
             }
 
             for (self.ring) |maybe_r| {
                 if (maybe_r) |r| self.gpa.free(r);
             }
             self.gpa.free(self.ring);
+            if (self.row_cwd.len > 0) self.gpa.free(self.row_cwd);
 
             self.ring = new_ring;
             self.ring_mask = new_ring_mask;
+            self.row_cwd = new_cwd;
             self.offset = 0;
             self.sb_len = copy_sb;
             self.cols = cols;
@@ -344,15 +460,19 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
                 const alt_mask = alt_cap - 1;
                 const new_alt = try self.gpa.alloc(?[]C, alt_cap);
                 @memset(new_alt, null);
+                const new_alt_cwd = try self.gpa.alloc(u16, alt_cap);
+                @memset(new_alt_cwd, self.cwd_cur);
                 for (0..rows) |r| {
                     const new_r = try self.gpa.alloc(C, cols);
                     @memset(new_r, .{});
                     if (r < copy_rows) {
                         const old_phys = (self.alt_offset + r) & self.alt_ring_mask;
+                        const ostamp = if (self.alt_cwd.len == self.alt_ring.len) self.alt_cwd[old_phys] else self.cwd_cur;
                         if (self.alt_ring[old_phys]) |old_r| {
                             const ccols = @min(cols, @as(u16, @intCast(old_r.len)));
                             @memcpy(new_r[0..ccols], old_r[0..ccols]);
                         }
+                        new_alt_cwd[r] = ostamp;
                     }
                     new_alt[r] = new_r;
                 }
@@ -363,6 +483,7 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
                 for (0..copy_alt_sb) |i| {
                     const k = self.alt_sb_len - i;
                     const old_phys = (self.alt_offset + self.alt_ring.len - k) & self.alt_ring_mask;
+                    const ostamp = if (self.alt_cwd.len == self.alt_ring.len) self.alt_cwd[old_phys] else self.cwd_cur;
                     const new_r = try self.gpa.alloc(C, cols);
                     @memset(new_r, .{});
                     if (self.alt_ring[old_phys]) |old_sb| {
@@ -372,6 +493,7 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
                     const nk = copy_alt_sb - i;
                     const phys = (alt_cap - nk) & alt_mask;
                     new_alt[phys] = new_r;
+                    new_alt_cwd[phys] = ostamp;
                 }
                 for (self.alt_ring) |maybe_r| {
                     if (maybe_r) |r| self.gpa.free(r);
@@ -379,6 +501,8 @@ pub fn Grid(comptime cfg: config_mod.Config) type {
                 self.gpa.free(self.alt_ring);
                 self.alt_ring = new_alt;
                 self.alt_ring_mask = alt_mask;
+                if (self.alt_cwd.len > 0) self.gpa.free(self.alt_cwd);
+                self.alt_cwd = new_alt_cwd;
                 self.alt_offset = 0;
                 self.alt_sb_len = copy_alt_sb;
             }
@@ -507,4 +631,36 @@ test "resize during alt preserves parked scrollback" {
     g.swapAlt(); // exit alt
     try std.testing.expectEqual(@as(usize, 1), g.sb_len);
     try std.testing.expectEqual(@as(u32, 'A'), g.getScrollbackRow(0)[0].rune);
+}
+
+test "cwd generations note, resolve, and dedupe" {
+    const G = Grid(.{ .scrollback_cap = 4, .alt_screen = false });
+    var g = try G.init(std.testing.allocator, 4, 2);
+    defer g.deinit();
+    try std.testing.expectEqual(@as(u16, 0), g.cwd_cur);
+    try std.testing.expect(!try g.noteCwdChange("", ""));
+    try std.testing.expect(try g.noteCwdChange("", "/home/mvk"));
+    try std.testing.expectEqual(@as(u16, 1), g.cwd_cur);
+    try std.testing.expect(g.cwdPathFor(1) == null); // live
+    try std.testing.expect(try g.noteCwdChange("/home/mvk", "/home/mvk/go"));
+    try std.testing.expectEqual(@as(u16, 2), g.cwd_cur);
+    try std.testing.expectEqualStrings("/home/mvk", g.cwdPathFor(1).?);
+    try std.testing.expect(g.cwdPathFor(2) == null);
+    try std.testing.expect(!try g.noteCwdChange("/home/mvk/go", "/home/mvk/go"));
+    try std.testing.expectEqual(@as(u16, 2), g.cwd_cur);
+    try std.testing.expect(g.cwdPathFor(99) == null); // unknown falls back
+}
+
+test "cwd stamps survive scroll rotation" {
+    const G = Grid(.{ .scrollback_cap = 4, .alt_screen = false });
+    var g = try G.init(std.testing.allocator, 4, 2);
+    defer g.deinit();
+    g.stampVisRow(0, 7);
+    g.stampVisRow(1, 7);
+    g.scrollUp(true);
+    try std.testing.expectEqual(@as(usize, 1), g.sb_len);
+    try std.testing.expectEqual(@as(u16, 7), g.sbCwdGen(0));
+    g.stampVisRow(1, 9);
+    try std.testing.expectEqual(@as(u16, 9), g.rowCwdGen(1, 0));
+    try std.testing.expectEqual(g.cwd_cur, g.rowCwdGen(9, 0)); // OOB: current
 }

@@ -125,6 +125,9 @@ pub fn reflowGrid(
         cells: []const C,
         wrapped: bool,
         is_cursor: bool,
+        /// Cwd generation stamp: output rows inherit their logical
+        /// line's stamp so click resolution survives rewrapping.
+        cwd: u16,
     };
 
     const input_rows = try gpa.alloc(InputRow, total_input);
@@ -138,6 +141,7 @@ pub fn reflowGrid(
                 .cells = rslice,
                 .wrapped = is_wrap,
                 .is_cursor = false,
+                .cwd = grid.sbCwdGen(i),
             };
         }
     }
@@ -149,14 +153,17 @@ pub fn reflowGrid(
             .cells = rslice,
             .wrapped = is_wrap,
             .is_cursor = (r == cursor_row.*),
+            .cwd = grid.rowCwdGen(@intCast(r), 0),
         };
     }
 
     // 2. Linear stream rewrapping into out_rows of width new_cols
     var out_rows = try std.ArrayList([]C).initCapacity(gpa, total_input + 16);
+    var out_cwd = try std.ArrayList(u16).initCapacity(gpa, total_input + 16);
     errdefer {
         for (out_rows.items) |r| gpa.free(r);
         out_rows.deinit(gpa);
+        out_cwd.deinit(gpa);
     }
 
     var tracked_cursor_row: ?usize = null;
@@ -177,6 +184,10 @@ pub fn reflowGrid(
 
         var line_cells = try std.ArrayList(C).initCapacity(gpa, 256);
         defer line_cells.deinit(gpa);
+
+        // Cwd follows the logical line (a cd mid-line is impossible —
+        // it needs a prompt — so first-row ownership is exact).
+        const line_cwd: u16 = input_rows[line_start].cwd;
 
         var cursor_offset_in_line: ?usize = null;
         var current_cell_count: usize = 0;
@@ -280,6 +291,7 @@ pub fn reflowGrid(
             }
             cur_row.?[new_cols - 1].wrapped = false;
             try out_rows.append(gpa, cur_row.?);
+            try out_cwd.append(gpa, line_cwd);
             cur_row = null;
         } else {
             var i: usize = 0;
@@ -295,6 +307,7 @@ pub fn reflowGrid(
                 if (is_wide and col == new_cols - 1) {
                     cur_row.?[col] = .{ .bg = filler_bg, .wrapped = true };
                     try out_rows.append(gpa, cur_row.?);
+                    try out_cwd.append(gpa, line_cwd);
                     cur_row = try gpa.alloc(C, new_cols);
                     @memset(cur_row.?, .{ .bg = filler_bg });
                     col = 0;
@@ -314,12 +327,14 @@ pub fn reflowGrid(
                     if (i + 1 < line_cells.items.len) {
                         cur_row.?[new_cols - 1].wrapped = true;
                         try out_rows.append(gpa, cur_row.?);
+                        try out_cwd.append(gpa, line_cwd);
                         cur_row = try gpa.alloc(C, new_cols);
                         @memset(cur_row.?, .{ .bg = filler_bg });
                         col = 0;
                     } else {
                         cur_row.?[new_cols - 1].wrapped = false;
                         try out_rows.append(gpa, cur_row.?);
+                        try out_cwd.append(gpa, line_cwd);
                         cur_row = null;
                         col = 0;
                     }
@@ -344,6 +359,7 @@ pub fn reflowGrid(
                 }
                 cur_row.?[new_cols - 1].wrapped = false;
                 try out_rows.append(gpa, cur_row.?);
+                try out_cwd.append(gpa, line_cwd);
                 cur_row = null;
             } else if (cur_row) |r| {
                 gpa.free(r);
@@ -388,12 +404,15 @@ pub fn reflowGrid(
     const new_ring_mask = new_ring_cap - 1;
     const new_ring = try gpa.alloc(?[]C, new_ring_cap);
     @memset(new_ring, null);
+    const new_cwd = try gpa.alloc(u16, new_ring_cap);
+    @memset(new_cwd, grid.cwd_cur);
 
     // Live screen gets rows st .. min(st + new_rows, total_lines)
     const copy_lines = @min(total_lines - st, @as(usize, new_rows));
     for (0..new_rows) |r| {
         if (r < copy_lines) {
             new_ring[r] = out_rows.items[st + r];
+            new_cwd[r] = out_cwd.items[st + r];
         } else {
             const blank_r = try gpa.alloc(C, new_cols);
             @memset(blank_r, .{ .bg = filler_bg });
@@ -406,15 +425,19 @@ pub fn reflowGrid(
         const k = sb_count_new - i;
         const phys = (new_ring_cap - k) & new_ring_mask;
         new_ring[phys] = out_rows.items[drop_count + i];
+        new_cwd[phys] = out_cwd.items[drop_count + i];
     }
 
     for (out_rows.items[st + copy_lines ..]) |extra_r| {
         gpa.free(extra_r);
     }
     out_rows.deinit(gpa);
+    out_cwd.deinit(gpa);
 
     grid.ring = new_ring;
     grid.ring_mask = new_ring_mask;
+    if (grid.row_cwd.len > 0) gpa.free(grid.row_cwd);
+    grid.row_cwd = new_cwd;
     grid.offset = 0;
     grid.sb_len = sb_count_new;
 
@@ -425,6 +448,8 @@ pub fn reflowGrid(
         const alt_mask = alt_cap - 1;
         const new_alt = try grid.gpa.alloc(?[]C, alt_cap);
         @memset(new_alt, null);
+        const new_alt_cwd = try grid.gpa.alloc(u16, alt_cap);
+        @memset(new_alt_cwd, grid.cwd_cur);
         const copy_c = @min(new_cols, old_cols);
         const copy_r = @min(new_rows, old_rows);
         for (0..new_rows) |r| {
@@ -432,6 +457,7 @@ pub fn reflowGrid(
             @memset(new_r, .{ .bg = filler_bg });
             if (r < copy_r) {
                 const old_phys = (grid.alt_offset + r) & grid.alt_ring_mask;
+                if (grid.alt_cwd.len == grid.alt_ring.len) new_alt_cwd[r] = grid.alt_cwd[old_phys];
                 if (grid.alt_ring[old_phys]) |old_r| {
                     @memcpy(new_r[0..copy_c], old_r[0..copy_c]);
                 }
@@ -442,7 +468,9 @@ pub fn reflowGrid(
             if (maybe_r) |r| grid.gpa.free(r);
         }
         grid.gpa.free(grid.alt_ring);
+        if (grid.alt_cwd.len > 0) grid.gpa.free(grid.alt_cwd);
         grid.alt_ring = new_alt;
+        grid.alt_cwd = new_alt_cwd;
         grid.alt_ring_mask = alt_mask;
         grid.alt_offset = 0;
     }
@@ -958,4 +986,45 @@ test "widen keeps gapped content rows intact" {
     try std.testing.expectEqual(@as(u32, '_'), g.at(0, 0).rune);
     try std.testing.expectEqual(@as(u32, '_'), g.at(16, 0).rune);
     try std.testing.expectEqual(@as(u32, '_'), g.at(17, 0).rune);
+}
+
+test "reflow carries cwd stamps with content" {
+    const grid_mod = @import("grid.zig");
+    const cfg = config_mod.Config{ .scrollback_cap = 8, .alt_screen = false };
+    const G = grid_mod.Grid(cfg);
+    var g = try G.init(std.testing.allocator, 4, 2);
+    defer g.deinit();
+    _ = try g.noteCwdChange("", "/a");
+    g.at(0, 0).setRune('A');
+    g.stampVisRow(0, g.cwd_cur);
+    g.scrollUp(true);
+    _ = try g.noteCwdChange("/a", "/b");
+    g.at(0, 1).setRune('B');
+    g.stampVisRow(1, g.cwd_cur);
+    var cur_col: u16 = 0;
+    var cur_row: u16 = 1;
+    try reflowGrid(cfg, std.testing.allocator, &g, 2, 4, &cur_col, &cur_row, cfg.bg);
+    // Each line keeps its generation: 'A' -> /a, 'B' -> live (/b).
+    var found_a = false;
+    var found_b = false;
+    var i: usize = 0;
+    while (i < g.sb_len) : (i += 1) {
+        const row = g.getScrollbackRow(i);
+        if (row.len > 0 and row[0].rune == 'A') {
+            try std.testing.expectEqualStrings("/a", g.cwdPathFor(g.sbCwdGen(i)).?);
+            found_a = true;
+        }
+    }
+    var r: u16 = 0;
+    while (r < g.rows) : (r += 1) {
+        if (g.at(0, r).rune == 'A') {
+            try std.testing.expectEqualStrings("/a", g.cwdPathFor(g.rowCwdGen(r, 0)).?);
+            found_a = true;
+        }
+        if (g.at(0, r).rune == 'B') {
+            try std.testing.expect(g.cwdPathFor(g.rowCwdGen(r, 0)) == null);
+            found_b = true;
+        }
+    }
+    try std.testing.expect(found_a and found_b);
 }

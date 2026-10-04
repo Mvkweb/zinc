@@ -66,6 +66,12 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// resolve relative Ctrl+click file paths.
         cwd_buf: [4096]u8 = [_]u8{0} ** 4096,
         cwd_len: usize = 0,
+        /// Row-switch write tracking for per-row cwd stamps (click
+        /// resolution): the last viewport row stamped, and whether the
+        /// stamp is trustworthy. Cleared on every real cwd change so the
+        /// next write re-stamps even mid-row.
+        stamped_row: u16 = 0,
+        stamped_ok: bool = false,
         kitty_b64: std.ArrayList(u8),
         /// Chunked-upload reassembly (m=1): payload accumulates here across
         /// APC dispatches; kitty_ctrl holds the first chunk's control data.
@@ -1173,10 +1179,16 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 .cwd => {
                     // OSC 7 ; file://host/path — track the shell working
                     // directory for resolving relative Ctrl+click paths.
+                    // Generations make old scrollback rows resolve against
+                    // the directory they were printed in, not the current
+                    // one. Repeats (shells emit per prompt) are no-ops.
                     var p = parts.payload;
                     if (std.mem.startsWith(u8, p, "file://")) {
                         p = p["file://".len..];
                         if (std.mem.indexOfScalar(u8, p, '/')) |slash| p = p[slash..];
+                    }
+                    if (self.grid.noteCwdChange(self.cwd_buf[0..self.cwd_len], p) catch false) {
+                        self.stamped_ok = false;
                     }
                     const n = @min(p.len, self.cwd_buf.len);
                     @memcpy(self.cwd_buf[0..n], p[0..n]);
@@ -1369,7 +1381,19 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// 0x80 (wide starts at U+1100, combining at U+300, diacritics at
         /// U+305 — the table floor is pinned at compile time). Seams
         /// (pending wrap, IRM, overflow) delegate to the full path.
+        /// Stamp the cursor row with the current cwd generation (per-row
+        /// cwd tracking for click resolution). Row-switch granularity:
+        /// one compare per write call, a store only on row change or
+        /// after a cwd change — never per char.
+        fn stampRow(self: *Self) void {
+            if (self.stamped_ok and self.stamped_row == self.cursor_row) return;
+            self.grid.stampVisRow(self.cursor_row, self.grid.cwd_cur);
+            self.stamped_row = self.cursor_row;
+            self.stamped_ok = true;
+        }
+
         fn putAscii(self: *Self, byte: u8) void {
+            self.stampRow();
             if (self.pending_wrap or self.cursor_col >= self.grid.cols or self.insert_mode) {
                 self.putCodepoint(byte);
                 return;
@@ -1404,6 +1428,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// impossible inside the run (floors at U+300/U+305/U+1100).
         /// Byte-for-byte equivalent to putAscii per char.
         fn putAsciiRun(self: *Self, bytes: []const u8) void {
+            self.stampRow();
             const cols = self.grid.cols;
             const col: usize = self.cursor_col;
             const n = bytes.len; // <= cols - col by contract
@@ -1485,6 +1510,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         }
 
         fn putCodepoint(self: *Self, cp: u21) void {
+            self.stampRow();
             // Keycap pieces never split across lines: VS16 attaches to a
             // digit/#/* base (in place at line end, silently, no advance);
             // U+20E3 composes via composeKeycap, which owns the
