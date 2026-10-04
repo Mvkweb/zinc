@@ -122,6 +122,41 @@ pub fn spanAt(grid: anytype, row: u16, col: u16) ?Span {
     return .{ .c0 = c0, .c1 = c1 };
 }
 
+/// Bare-word span under (col, row) for click-time fallback: plain `ls`
+/// names (`src`, `Makefile`) carry no slash/dot so spanAt rejects them.
+/// Clicks verify existence, so false positives die at stat — hover never
+/// uses this (it would underline every word).
+pub fn wordSpanAt(grid: anytype, row: u16, col: u16) ?Span {
+    const cols: u16 = grid.cols;
+    if (cols == 0 or col >= cols) return null;
+    if (!isWordChar(cellRune(grid, col, row) orelse return null)) return null;
+    var c0 = col;
+    while (c0 > 0) {
+        const r = cellRune(grid, c0 - 1, row) orelse break;
+        if (!isWordChar(r)) break;
+        c0 -= 1;
+        if (c0 == 0) break;
+    }
+    var c1 = col;
+    while (c1 + 1 < cols) {
+        const r = cellRune(grid, c1 + 1, row) orelse break;
+        if (!isWordChar(r)) break;
+        c1 += 1;
+    }
+    if (@as(usize, c1) - c0 + 1 > max_token) return null;
+    return .{ .c0 = c0, .c1 = c1 };
+}
+
+fn isWordChar(r: u32) bool {
+    if (r > 127) return false;
+    if (r <= 0x20 or r == 0x7f) return false;
+    return switch (@as(u8, @intCast(r))) {
+        'A'...'Z', 'a'...'z', '0'...'9' => true,
+        '_', '.', '-', '+', '~', '@', '%' => true,
+        else => false,
+    };
+}
+
 /// Token text of a span (ASCII by construction).
 pub fn spanText(grid: anytype, row: u16, span: Span, out: []u8) []u8 {
     var n: usize = 0;
@@ -211,6 +246,37 @@ pub fn hasFileToken(template: []const u8) bool {
     return std.mem.indexOf(u8, template, "{file}") != null;
 }
 
+/// Directory-click gesture outcome. A configured modifier set matches
+/// when all of its bits are held (extra bits ignored); cd wins ties so
+/// Ctrl+Shift with cd=ctrl still cds. Empty sets never match (off).
+pub const DirClick = enum { none, cd, open };
+
+pub fn dirClickAction(ctrl: bool, shift: bool, cd_ctrl: bool, cd_shift: bool, open_ctrl: bool, open_shift: bool) DirClick {
+    if ((cd_ctrl or cd_shift) and (!cd_ctrl or ctrl) and (!cd_shift or shift)) return .cd;
+    if ((open_ctrl or open_shift) and (!open_ctrl or ctrl) and (!open_shift or shift)) return .open;
+    return .none;
+}
+
+/// Build `cd '<path>'\n` (or `cd '<path>' && ls\n`) for the PTY.
+/// Single-quoted like the in-place editor tier; refuses quotes/newlines
+/// (the token charset excludes quotes, but $HOME/cwd prefixes are
+/// outside it). Null on overflow.
+pub fn buildCdCommand(path: []const u8, ls_after: bool, out: []u8) ?[]u8 {
+    for (path) |b| {
+        if (b == '\'' or b == '\n' or b == '\r') return null;
+    }
+    const tail = if (ls_after) "' && ls\n" else "'\n";
+    const head = "cd '";
+    if (head.len + path.len + tail.len > out.len) return null;
+    var o: usize = 0;
+    @memcpy(out[o..][0..head.len], head);
+    o += head.len;
+    @memcpy(out[o..][0..path.len], path);
+    o += path.len;
+    @memcpy(out[o..][0..tail.len], tail);
+    return out[0 .. o + tail.len];
+}
+
 test "detect paths with line suffix" {
     const grid_mod = @import("grid.zig");
     const G = grid_mod.Grid(.{});
@@ -275,4 +341,62 @@ test "quoteSplit + expandArg" {
     try std.testing.expect(expandArg("{file}", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", 1, 1, ob[0..8]) == null);
     try std.testing.expect(hasFileToken("zed {file}:{line}"));
     try std.testing.expect(!hasFileToken("zed --new"));
+}
+
+test "dirClickAction routing table" {
+    // Defaults: cd=ctrl, open=shift.
+    try std.testing.expectEqual(DirClick.cd, dirClickAction(true, false, true, false, false, true));
+    try std.testing.expectEqual(DirClick.open, dirClickAction(false, true, true, false, false, true));
+    try std.testing.expectEqual(DirClick.cd, dirClickAction(true, true, true, false, false, true));
+    try std.testing.expectEqual(DirClick.none, dirClickAction(false, false, true, false, false, true));
+    // All off: never fires.
+    try std.testing.expectEqual(DirClick.none, dirClickAction(true, true, false, false, false, false));
+    // cd=ctrl+shift needs both bits.
+    try std.testing.expectEqual(DirClick.none, dirClickAction(true, false, true, true, false, false));
+    try std.testing.expectEqual(DirClick.cd, dirClickAction(true, true, true, true, false, false));
+}
+
+test "buildCdCommand quoting" {
+    var ob: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("cd '/tmp/x'\n", buildCdCommand("/tmp/x", false, &ob).?);
+    try std.testing.expectEqualStrings("cd '/tmp/x' && ls\n", buildCdCommand("/tmp/x", true, &ob).?);
+    try std.testing.expect(buildCdCommand("/a'b", false, &ob) == null);
+    try std.testing.expect(buildCdCommand("/a\nb", true, &ob) == null);
+    try std.testing.expect(buildCdCommand("/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa", false, ob[0..16]) == null);
+}
+
+test "wordSpanAt catches bare ls names" {
+    const grid_mod = @import("grid.zig");
+    const G = grid_mod.Grid(.{});
+    var g = try G.init(std.testing.allocator, 64, 4);
+    defer g.deinit();
+    const line = "src main.zig";
+    for (line, 0..) |ch, i| g.at(@intCast(i), 0).setRune(ch);
+    // spanAt rejects both (no slash/dot gate)...
+    try std.testing.expect(spanAt(&g, 0, 1) == null);
+    try std.testing.expect(spanAt(&g, 0, 5) == null);
+    // ...word fallback spans them.
+    const w0 = wordSpanAt(&g, 0, 1) orelse return error.Fail;
+    try std.testing.expectEqual(@as(u16, 0), w0.c0);
+    try std.testing.expectEqual(@as(u16, 2), w0.c1);
+    const w1 = wordSpanAt(&g, 0, 6) orelse return error.Fail;
+    var tbuf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("main.zig", spanText(&g, 0, w1, &tbuf));
+    // Whitespace is not a word.
+    try std.testing.expect(wordSpanAt(&g, 0, 3) == null);
+}
+
+test "wordSpanAt catches dotdot parent" {
+    const grid_mod = @import("grid.zig");
+    const G = grid_mod.Grid(.{});
+    var g = try G.init(std.testing.allocator, 64, 4);
+    defer g.deinit();
+    const line = "aaa .. bbb";
+    for (line, 0..) |ch, i| g.at(@intCast(i), 0).setRune(ch);
+    // ".." fails the path gate (no alnum)...
+    try std.testing.expect(spanAt(&g, 0, 4) == null);
+    // ...but the word fallback spans it; the kernel resolves it at click.
+    const w = wordSpanAt(&g, 0, 4) orelse return error.Fail;
+    var tbuf: [64]u8 = undefined;
+    try std.testing.expectEqualStrings("..", spanText(&g, 0, w, &tbuf));
 }

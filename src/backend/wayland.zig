@@ -310,6 +310,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// Scrollback rows per wheel notch (runtime scroll-step orelse
         /// comptime default; touchpads scale proportionally off it).
         wheel_step: u32 = cfg.scroll_step,
+        /// Directory click gestures (runtime dir-cd-mod/dir-open-mod
+        /// orelse comptime defaults). Empty set disables the gesture.
+        dir_cd_mod: input_kb.Mods = cfg.dir_cd_mod,
+        dir_open_mod: input_kb.Mods = cfg.dir_open_mod,
         /// High-res scroll accumulation (120ths remainder) + whether the
         /// compositor speaks value120 (then it owns scrolling, and the
         /// legacy axis path stands down to avoid double steps).
@@ -538,6 +542,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .smooth_scroll = runtime_cfg.smooth_scroll orelse cfg.smooth_scroll,
                 .smooth_scroll_ms = runtime_cfg.smooth_scroll_ms orelse cfg.smooth_scroll_ms,
                 .wheel_step = runtime_cfg.scroll_step orelse cfg.scroll_step,
+                .dir_cd_mod = runtime_cfg.dir_cd_mod orelse cfg.dir_cd_mod,
+                .dir_open_mod = runtime_cfg.dir_open_mod orelse cfg.dir_open_mod,
             };
             errdefer {
                 self.deinit();
@@ -3421,34 +3427,88 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.refreshCursor();
                 return;
             }
+            // Bare-word fallback (plain `ls` names): underline only when
+            // the token resolves to something real, otherwise every prose
+            // word would light up. One stat per newly hovered token.
+            if (filelink_mod.wordSpanAt(&self.ctx.grid, row, col)) |wspan| {
+                var abs: [4096]u8 = undefined;
+                if (self.resolveFileToken(row, wspan, &abs, self.clickCwdForRow(row))) |_| {
+                    if (self.hover_uri) |u| self.gpa.free(u);
+                    self.hover_uri = null;
+                    self.hover_col = col;
+                    self.hover_row = row;
+                    self.hover_c0 = wspan.c0;
+                    self.hover_c1 = wspan.c1;
+                    self.hover_is_file = true;
+                    self.hover_active = true;
+                    self.needs_render = true;
+                    self.refreshCursor();
+                    return;
+                }
+            }
             self.clearHover();
+        }
+
+        /// Live cwd for resolution (OSC 7 buffer, else launch PWD).
+        fn curCwd(self: *Self) []const u8 {
+            if (self.ctx.cwd_len > 0) return self.ctx.cwd_buf[0..self.ctx.cwd_len];
+            if (std.c.getenv("PWD")) |p| {
+                const s = std.mem.span(p);
+                if (s.len > 0) return s;
+            }
+            return "";
+        }
+
+        /// Cwd owning a viewport row: the generation stamped when it was
+        /// printed (old scrollback keeps its directory), else live.
+        fn clickCwdForRow(self: *Self, vis_row: u16) []const u8 {
+            const live = self.curCwd();
+            const gen = self.ctx.grid.rowCwdGen(vis_row, @min(self.ctx.grid.view_offset, self.ctx.grid.sb_len));
+            if (gen == self.ctx.grid.cwd_cur) return live;
+            return self.ctx.grid.cwdPathFor(gen) orelse live;
         }
 
         /// Open a Ctrl+clicked file token: resolve (absolute, ~/HOME, OSC 7
         /// cwd, launch-time PWD), verify existence, then open. Silent no-op
         /// unless something real exists — syntax alone never launches.
+        /// Directories never reach the editor tiers: they go to the file
+        /// manager (Shift gesture) or the shell cd tier (Ctrl gesture).
         fn openFileToken(self: *Self, row: u16, span: filelink_mod.Span) void {
+            var abs: [4096]u8 = undefined;
+            const alen = self.resolveFileToken(row, span, &abs, self.clickCwdForRow(row)) orelse return;
+            if (self.isDirectoryAbs(abs[0..alen])) {
+                self.openPathUrl(abs[0..alen]);
+                return;
+            }
+            var tbuf: [1024]u8 = undefined;
+            const t = filelink_mod.splitLineCol(filelink_mod.spanText(&self.ctx.grid, row, span, &tbuf));
+            const ln = if (t.line == 0) 1 else t.line;
+            const cn = if (t.col == 0) 1 else t.col;
+            self.openFile(abs[0..alen], ln, cn);
+        }
+
+        /// Resolve a token span to an absolute path and verify existence.
+        /// Returns the byte length on success. `cwd` is the owning
+        /// directory (per-row for stale scrollback, live otherwise).
+        /// Shared by file open and the directory gestures.
+        fn resolveFileToken(self: *Self, row: u16, span: filelink_mod.Span, abs: *[4096]u8, cwd: []const u8) ?usize {
             var tbuf: [1024]u8 = undefined;
             const tok = filelink_mod.spanText(&self.ctx.grid, row, span, &tbuf);
             const t = filelink_mod.splitLineCol(tok);
-            if (t.path.len == 0 or t.path.len > 2000) return;
-            var abs: [4096]u8 = undefined;
+            if (t.path.len == 0 or t.path.len > 2000) return null;
             var alen: usize = 0;
             if (t.path[0] == '/') {
                 alen = t.path.len;
                 @memcpy(abs[0..alen], t.path);
             } else if (t.path.len > 1 and t.path[0] == '~' and t.path[1] == '/') {
-                const home = std.c.getenv("HOME") orelse return;
+                const home = std.c.getenv("HOME") orelse return null;
                 const hs = std.mem.span(home);
-                if (hs.len == 0 or hs.len + t.path.len - 1 >= abs.len) return;
+                if (hs.len == 0 or hs.len + t.path.len - 1 >= abs.len) return null;
                 @memcpy(abs[0..hs.len], hs);
                 @memcpy(abs[hs.len..][0 .. t.path.len - 1], t.path[1..]);
                 alen = hs.len + t.path.len - 1;
             } else {
-                const cwd: []const u8 = if (self.ctx.cwd_len > 0)
-                    self.ctx.cwd_buf[0..self.ctx.cwd_len]
-                else if (std.c.getenv("PWD")) |p| std.mem.span(p) else return;
-                if (cwd.len == 0 or cwd.len + 1 + t.path.len >= abs.len) return;
+                if (cwd.len == 0 or cwd.len + 1 + t.path.len >= abs.len) return null;
                 @memcpy(abs[0..cwd.len], cwd);
                 alen = cwd.len;
                 if (abs[alen - 1] != '/') {
@@ -3460,11 +3520,63 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             abs[alen] = 0;
             const rc = linux.open(abs[0..alen :0].ptr, .{ .ACCMODE = .RDONLY }, 0);
-            if (linux.errno(rc) != .SUCCESS) return;
+            if (linux.errno(rc) != .SUCCESS) return null;
             _ = linux.close(@intCast(rc));
-            const ln = if (t.line == 0) 1 else t.line;
-            const cn = if (t.col == 0) 1 else t.col;
-            self.openFile(abs[0..alen], ln, cn);
+            return alen;
+        }
+
+        /// True when an existing absolute path is a directory (O.DIRECTORY
+        /// open succeeds only on directories — no stat plumbing needed).
+        fn isDirectoryAbs(self: *Self, path: []const u8) bool {
+            _ = self;
+            if (path.len == 0 or path.len >= 4096) return false;
+            var z: [4096]u8 = undefined;
+            @memcpy(z[0..path.len], path);
+            z[path.len] = 0;
+            const rc = linux.open(z[0..path.len :0].ptr, .{ .ACCMODE = .RDONLY, .DIRECTORY = true }, 0);
+            if (linux.errno(rc) != .SUCCESS) return false;
+            _ = linux.close(@intCast(rc));
+            return true;
+        }
+
+        /// Open an absolute path in the desktop file manager (Tier-3 style
+        /// file:// launch, no shell involved). Used for directories.
+        fn openPathUrl(self: *Self, path: []const u8) void {
+            _ = self;
+            if (path.len == 0 or path.len > 2000) return;
+            var ob: [2100]u8 = undefined;
+            @memcpy(ob[0..7], "file://");
+            @memcpy(ob[7..][0..path.len], path);
+            pty_mod.openUrl(ob[0 .. 7 + path.len]);
+        }
+
+        /// cd the shell into a directory: `cd '<path>'` (plus `&& ls`
+        /// unless dir-cd-ls is off) typed into the PTY — primary screen
+        /// only, since typing into a fullscreen app would be vandalism
+        /// (there it falls back to the file manager). Quoted like the
+        /// in-place editor tier. Learns the new cwd for resolving later
+        /// relative clicks (the shell only reports it via OSC 7, which
+        /// stock fish never emits — without this, clicks work exactly
+        /// once and then resolve against the stale directory).
+        fn cdToDir(self: *Self, path: []const u8) void {
+            if (self.ctx.alt_active) {
+                self.openPathUrl(path);
+                return;
+            }
+            const ls = self.runtime_cfg.dir_cd_ls orelse cfg.dir_cd_ls;
+            var cmd: [2100]u8 = undefined;
+            const line = filelink_mod.buildCdCommand(path, ls, &cmd) orelse return;
+            self.sendToPty(line);
+            var end = path.len;
+            while (end > 1 and path[end - 1] == '/') end -= 1;
+            // Learn the new cwd (see noteCwdChange): keeps later relative
+            // clicks resolving instead of dying on the stale directory.
+            if (self.ctx.grid.noteCwdChange(self.ctx.cwd_buf[0..self.ctx.cwd_len], path[0..end]) catch false) {
+                self.ctx.stamped_ok = false;
+            }
+            const n = @min(end, self.ctx.cwd_buf.len);
+            @memcpy(self.ctx.cwd_buf[0..n], path[0..n]);
+            self.ctx.cwd_len = n;
         }
 
         /// Open a verified absolute path. Terminal editors (editor-command-
@@ -3566,10 +3678,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 }
             }
             if (path.len > 2000) return;
-            var ob: [2100]u8 = undefined;
-            @memcpy(ob[0..7], "file://");
-            @memcpy(ob[7..][0..path.len], path);
-            pty_mod.openUrl(ob[0 .. 7 + path.len]);
+            self.openPathUrl(path);
         }
 
         /// Open an allowlisted URL via xdg-open (no shell involved).
@@ -3797,10 +3906,31 @@ pub fn App(comptime cfg: config_mod.Config) type {
                                 self.openLink(u);
                                 return;
                             }
-                            // Bare file path under cursor (Ctrl+click).
-                            if (filelink_mod.spanAt(&self.ctx.grid, cc.row, cc.col)) |fspan| {
-                                self.openFileToken(cc.row, fspan);
-                                return;
+                        }
+                        // Clickable tokens: path spans first, bare words as
+                        // fallback (plain `ls` names carry no slash/dot;
+                        // existence decides, so prose never triggers).
+                        // Directories route by gesture (cd / file manager);
+                        // files keep Ctrl+click open; anything else falls
+                        // through to selection exactly as before.
+                        if (mods.ctrl or mods.shift) {
+                            const fspan = filelink_mod.spanAt(&self.ctx.grid, cc.row, cc.col) orelse filelink_mod.wordSpanAt(&self.ctx.grid, cc.row, cc.col);
+                            if (fspan) |sp| {
+                                var abs: [4096]u8 = undefined;
+                                if (self.resolveFileToken(cc.row, sp, &abs, self.clickCwdForRow(cc.row))) |alen| {
+                                    if (self.isDirectoryAbs(abs[0..alen])) {
+                                        switch (filelink_mod.dirClickAction(mods.ctrl, mods.shift, self.dir_cd_mod.ctrl, self.dir_cd_mod.shift, self.dir_open_mod.ctrl, self.dir_open_mod.shift)) {
+                                            .cd => self.cdToDir(abs[0..alen]),
+                                            .open => self.openPathUrl(abs[0..alen]),
+                                            .none => {},
+                                        }
+                                        return;
+                                    }
+                                    if (mods.ctrl) {
+                                        self.openFileToken(cc.row, sp);
+                                        return;
+                                    }
+                                }
                             }
                         }
 

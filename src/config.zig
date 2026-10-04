@@ -2,6 +2,7 @@
 //! Disabled features are stripped at compile time via `if (config.x)`.
 
 const build_options = @import("build_options");
+const input_kb = @import("input/keyboard.zig");
 
 /// Terminal cursor shape.
 pub const CursorStyle = enum { block, underline, bar };
@@ -145,6 +146,15 @@ pub const Config = struct {
     /// Same for terminal editors (nano/vim): typed into the shell instead
     /// of spawned detached, so they open in place. GUI editors go above.
     editor_command_terminal: []const u8 = "",
+    /// Directory click gestures (resolved paths that stat as directories).
+    /// cd set types `cd '<dir>'` into the shell (primary screen only);
+    /// open set launches the file manager. Empty set disables the gesture.
+    dir_cd_mod: input_kb.Mods = .{ .ctrl = true },
+    dir_open_mod: input_kb.Mods = .{ .shift = true },
+    /// After a gesture cd, also list the directory (`cd '<dir>' && ls).
+    /// The typed line echoes (a terminal cannot hide PTY input); the
+    /// listing is the point.
+    dir_cd_ls: bool = true,
     /// In-terminal find (Ctrl+Shift+F bottom bar over scrollback + grid).
     find: bool = true,
     find_max_matches: u32 = 256,

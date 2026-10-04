@@ -3,6 +3,7 @@
 
 const std = @import("std");
 const config_mod = @import("../config.zig");
+const input_kb = @import("../input/keyboard.zig");
 pub const CursorStyle = config_mod.CursorStyle;
 
 pub const RuntimeConfig = struct {
@@ -33,6 +34,9 @@ pub const RuntimeConfig = struct {
     find_number_scale: ?u8 = null,
     editor_command: ?[]const u8 = null,
     editor_command_terminal: ?[]const u8 = null,
+    dir_cd_mod: ?input_kb.Mods = null,
+    dir_open_mod: ?input_kb.Mods = null,
+    dir_cd_ls: ?bool = null,
 
     pub fn deinit(self: *RuntimeConfig, gpa: std.mem.Allocator) void {
         if (self.font_family) |f| {
@@ -222,8 +226,46 @@ pub fn parse(content: []const u8, cfg: *RuntimeConfig, gpa: std.mem.Allocator) v
             const cmd = trimQuotes(val);
             if (cfg.editor_command_terminal) |old| gpa.free(old);
             cfg.editor_command_terminal = if (cmd.len > 0) (gpa.dupe(u8, cmd) catch null) else null;
+        } else if (std.ascii.eqlIgnoreCase(key, "dir-cd-mod") or std.ascii.eqlIgnoreCase(key, "dir_cd_mod")) {
+            if (parseDirMods(val)) |m| cfg.dir_cd_mod = m;
+        } else if (std.ascii.eqlIgnoreCase(key, "dir-open-mod") or std.ascii.eqlIgnoreCase(key, "dir_open_mod")) {
+            if (parseDirMods(val)) |m| cfg.dir_open_mod = m;
+        } else if (std.ascii.eqlIgnoreCase(key, "dir-cd-ls") or std.ascii.eqlIgnoreCase(key, "dir_cd_ls")) {
+            if (parseBool(val)) |b| cfg.dir_cd_ls = b;
         }
     }
+}
+
+/// Parse a modifier set: "ctrl", "shift", "ctrl+shift" (any order, `+`
+/// or `,` separated), "off"/"none"/"" for empty. Unknown tokens are
+/// ignored; a value with no known token leaves the config untouched.
+pub fn parseDirMods(raw: []const u8) ?input_kb.Mods {
+    var s = std.mem.trim(u8, raw, " \t\r\n\"'");
+    if (s.len == 0) return input_kb.Mods{};
+    if (std.ascii.eqlIgnoreCase(s, "off") or std.ascii.eqlIgnoreCase(s, "none")) return input_kb.Mods{};
+    var m = input_kb.Mods{};
+    var seen = false;
+    while (s.len > 0) {
+        var tok = s;
+        if (std.mem.indexOfAny(u8, s, "+,")) |i| {
+            tok = s[0..i];
+            s = s[i + 1 ..];
+        } else {
+            s = s[0..0];
+        }
+        tok = std.mem.trim(u8, tok, " \t");
+        if (std.ascii.eqlIgnoreCase(tok, "ctrl") or std.ascii.eqlIgnoreCase(tok, "control")) {
+            m.ctrl = true;
+            seen = true;
+        } else if (std.ascii.eqlIgnoreCase(tok, "shift")) {
+            m.shift = true;
+            seen = true;
+        } else if (tok.len > 0) {
+            return null;
+        }
+    }
+    if (!seen) return null;
+    return m;
 }
 
 test "parse color formats" {
@@ -282,6 +324,8 @@ test "parse complete config content" {
         \\smooth-scroll = false
         \\smooth-scroll-ms = 200
         \\scroll-step = 5
+        \\dir-cd-mod = ctrl
+        \\dir-open-mod = shift
     ;
 
     var cfg = RuntimeConfig{};
@@ -311,6 +355,28 @@ test "parse complete config content" {
     try std.testing.expectEqual(@as(?bool, false), cfg.smooth_scroll);
     try std.testing.expectEqual(@as(?u16, 200), cfg.smooth_scroll_ms);
     try std.testing.expectEqual(@as(?u32, 5), cfg.scroll_step);
+    try std.testing.expectEqual(true, cfg.dir_cd_mod.?.ctrl);
+    try std.testing.expectEqual(false, cfg.dir_cd_mod.?.shift);
+    try std.testing.expectEqual(true, cfg.dir_open_mod.?.shift);
+}
+
+test "parse dir mods" {
+    try std.testing.expectEqual(input_kb.Mods{ .ctrl = true }, parseDirMods("ctrl").?);
+    try std.testing.expectEqual(input_kb.Mods{ .shift = true }, parseDirMods("shift").?);
+    const both = parseDirMods("ctrl+shift").?;
+    try std.testing.expect(both.ctrl and both.shift);
+    const rev = parseDirMods("shift+ctrl").?;
+    try std.testing.expect(rev.ctrl and rev.shift);
+    try std.testing.expectEqual(input_kb.Mods{}, parseDirMods("off").?);
+    try std.testing.expectEqual(input_kb.Mods{}, parseDirMods("").?);
+    try std.testing.expect(parseDirMods("bogus") == null);
+    try std.testing.expect(parseDirMods("ctrl+bogus") == null);
+    var cfg = RuntimeConfig{};
+    defer cfg.deinit(std.testing.allocator);
+    parse("dir-cd-mod = ctrl+shift\ndir-open-mod = off\ndir-cd-ls = no\n", &cfg, std.testing.allocator);
+    try std.testing.expect(cfg.dir_cd_mod.?.ctrl and cfg.dir_cd_mod.?.shift);
+    try std.testing.expectEqual(input_kb.Mods{}, cfg.dir_open_mod.?);
+    try std.testing.expectEqual(@as(?bool, false), cfg.dir_cd_ls);
 }
 
 test "parse find scale clamps + version-agnostic keys" {

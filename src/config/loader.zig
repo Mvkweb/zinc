@@ -107,6 +107,15 @@ pub const DEFAULT_CONFIG_TEMPLATE =
     \\# editor-command-terminal = "nano +{line} {file}"
     \\# editor-command-terminal = "nvim +{line} {file}"
     \\editor-command-terminal = ""
+    \\# Directory clicks (resolved paths that stat as directories):
+    \\# dir-cd-mod types `cd '<dir>'` into the shell (primary screen only),
+    \\# dir-open-mod opens the file manager. Values: ctrl, shift,
+    \\# ctrl+shift, off. Empty set disables the gesture.
+    \\dir-cd-mod = ctrl
+    \\dir-open-mod = shift
+    \\# After a gesture cd, list the directory too (`cd '<dir>' && ls).
+    \\# The typed line echoes; set false for a bare cd.
+    \\dir-cd-ls = true
     \\
 ;
 
@@ -352,6 +361,7 @@ test "template documents every supported key" {
         "cursor-trail-ms",      "smooth-scroll",         "smooth-scroll-ms",
         "scroll-step",          "selection-single-cell", "find-match-numbers",
         "find-number-scale",    "editor-command",        "editor-command-terminal",
+        "dir-cd-mod",           "dir-open-mod",          "dir-cd-ls",
         "config-version",
     };
     for (keys) |k| {
