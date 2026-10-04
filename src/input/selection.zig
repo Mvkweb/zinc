@@ -38,6 +38,18 @@ pub const Span = struct {
     end_row: u16,
 };
 
+/// Drag row under a gliding viewport: the pointer addresses painted
+/// content (interpolated offset) while grid mapping reads live
+/// truth. Shift the viewport row by the lag so downstream logic
+/// (spans, toAbs, update) sees the painted row. Identity at rest.
+pub fn dragRowAt(vis_row: u16, live_off: usize, eff_off: usize, rows: u16) u16 {
+    if (rows == 0) return vis_row;
+    const lag: i64 = @as(i64, @intCast(live_off)) - @as(i64, @intCast(eff_off));
+    const adj: i64 = @as(i64, @intCast(vis_row)) + lag;
+    const max: i64 = @as(i64, @intCast(rows)) - 1;
+    return @intCast(@max(@as(i64, 0), @min(max, adj)));
+}
+
 pub fn findWordSpan(grid: anytype, col: u16, row: u16) Span {
     const rows = grid.rows;
     const cols = grid.cols;
@@ -143,6 +155,10 @@ pub const Selection = struct {
     init_end_col: u16 = 0,
     init_end_row: u16 = 0,
 
+    /// Drag-extend cursor for the interpolated viewport (see beginExtend
+    /// / takeExtendRows below): the shown offset already consumed.
+    extend_base: f32 = 0,
+
     /// Viewport row -> absolute (stable across scrolls by construction:
     /// live row r sits at sb_len + r, scrollback row i at i, and both
     /// survive scrollUp/rotation; only cap eviction drifts, clamped).
@@ -223,9 +239,52 @@ pub const Selection = struct {
         };
     }
 
+    /// Drag row under a gliding viewport: the pointer addresses painted
+    /// content (interpolated offset) while grid mapping reads live
+    /// truth. Shift the viewport row by the lag so downstream logic
+    /// (spans, toAbs, update) sees the painted row. Identity at rest.
+    pub fn dragRowAt(vis_row: u16, live_off: usize, eff_off: usize, rows: u16) u16 {
+        if (rows == 0) return vis_row;
+        const lag: i64 = @as(i64, @intCast(live_off)) - @as(i64, @intCast(eff_off));
+        const adj: i64 = @as(i64, @intCast(vis_row)) + lag;
+        const max: i64 = @as(i64, @intCast(rows)) - 1;
+        return @intCast(@max(@as(i64, 0), @min(max, adj)));
+    }
+
     pub fn update(self: *Selection, col: u16, row: u16) void {
         self.focus_col = col;
         self.focus_row = row;
+    }
+
+    /// Drag-extend cursor for the interpolated viewport: `beginExtend`
+    /// latches the shown offset at press/snap time; each frame
+    /// `takeExtendRows` consumes whole travelled rows (the fraction stays
+    /// for later frames) so the highlight streams with the glide instead
+    /// of jumping ahead of it.
+    pub fn beginExtend(self: *Selection, shown: f32) void {
+        self.extend_base = shown;
+    }
+
+    /// Returns true when the focus moved.
+    pub fn takeExtendRows(self: *Selection, shown: f32, top: u16, bottom: u16) bool {
+        const rows: i64 = @intFromFloat(@trunc(shown - self.extend_base));
+        if (rows == 0) return false;
+        self.extendByViewDelta(rows, top, bottom);
+        self.extend_base += @floatFromInt(rows);
+        return true;
+    }
+
+    /// Drag-extend across a viewport scroll: shift the focus end by the
+    /// scrolled delta (`moved` > 0 = up into history), clamped to the
+    /// visible span. Small scrolls grow the span a little; only large
+    /// scrolls pin to the edge. Snapping to the edge unconditionally made
+    /// one wheel notch select the whole page.
+    pub fn extendByViewDelta(self: *Selection, moved: i64, top: u16, bottom: u16) void {
+        if (moved == 0 or top > bottom) return;
+        const next: i64 = @as(i64, @intCast(self.focus_row)) - moved;
+        const lo: i64 = @intCast(top);
+        const hi: i64 = @intCast(bottom);
+        self.focus_row = @intCast(@max(lo, @min(hi, next)));
     }
 
     pub fn updateWordDrag(self: *Selection, grid: anytype, col: u16, row: u16) void {
@@ -617,4 +676,78 @@ test "isSingleCell detection" {
     s.beginWord(span);
     // Word mode is not considered single cell (it was an explicit word selection)
     try std.testing.expect(!s.isSingleCell());
+}
+
+test "extendByViewDelta grows by scrolled rows, not to the edge" {
+    var s = Selection{};
+    s.active = true;
+    s.focus_row = 10;
+    // One wheel notch up: 3 rows, viewport spans abs 0..23.
+    s.extendByViewDelta(3, 0, 23);
+    try std.testing.expectEqual(@as(u16, 7), s.focus_row);
+    // And back down.
+    s.extendByViewDelta(-3, 0, 23);
+    try std.testing.expectEqual(@as(u16, 10), s.focus_row);
+}
+
+test "extendByViewDelta clamps at the visible span" {
+    var s = Selection{};
+    s.active = true;
+    s.focus_row = 2;
+    s.extendByViewDelta(10, 0, 23);
+    try std.testing.expectEqual(@as(u16, 0), s.focus_row);
+    s.focus_row = 20;
+    s.extendByViewDelta(-10, 0, 23);
+    try std.testing.expectEqual(@as(u16, 23), s.focus_row);
+}
+
+test "extendByViewDelta ignores no-ops" {
+    var s = Selection{};
+    s.active = true;
+    s.focus_row = 10;
+    s.extendByViewDelta(0, 0, 23);
+    try std.testing.expectEqual(@as(u16, 10), s.focus_row);
+    s.extendByViewDelta(5, 23, 0); // inverted span
+    try std.testing.expectEqual(@as(u16, 10), s.focus_row);
+}
+
+test "takeExtendRows streams with the glide" {
+    var s = Selection{};
+    s.active = true;
+    s.focus_row = 10;
+    s.beginExtend(0);
+    // Sub-row travel accumulates, nothing applied yet.
+    try std.testing.expect(!s.takeExtendRows(0.9, 0, 23));
+    try std.testing.expectEqual(@as(u16, 10), s.focus_row);
+    // Crossing a whole row applies exactly one.
+    try std.testing.expect(s.takeExtendRows(1.4, 0, 23));
+    try std.testing.expectEqual(@as(u16, 9), s.focus_row);
+    // Reversal is absorbed by the remainder first.
+    try std.testing.expect(!s.takeExtendRows(0.6, 0, 23));
+    try std.testing.expectEqual(@as(u16, 9), s.focus_row);
+    // ...then extends back down past it.
+    try std.testing.expect(s.takeExtendRows(-0.3, 0, 23));
+    try std.testing.expectEqual(@as(u16, 10), s.focus_row);
+}
+
+test "takeExtendRows clamps to the painted span" {
+    var s = Selection{};
+    s.active = true;
+    s.focus_row = 10;
+    s.beginExtend(0);
+    try std.testing.expect(s.takeExtendRows(5.0, 8, 12));
+    try std.testing.expectEqual(@as(u16, 8), s.focus_row);
+}
+
+test "dragRowAt rides paint, identity at rest" {
+    // Settled: live == painted, row passes through.
+    try std.testing.expectEqual(@as(u16, 5), dragRowAt(5, 3, 3, 24));
+    // Glide up: live 3 ahead of paint 1, pointer row 0 is live row 2.
+    try std.testing.expectEqual(@as(u16, 2), dragRowAt(0, 3, 1, 24));
+    // Glide down: live 1 behind paint 3, pointer row 2 is live row 0.
+    try std.testing.expectEqual(@as(u16, 0), dragRowAt(2, 1, 3, 24));
+    // Clamps at both edges, never wraps.
+    try std.testing.expectEqual(@as(u16, 0), dragRowAt(0, 1, 9, 24));
+    try std.testing.expectEqual(@as(u16, 23), dragRowAt(23, 9, 1, 24));
+    try std.testing.expectEqual(@as(u16, 7), dragRowAt(7, 0, 0, 0));
 }

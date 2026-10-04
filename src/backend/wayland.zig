@@ -2129,6 +2129,18 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const view_live = voff == 0 and !self.copy_active;
             const flow_visible = (!(self.ctx.decscusr_blink orelse self.cursor_blink) or self.ctx.blink_visible) and self.ctx.show_cursor and view_live;
             self.flow.step(flow_now, self.ctx.cursor_col, self.ctx.cursor_row, voff, flow_visible, !view_live, self.cell_w, self.cell_h, self.glide, self.glide_ms, self.trail_ms, self.smooth_scroll, self.smooth_scroll_ms);
+            // Drag-extend rides the INTERPOLATED viewport: extending on
+            // the scroll event jumped the highlight ahead of the glide.
+            // Whole travelled rows are consumed per frame (the fraction
+            // stays), clamped to the painted span — two bool checks when
+            // idle, nothing more.
+            if (cfg.selection and self.sel_drag and self.sel.active and self.ctx.grid.rows != 0) {
+                const sb = self.ctx.grid.sb_len;
+                const e = self.flow.viewEff(sb);
+                const top: u16 = @intCast(@min(sb - e, 65535));
+                const bottom: u16 = @intCast(@min(sb - e + self.ctx.grid.rows - 1, 65535));
+                if (self.sel.takeExtendRows(self.flow.shown_off, top, bottom)) self.needs_render = true;
+            }
             // Overlay-change detection: selection/find/hover/copy/shape
             // toggles alter pixels without cell writes. Any change forces
             // a full repaint (one bitmask compare per frame, covers all
@@ -2368,6 +2380,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (self.ctx.grid.view_offset != 0) {
                 self.ctx.grid.view_offset = 0;
                 self.flow.snapView(0);
+                self.sel.beginExtend(self.flow.shown_off);
                 self.needs_render = true;
             }
             pty_mod.writeAll(self.pty_fd, data);
@@ -2919,7 +2932,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     const delta: i32 = if (k == .page_up) page else -page;
                     const before = self.ctx.grid.view_offset;
                     self.ctx.grid.scrollView(delta);
-                    self.extendSelByView(before);
                     if (self.ctx.grid.sb_len > 0 and self.ctx.grid.view_offset == before and delta != 0) {
                         self.flow.bumpOver(if (delta > 0) 1 else -1);
                     }
@@ -3675,11 +3687,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             if (self.sel_drag) {
                 const cc = self.ptrCell(sx, sy);
-                const abs_row: u16 = @intCast(selection_mod.Selection.toAbs(&self.ctx.grid, cc.row));
+                // Ride the painted viewport: during a glide the live
+                // offset runs ahead of pixels; unadjusted, the focus lands
+                // rows off the text under the pointer and fights the
+                // per-frame extension. Identity once settled.
+                const sb = self.ctx.grid.sb_len;
+                const erow = selection_mod.dragRowAt(cc.row, @min(self.ctx.grid.view_offset, sb), self.flow.viewEff(sb), self.ctx.grid.rows);
+                const abs_row: u16 = @intCast(selection_mod.Selection.toAbs(&self.ctx.grid, erow));
                 switch (self.sel.mode) {
                     .cell => self.sel.update(cc.col, abs_row),
-                    .word => self.sel.updateWordDrag(&self.ctx.grid, cc.col, cc.row),
-                    .line => self.sel.updateLineDrag(&self.ctx.grid, cc.row),
+                    .word => self.sel.updateWordDrag(&self.ctx.grid, cc.col, erow),
+                    .line => self.sel.updateLineDrag(&self.ctx.grid, erow),
                 }
                 self.needs_render = true;
                 return;
@@ -3690,9 +3708,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (cfg.scrollbar and self.sb_dragging and self.ctx.mouse_mode == .off) {
                 const by: i32 = @divFloor(sy, 256);
                 const bg = self.sbGeom();
-                const before = self.ctx.grid.view_offset;
                 self.ctx.grid.view_offset = scrollbar_mod.offsetAt(bg, self.ctx.grid.sb_len, by);
-                self.extendSelByView(before);
                 self.clearHover();
                 self.sbBump();
                 self.cursor_only_render = false;
@@ -3720,6 +3736,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.needs_render = true;
                 return;
             }
+            // A left release ends any local drag no matter which branch the
+            // press took: press/release straddling a mouse-mode or Shift
+            // transition otherwise strands sel_drag, and every later wheel
+            // then flings the selection to the viewport edge.
+            if (button == 0x110 and state == 0) self.sel_drag = false;
             // App-owned mouse reports to the PTY (DECSET 1000/1002/1003);
             // Shift bypasses to local selection (foot parity).
             if (self.ctx.mouse_mode != .off and !mods.shift) {
@@ -3757,9 +3778,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         const bg = self.sbGeom();
                         if (scrollbar_mod.hitTest(bg, bx, by)) {
                             self.sb_dragging = true;
-                            const before = self.ctx.grid.view_offset;
                             self.ctx.grid.view_offset = scrollbar_mod.offsetAt(bg, self.ctx.grid.sb_len, by);
-                            self.extendSelByView(before);
                             self.clearHover();
                             self.sbBump();
                             self.cursor_only_render = false;
@@ -3814,6 +3833,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                             },
                         }
                         self.sel_drag = true;
+                        self.sel.beginExtend(self.flow.shown_off);
                         self.needs_render = true;
                     } else {
                         self.sel_drag = false;
@@ -3828,29 +3848,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 },
                 else => {},
             }
-        }
-
-        /// Drag-select + viewport scroll: extend the focus end to the edge
-        /// in the scroll direction, so the span grows over newly revealed
-        /// lines while the anchor stays glued to its text. Completed
-        /// selections (button released) only ever track content.
-        fn extendSelByView(self: *Self, before: usize) void {
-            if (!self.sel_drag or !self.sel.active) return;
-            const after: i64 = @intCast(self.ctx.grid.view_offset);
-            const moved = after - @as(i64, @intCast(before));
-            if (moved == 0) return;
-            const sb = self.ctx.grid.sb_len;
-            const off: usize = @min(self.ctx.grid.view_offset, sb);
-            const rows = self.ctx.grid.rows;
-            if (rows == 0) return;
-            if (moved > 0) {
-                // Up into history: focus rides the top edge (abs row).
-                self.sel.focus_row = @intCast(sb - off);
-            } else {
-                // Down toward live: focus rides the bottom edge.
-                self.sel.focus_row = @intCast(sb - off + rows - 1);
-            }
-            self.needs_render = true;
         }
 
         fn appOnPointerAxis(data: ?*anyopaque, pointer: ?*P.Pointer, time: u32, axis: u32, value: i32) callconv(.c) void {
@@ -3890,7 +3887,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const before = self.ctx.grid.view_offset;
             const delta: i32 = if (value > 0) -@as(i32, @intCast(step)) else @as(i32, @intCast(step));
             self.ctx.grid.scrollView(delta);
-            self.extendSelByView(before);
             if (self.ctx.grid.sb_len > 0 and self.ctx.grid.view_offset == before and delta != 0) {
                 self.flow.bumpOver(if (delta > 0) 1 else -1);
             }
@@ -3970,7 +3966,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (self.ctx.alt_active) return; // app owns the screen
             const before = self.ctx.grid.view_offset;
             self.ctx.grid.scrollView(delta);
-            self.extendSelByView(before);
             if (self.ctx.grid.sb_len > 0 and self.ctx.grid.view_offset == before and delta != 0) {
                 self.flow.bumpOver(if (delta > 0) 1 else -1);
             }
