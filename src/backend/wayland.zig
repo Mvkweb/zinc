@@ -155,6 +155,8 @@ const box_drawing = @import("../render/box_drawing.zig");
 const flow_mod = @import("../render/flow.zig");
 const scrollbar_mod = @import("../render/scrollbar.zig");
 const placeholder_mod = @import("../gfx/placeholder.zig");
+const kitty_mod = @import("../gfx/kitty.zig");
+const pool_mod = @import("../gfx/image_pool.zig");
 const search_mod = @import("../term/search.zig");
 const filelink_mod = @import("../term/filelink.zig");
 const ft_mod = @import("../font/ft.zig");
@@ -1304,11 +1306,79 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 const vr: i32 = @as(i32, pl.row) + voff;
                 if (vr < 0 or vr >= @as(i32, visible_rows)) continue;
                 if (pl.col >= visible_cols) continue;
+                // Legacy tiled placements (old a=p clients) crop + scale;
+                // everything else blits the full image 1:1.
+                if (pl.src_w > 0 and pl.src_h > 0) {
+                    self.blitTiledPlacement(&pl, img, W, H, px, py, cw, ch, vr, dmg);
+                    continue;
+                }
                 const dx: i32 = px + @as(i32, pl.col) * cw + pl.x_off;
                 const dy: i32 = py + vr * ch + pl.y_off;
                 const idmg = software.blitRgba(self.pool_pixels, W, H, src, img.w, sh, img.w, dx, dy);
                 dmgMerge(dmg, idmg);
             }
+        }
+
+        /// Blit one legacy tiled placement (KgpOld-style a=p): the source
+        /// crop (src rect, M4 clip applied from its top, legacy parity)
+        /// scales into a dest cell span at the placement cell. Silent
+        /// no-op on degenerate geometry or allocation failure — a bad tile
+        /// must never kill the frame.
+        fn blitTiledPlacement(
+            self: *Self,
+            pl: *const pool_mod.Placement,
+            img: *const pool_mod.Image,
+            W: u32,
+            H: u32,
+            px: i32,
+            py: i32,
+            cw: i32,
+            ch: i32,
+            vr: i32,
+            dmg: *software.Damage,
+        ) void {
+            if (cw <= 0 or ch <= 0 or img.w == 0 or img.h == 0) return;
+            const iw: usize = img.w;
+            const ih: usize = img.h;
+            const sx: usize = pl.src_x;
+            const sy_in: usize = pl.src_y;
+            if (sx >= iw or sy_in >= ih) return;
+            const sw: usize = @min(@as(usize, pl.src_w), iw - sx);
+            const sh_full: usize = @min(@as(usize, pl.src_h), ih - sy_in);
+            if (sw == 0 or sh_full == 0) return;
+            // M4 clip eats source rows from the crop top (legacy parity:
+            // remainder stays top-aligned at the placement origin).
+            const skip: usize = @min(@as(usize, pl.clip_top), sh_full);
+            const sh: usize = sh_full - skip;
+            if (sh == 0) return;
+            const dc: i32 = @max(1, @as(i32, pl.dest_cols));
+            const dr: i32 = @max(1, @as(i32, pl.dest_rows));
+            const dw: usize = @intCast(dc * cw);
+            const dh_full: usize = @intCast(dr * ch);
+            if (dw == 0 or dh_full == 0) return;
+            // Same scale factor for the clipped remainder as the full crop.
+            const skip_dst: usize = skip * dh_full / sh_full;
+            if (skip_dst >= dh_full) return;
+            const dh: usize = dh_full - skip_dst;
+            // Absurd spans (garbage c/r) must not balloon the frame heap.
+            if (sw * sh > 16 * 1024 * 1024 or dw * dh > 16 * 1024 * 1024) return;
+            const crop = self.gpa.alloc(u32, sw * sh) catch return;
+            defer self.gpa.free(crop);
+            const sy0: usize = sy_in + skip;
+            const sstride: usize = iw;
+            const sx0: usize = sx;
+            var y: usize = 0;
+            while (y < sh) : (y += 1) {
+                const srow = img.pixels[(sy0 + y) * sstride + sx0 ..][0..sw];
+                @memcpy(crop[y * sw ..][0..sw], srow);
+            }
+            const out = self.gpa.alloc(u32, dw * dh) catch return;
+            defer self.gpa.free(out);
+            kitty_mod.scaleRgba(crop, @intCast(sw), @intCast(sh), out, @intCast(dw), @intCast(dh));
+            const dx: i32 = px + @as(i32, pl.col) * cw + pl.x_off;
+            const dy: i32 = py + vr * ch + pl.y_off;
+            const idmg = software.blitRgba(self.pool_pixels, W, H, out, @intCast(dw), @intCast(dh), @intCast(dw), dx, dy);
+            dmgMerge(dmg, idmg);
         }
 
         /// Any dirty cell on a live row (dirty-row render gate).

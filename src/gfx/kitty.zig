@@ -67,6 +67,16 @@ pub const Control = struct {
     cursor_move: bool = true, // C=1 disables post-place cursor advance
     placement_id: u32 = 0, // p (0 = none; duplicates replace)
     request_num: u32 = 0, // I (0 = none; i+I together is EINVAL)
+    // Legacy tiled placement geometry (lowercase, a=p from old clients
+    // like yazi's KgpOld driver): source crop (x,y,w,h pixels) shown in
+    // a c*r cell span at the cursor. Zeros = absent = legacy full-image
+    // single-cell placement (a=t without geometry behaves as before).
+    src_x: u32 = 0,
+    src_y: u32 = 0,
+    src_w: u32 = 0,
+    src_h: u32 = 0,
+    disp_cols: u32 = 0, // c
+    disp_rows: u32 = 0, // r
     parse_err: ?[]const u8 = null,
 };
 
@@ -182,7 +192,23 @@ pub fn parseControl(ctrl: []const u8) Control {
                 if (c.parse_err == null) c.parse_err = "bad image number";
                 continue;
             },
-            else => {}, // c/r/x/y/I/U/... : delete keys + M2c.
+            // Legacy tiled geometry (a=p): source crop + cell span.
+            // Out-of-range values clamp at use; only well-formed ints land.
+            'x', 'y', 'w', 'h', 'c', 'r' => {
+                const n = parseU32(val) orelse {
+                    if (c.parse_err == null) c.parse_err = "bad place geometry";
+                    continue;
+                };
+                switch (key) {
+                    'x' => c.src_x = n,
+                    'y' => c.src_y = n,
+                    'w' => c.src_w = n,
+                    'h' => c.src_h = n,
+                    'c' => c.disp_cols = n,
+                    else => c.disp_rows = n,
+                }
+            },
+            else => {}, // U/... : unicode + forward-compat keys.
         }
     }
     return c;
@@ -402,6 +428,31 @@ test "kitty control parse" {
     const c3 = parseControl("a=t,f=32,s=x,v=8");
     try std.testing.expect(c3.parse_err != null);
     try std.testing.expectEqual(@as(u32, 0), c3.img_w);
+}
+
+test "kitty legacy place geometry parse" {
+    // Yazi KgpOld tile: source crop + 1x1 cell span, quiet.
+    const c = parseControl("a=p,i=5,p=12,x=10,y=20,w=30,h=40,c=1,r=1,q=2,C=1");
+    try std.testing.expectEqual(Action.put, c.action);
+    try std.testing.expectEqual(@as(u32, 5), c.image_id);
+    try std.testing.expectEqual(@as(u32, 12), c.placement_id);
+    try std.testing.expectEqual(@as(u32, 10), c.src_x);
+    try std.testing.expectEqual(@as(u32, 20), c.src_y);
+    try std.testing.expectEqual(@as(u32, 30), c.src_w);
+    try std.testing.expectEqual(@as(u32, 40), c.src_h);
+    try std.testing.expectEqual(@as(u32, 1), c.disp_cols);
+    try std.testing.expectEqual(@as(u32, 1), c.disp_rows);
+    try std.testing.expectEqual(@as(u8, 2), c.quiet);
+    try std.testing.expect(!c.cursor_move);
+    try std.testing.expect(c.parse_err == null);
+    // Absent geometry stays zeroed (legacy full-image path).
+    const c2 = parseControl("a=p,i=5");
+    try std.testing.expectEqual(@as(u32, 0), c2.src_w);
+    try std.testing.expect(c2.parse_err == null);
+    // Malformed geometry records once, field stays zero.
+    const c3 = parseControl("a=p,w=zz");
+    try std.testing.expect(c3.parse_err != null);
+    try std.testing.expectEqual(@as(u32, 0), c3.src_w);
 }
 
 test "kitty replies" {

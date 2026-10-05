@@ -603,6 +603,14 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             slot.y_off = ctrl.off_y;
             slot.z_index = ctrl.z_index;
             slot.placement_id = ctrl.placement_id;
+            // Legacy tiled geometry (a=p from old clients): clamps to u16
+            // here; the renderer clamps the crop to image bounds.
+            slot.src_x = ctrl.src_x;
+            slot.src_y = ctrl.src_y;
+            slot.src_w = ctrl.src_w;
+            slot.src_h = ctrl.src_h;
+            slot.dest_cols = @intCast(@min(ctrl.disp_cols, 4096));
+            slot.dest_rows = @intCast(@min(ctrl.disp_rows, 4096));
             self.images.sortPlacements();
             if (ctrl.cursor_move) self.advanceAfterImage(img.w, img.h);
             return true;
@@ -637,11 +645,19 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             self.replyPlaced(id, ctrl);
         }
 
-        /// Query always answers OK, even for never-transmitted ids: the
-        /// ratatui-image probe (`Gi=31,s=1,v=1,a=q,...`) requires byte-exact
-        /// `Gi=<id>;OK` to select the kitty backend, matching real
-        /// kitty/ghostty/wezterm behavior.
+        /// Query answers OK for direct-transmission probes, even for
+        /// never-transmitted ids: the ratatui-image probe
+        /// (`Gi=31,s=1,v=1,a=q,...`) requires byte-exact `Gi=<id>;OK`
+        /// to select the kitty backend, matching real
+        /// kitty/ghostty/wezterm behavior. Shared-memory probes (t=s)
+        /// get an error instead: there is no shm transport here, and an
+        /// OK would make clients send images into the void (yazi's KgpOld
+        /// shm-first path fell back to nothing and previews stayed blank).
         fn kittyQuery(self: *Self, ctrl: kitty_mod.Control) void {
+            if (ctrl.medium != 'd') {
+                self.replyKitty(ctrl.image_id, ctrl.quiet, "unsupported transmission medium");
+                return;
+            }
             self.replyKitty(ctrl.image_id, ctrl.quiet, null);
         }
 
@@ -2084,6 +2100,50 @@ test "kitty transmit RGBA end-to-end" {
     sink.len = 0;
     ctx.parse("\x1b_Gi=31,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\");
     try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "Gi=31;OK") != null);
+    // Shared-memory probe must NOT answer OK: no shm transport exists.
+    // (Yazi sends images only via shm while it believes shm works.)
+    sink.len = 0;
+    ctx.parse("\x1b_Gi=916472805,s=1,v=1,a=q,t=s,f=24;AAAA\x1b\\");
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "Gi=916472805;OK") == null);
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "Gi=916472805;") != null);
+}
+
+test "kitty legacy tiled placement stores geometry" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    const Sink = struct {
+        buf: [512]u8 = undefined,
+        len: usize = 0,
+        fn cb(user: ?*anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(user));
+            const n = @min(data.len, self.buf.len - self.len);
+            @memcpy(self.buf[self.len..][0..n], data[0..n]);
+            self.len += n;
+        }
+    };
+    var sink = Sink{};
+    ctx.onWrite(Sink.cb, &sink);
+    ctx.cursor_col = 5;
+    ctx.cursor_row = 3;
+    // 2x1 RGBA white ("/////////w==" = 8x 0xFF), transmit-and-place
+    // at the cursor (quiet).
+    ctx.parse("\x1b_Ga=t,f=32,s=2,v=1,i=50,q=2;/////////w==\x1b\\");
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
+    const base = ctx.images.placements.items[0];
+    try std.testing.expectEqual(@as(u32, 0), base.src_w); // legacy: full image
+    // One legacy tile: 1x1 source crop in a single cell, new placement id.
+    ctx.parse("\x1b_Ga=p,i=50,p=7,x=0,y=0,w=1,h=1,c=1,r=1,q=2,C=1\x1b\\");
+    try std.testing.expectEqual(@as(usize, 2), ctx.images.placements.items.len);
+    const tile = ctx.images.placements.items[1];
+    try std.testing.expectEqual(@as(u32, 50), tile.img_id);
+    try std.testing.expectEqual(@as(u32, 7), tile.placement_id);
+    try std.testing.expectEqual(@as(u32, 1), tile.src_w);
+    try std.testing.expectEqual(@as(u32, 1), tile.src_h);
+    try std.testing.expectEqual(@as(u16, 5), tile.col);
+    try std.testing.expectEqual(@as(u16, 3), tile.row);
+    // Per-cell erase removes just the tile.
+    ctx.parse("\x1b_Ga=d,d=i,i=50,p=7,q=2\x1b\\");
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
 }
 
 test "kitty chunked upload reassembles" {

@@ -28,6 +28,14 @@ pub const Placement = struct {
     z_index: i32 = 0,
     is_sixel: bool = false,
     alt_screen: bool = false,
+    /// Legacy tiled source crop (pixels): zero w/h = absent = full image.
+    src_x: u32 = 0,
+    src_y: u32 = 0,
+    src_w: u32 = 0,
+    src_h: u32 = 0,
+    /// Destination cell span: 0/1 = single cell (legacy behavior).
+    dest_cols: u16 = 0,
+    dest_rows: u16 = 0,
 };
 
 pub fn ensureCap(comptime T: type, gpa: std.mem.Allocator, list: *std.ArrayList(T), need: usize, max: usize) !void {
