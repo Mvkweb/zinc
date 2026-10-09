@@ -16,8 +16,7 @@ On Arch/CachyOS:
 sudo pacman -S zig wayland libxkbcommon freetype2 fontconfig
 ```
 
-Note: zinc needs exactly Zig 0.16.0. If your distro ships a newer Zig,
-grab 0.16.0 from ziglang.org instead.
+Note: built with Zig 0.16.0.
 
 ## Build
 
