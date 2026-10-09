@@ -91,6 +91,35 @@ pub fn build(b: *std.Build) void {
     const check_step = b.step("check", "Compile check only (no install, no run)");
     check_step.dependOn(&check_exe.step);
     check_step.dependOn(&check_tests.step);
+
+    // Desktop integration: `zig build install --prefix ~/.local` (or /usr
+    // as root) lays out bin/ + share/applications + share/icons +
+    // share/metainfo. Everything is prefix-relative — nothing here touches
+    // the live system; the prefix decides the destination.
+    const install_step = b.getInstallStep();
+    install_step.dependOn(&b.addInstallFileWithDir(
+        b.path("assets/io.github.mvkweb.zinc.desktop"),
+        .prefix,
+        "share/applications/io.github.mvkweb.zinc.desktop",
+    ).step);
+    install_step.dependOn(&b.addInstallFileWithDir(
+        b.path("assets/io.github.mvkweb.zinc.metainfo.xml"),
+        .prefix,
+        "share/metainfo/io.github.mvkweb.zinc.metainfo.xml",
+    ).step);
+    const icon_sizes = [_][]const u8{ "16", "32", "48", "64", "128", "256" };
+    for (icon_sizes) |s| {
+        install_step.dependOn(&b.addInstallFileWithDir(
+            b.path(b.fmt("assets/icons/hicolor/{s}x{s}/apps/zinc.png", .{ s, s })),
+            .prefix,
+            b.fmt("share/icons/hicolor/{s}x{s}/apps/zinc.png", .{ s, s }),
+        ).step);
+    }
+    install_step.dependOn(&b.addInstallFileWithDir(
+        b.path("assets/icons/pixmaps/zinc.png"),
+        .prefix,
+        "share/pixmaps/zinc.png",
+    ).step);
 }
 
 fn addPkgConfigIncludes(b: *std.Build, translate_c: *std.Build.Step.TranslateC, lib_name: []const u8) void {

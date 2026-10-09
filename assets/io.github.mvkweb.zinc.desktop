@@ -1,0 +1,13 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Zinc
+GenericName=Terminal Emulator
+Comment=A terminal written in Zig
+Exec=zinc
+Icon=zinc
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;console;shell;command line;wayland;zig;
+StartupWMClass=zinc
+StartupNotify=true
