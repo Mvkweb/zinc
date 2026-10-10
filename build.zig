@@ -107,14 +107,13 @@ pub fn build(b: *std.Build) void {
         .prefix,
         "share/metainfo/io.github.mvkweb.zinc.metainfo.xml",
     ).step);
-    const icon_sizes = [_][]const u8{ "16", "32", "48", "64", "128", "256" };
-    for (icon_sizes) |s| {
-        install_step.dependOn(&b.addInstallFileWithDir(
-            b.path(b.fmt("assets/icons/hicolor/{s}x{s}/apps/zinc.png", .{ s, s })),
-            .prefix,
-            b.fmt("share/icons/hicolor/{s}x{s}/apps/zinc.png", .{ s, s }),
-        ).step);
-    }
+    // Whole hicolor tree in one step: adding a size later means dropping
+    // in a file, no build.zig edit.
+    install_step.dependOn(&b.addInstallDirectory(.{
+        .source_dir = b.path("assets/icons/hicolor"),
+        .install_dir = .prefix,
+        .install_subdir = "share/icons/hicolor",
+    }).step);
     install_step.dependOn(&b.addInstallFileWithDir(
         b.path("assets/icons/pixmaps/zinc.png"),
         .prefix,

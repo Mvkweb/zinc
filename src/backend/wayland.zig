@@ -658,7 +658,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             _ = c.wl_proxy_add_listener(@ptrCast(tl), @ptrCast(&self.tll), @ptrCast(self));
 
             c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.SET_TITLE, @as([*:0]const u8, "zinc"));
-            c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.SET_APP_ID, @as([*:0]const u8, "zinc"));
+            c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.SET_APP_ID, @as([*:0]const u8, "io.github.mvkweb.zinc"));
             const min_w = @as(i32, 15) * self.cell_w + 2 * @as(i32, @intCast(self.currentPadX()));
             const min_h = @as(i32, 3) * self.cell_h + 2 * @as(i32, @intCast(self.currentPadY()));
             c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.SET_MIN_SIZE, min_w, min_h);

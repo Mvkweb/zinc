@@ -6,6 +6,8 @@ A Wayland terminal emulator written in Zig.
   <img src="assets/showcase.gif" alt="Showcase" />
 </p>
 
+Keep in mind this is still experimental and you will surely find issues. If you report them in the issues I would really appreciate it and will work on the fix. I am doing this project to learn, not competing with other terminals, although zinc is faster in some tasks and has niche features.
+
 ## Highlights
 
 The cursor glides to its cell over 60ms instead of teleporting. Scrolling pours instead of jumping, with a scrollbar that fades when idle. Ctrl+click a file to open it in your editor, Ctrl+click a folder to cd into it, Shift+click to open the file manager. Images render inline through the Kitty graphics protocol, so tools like yazi show real previews. Fonts auto-discover with CJK and emoji fallback, and Ctrl+plus/minus zooms.
@@ -65,10 +67,12 @@ This puts the binary in `~/.local/bin` and the desktop files under
 launcher should list Zinc after that. If it does not show up right away,
 most launchers pick it up on next login.
 
-System-wide (needs root):
+System-wide (needs root). Build as yourself first, otherwise the build
+cache in your repo ends up owned by root:
 
 ```bash
-sudo zig build install -Doptimize=ReleaseSafe --prefix /usr/local
+zig build -Doptimize=ReleaseSafe --prefix ./stage
+sudo cp -a stage/. /usr/local/
 ```
 
 On Arch, you can also build a proper package from the repo:

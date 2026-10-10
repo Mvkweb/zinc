@@ -14,6 +14,9 @@
     </p>
   </description>
   <launchable type="desktop-id">io.github.mvkweb.zinc.desktop</launchable>
+  <provides>
+    <binary>zinc</binary>
+  </provides>
   <url type="homepage">https://github.com/mvkweb/zinc</url>
   <developer id="io.github.mvkweb">
     <name>Mvkweb</name>
