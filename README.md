@@ -52,50 +52,46 @@ zig build check
 
 ## Install
 
-`zig build install` lays out the binary plus the launcher files
-(desktop entry, icon, app metadata). It installs relative to a prefix,
-so pick where it goes.
-
-For your user only, no root needed:
+To install for your user only (no root required):
 
 ```bash
-zig build install -Doptimize=ReleaseSafe --prefix ~/.local
+zig build -Doptimize=ReleaseSafe --prefix ~/.local
+update-desktop-database ~/.local/share/applications
 ```
 
-This puts the binary in `~/.local/bin` and the desktop files under
-`~/.local/share`. Make sure `~/.local/bin` is on your PATH. Your app
-launcher should list Zinc after that. If it does not show up right away,
-most launchers pick it up on next login.
+This installs the binary to `~/.local/bin/zinc` and registers the desktop launcher, multi-res transparent icons, and AppStream metadata in `~/.local/share/`. Ensure `~/.local/bin` is in your `PATH`.
 
-System-wide (needs root). Build as yourself first, otherwise the build
-cache in your repo ends up owned by root:
+For system-wide installation:
 
 ```bash
-zig build -Doptimize=ReleaseSafe --prefix ./stage
-sudo cp -a stage/. /usr/local/
+sudo zig build -Doptimize=ReleaseSafe --prefix /usr/local
+sudo update-desktop-database /usr/local/share/applications
 ```
 
-On Arch, you can also build a proper package from the repo:
+On Arch Linux, you can also build and install directly using the included `PKGBUILD`:
 
 ```bash
 makepkg -si
 ```
 
-This needs a release tag to exist (it builds `v$pkgver`). AUR submission
-will follow once registrations reopen.
+## Uninstall
 
-To uninstall, delete what the prefix install placed:
+To uninstall, run the built-in uninstall command pointing to your prefix:
 
 ```bash
-rm ~/.local/bin/zinc
-rm ~/.local/share/applications/io.github.mvkweb.zinc.desktop
-rm ~/.local/share/metainfo/io.github.mvkweb.zinc.metainfo.xml
-rm -rf ~/.local/share/icons/hicolor/*/apps/zinc.png
-rm ~/.local/share/pixmaps/zinc.png
+zig build uninstall --prefix ~/.local
+update-desktop-database ~/.local/share/applications
 ```
 
-Your config at `~/.config/zinc/config` stays put. Zinc creates it on
-first launch if it is missing.
+Or for system-wide installs:
+
+```bash
+sudo zig build uninstall --prefix /usr/local
+sudo update-desktop-database /usr/local/share/applications
+```
+
+Your configuration at `~/.config/zinc/config` stays untouched.
+
 
 ## Known issues
 

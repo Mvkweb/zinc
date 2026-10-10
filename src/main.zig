@@ -2,6 +2,7 @@
 //! Juicy Main (Zig 0.16): io/gpa/arena flow through everything.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const config_mod = @import("config.zig");
 const context_mod = @import("context.zig");
 const wayland_mod = @import("backend/wayland.zig");
@@ -17,7 +18,10 @@ pub fn main(init: std.process.Init) !void {
 
     const args = try init.minimal.args.toSlice(init.arena.allocator());
     if (args.len > 1 and std.mem.eql(u8, args[1], "--version")) {
-        try std.Io.File.stdout().writeStreamingAll(io, "zinc 0.1.0 (zig 0.16.0)\n");
+        var vb: [128]u8 = undefined;
+        var w = std.Io.File.stdout().writer(io, &vb);
+        try w.interface.print("zinc {s} (zig 0.16.0)\n", .{build_options.version});
+        try w.interface.flush();
         return;
     }
     if (args.len > 1 and std.mem.eql(u8, args[1], "--smoke")) {

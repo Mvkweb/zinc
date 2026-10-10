@@ -8,10 +8,12 @@ pub fn build(b: *std.Build) void {
     // images / eye-candy / alt-screen at compile time (sfte-macro equivalent).
     const minimal = b.option(bool, "minimal", "Minimal build: no images, eye-candy, or alt-screen") orelse false;
     const ascii_only = b.option(bool, "ascii-only", "Store cells as u8 (ASCII only, halves grid memory)") orelse false;
+    const version = b.option([]const u8, "version", "Package version string") orelse "0.1.0";
 
     const options = b.addOptions();
     options.addOption(bool, "minimal", minimal);
     options.addOption(bool, "ascii_only", ascii_only);
+    options.addOption([]const u8, "version", version);
 
     // Wayland core C decls (translateC over wayland-client-core.h).
     // xdg-shell tables are hand-written in Zig (no scanner step).
@@ -119,6 +121,50 @@ pub fn build(b: *std.Build) void {
         .prefix,
         "share/pixmaps/zinc.png",
     ).step);
+    install_step.dependOn(&b.addInstallFileWithDir(
+        b.path("assets/icons/pixmaps/io.github.mvkweb.zinc.png"),
+        .prefix,
+        "share/pixmaps/io.github.mvkweb.zinc.png",
+    ).step);
+
+    // Override the unimplemented std.Build uninstall step so `zig build uninstall`
+    // cleanly removes all installed files from the destination prefix.
+    b.getUninstallStep().makeFn = makeUninstall;
+}
+
+fn makeUninstall(step: *std.Build.Step, options: std.Build.Step.MakeOptions) anyerror!void {
+    _ = options;
+    const b = step.owner;
+    const prefix = b.install_path;
+
+    const files_to_remove = [_][]const u8{
+        b.pathJoin(&.{ prefix, "bin/zinc" }),
+        b.pathJoin(&.{ prefix, "share/applications/io.github.mvkweb.zinc.desktop" }),
+        b.pathJoin(&.{ prefix, "share/metainfo/io.github.mvkweb.zinc.metainfo.xml" }),
+        b.pathJoin(&.{ prefix, "share/pixmaps/zinc.png" }),
+        b.pathJoin(&.{ prefix, "share/pixmaps/io.github.mvkweb.zinc.png" }),
+        b.pathJoin(&.{ prefix, "share/icons/hicolor/16x16/apps/zinc.png" }),
+        b.pathJoin(&.{ prefix, "share/icons/hicolor/16x16/apps/io.github.mvkweb.zinc.png" }),
+        b.pathJoin(&.{ prefix, "share/icons/hicolor/32x32/apps/zinc.png" }),
+        b.pathJoin(&.{ prefix, "share/icons/hicolor/32x32/apps/io.github.mvkweb.zinc.png" }),
+        b.pathJoin(&.{ prefix, "share/icons/hicolor/48x48/apps/zinc.png" }),
+        b.pathJoin(&.{ prefix, "share/icons/hicolor/48x48/apps/io.github.mvkweb.zinc.png" }),
+        b.pathJoin(&.{ prefix, "share/icons/hicolor/64x64/apps/zinc.png" }),
+        b.pathJoin(&.{ prefix, "share/icons/hicolor/64x64/apps/io.github.mvkweb.zinc.png" }),
+        b.pathJoin(&.{ prefix, "share/icons/hicolor/128x128/apps/zinc.png" }),
+        b.pathJoin(&.{ prefix, "share/icons/hicolor/128x128/apps/io.github.mvkweb.zinc.png" }),
+        b.pathJoin(&.{ prefix, "share/icons/hicolor/256x256/apps/zinc.png" }),
+        b.pathJoin(&.{ prefix, "share/icons/hicolor/256x256/apps/io.github.mvkweb.zinc.png" }),
+        b.pathJoin(&.{ prefix, "share/icons/hicolor/512x512/apps/zinc.png" }),
+        b.pathJoin(&.{ prefix, "share/icons/hicolor/512x512/apps/io.github.mvkweb.zinc.png" }),
+    };
+
+    for (files_to_remove) |file_path| {
+        std.Io.Dir.cwd().deleteFile(b.graph.io, file_path) catch |err| switch (err) {
+            error.FileNotFound => {},
+            else => return err,
+        };
+    }
 }
 
 fn addPkgConfigIncludes(b: *std.Build, translate_c: *std.Build.Step.TranslateC, lib_name: []const u8) void {

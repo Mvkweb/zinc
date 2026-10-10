@@ -4,10 +4,12 @@ Type=Application
 Name=Zinc
 GenericName=Terminal Emulator
 Comment=A terminal written in Zig
+TryExec=zinc
 Exec=zinc
-Icon=zinc
+Icon=io.github.mvkweb.zinc
 Terminal=false
 Categories=System;TerminalEmulator;
 Keywords=terminal;console;shell;command line;wayland;zig;
-StartupWMClass=zinc
+StartupWMClass=io.github.mvkweb.zinc
 StartupNotify=true
+
