@@ -3,8 +3,14 @@
 A Wayland terminal emulator written in Zig.
 
 <p align="center">
-  <img src="assets/showcase.gif" alt="Zinc terminal showcase" />
+  <img src="assets/showcase.gif" alt="Showcase" />
 </p>
+
+## Highlights
+
+The cursor glides to its cell over 60ms instead of teleporting. Scrolling pours instead of jumping, with a scrollbar that fades when idle. Ctrl+click a file to open it in your editor, Ctrl+click a folder to cd into it, Shift+click to open the file manager. Images render inline through the Kitty graphics protocol, so tools like yazi show real previews. Fonts auto-discover with CJK and emoji fallback, and Ctrl+plus/minus zooms.
+
+Everything lives in `~/.config/zinc/config`, created on first launch and never rewritten. Tune `cursor-glide-ms`, `smooth-scroll-ms`, or `scroll-step` and restart.
 
 ## Dependencies
 
