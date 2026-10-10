@@ -2,6 +2,10 @@
 
 A Wayland terminal emulator written in Zig.
 
+<p align="center">
+  <img src="assets/showcase.gif" alt="Zinc terminal showcase" />
+</p>
+
 ## Dependencies
 
 - Zig 0.16.0
@@ -10,7 +14,7 @@ A Wayland terminal emulator written in Zig.
 - freetype2
 - fontconfig
 
-On Arch/CachyOS:
+On Arch:
 
 ```bash
 sudo pacman -S zig wayland libxkbcommon freetype2 fontconfig
