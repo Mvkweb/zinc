@@ -9,8 +9,8 @@
     <p>
       Zinc is an ultra-lightweight Wayland-native terminal emulator written
       in pure Zig. It pairs a fast software renderer with FreeType text,
-      kitty graphics, smooth scrolling, and a Ghostty-style config file —
-      without a GPU or toolkit dependency.
+      kitty graphics, smooth scrolling, and simple plain-text configuration,
+      without GPU or toolkit dependencies.
     </p>
   </description>
   <launchable type="desktop-id">io.github.mvkweb.zinc.desktop</launchable>

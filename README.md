@@ -14,6 +14,9 @@ The cursor glides to its cell over 60ms instead of teleporting. Scrolling pours 
 
 Everything lives in `~/.config/zinc/config`, created on first launch and never rewritten. Tune `cursor-glide-ms`, `smooth-scroll-ms`, or `scroll-step` and restart.
 
+If you want to see the full breakdown of everything zinc does, check [features.md](features.md).
+
+
 ## Dependencies
 
 - Zig 0.16.0
@@ -59,7 +62,11 @@ zig build -Doptimize=ReleaseSafe --prefix ~/.local
 update-desktop-database ~/.local/share/applications
 ```
 
-This installs the binary to `~/.local/bin/zinc` and registers the desktop launcher, multi-res transparent icons, and AppStream metadata in `~/.local/share/`. Ensure `~/.local/bin` is in your `PATH`.
+This installs the binary to `~/.local/bin/zinc` and registers the desktop launcher, multi-res transparent icons, and AppStream metadata in `~/.local/share/`.
+
+Make sure `~/.local/bin` is in your `PATH`:
+- **fish**: `fish_add_path ~/.local/bin`
+- **bash / zsh**: add `export PATH="$HOME/.local/bin:$PATH"` to your `~/.bashrc` or `~/.zshrc`
 
 For system-wide installation:
 
