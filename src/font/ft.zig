@@ -373,11 +373,11 @@ pub const Face = struct {
     cjk_path_buf: [1024]u8 = undefined,
     cjk_path_len: usize = 0,
     keycap_gsub_done: bool = false,
-    keycap_lig: [12]u32 = .{0} ** 12,
+    keycap_lig: [12]u32 = @splat(0),
     bold_tried: bool = false,
     italic_tried: bool = false,
     bold_italic_tried: bool = false,
-    fallback_tried: [3]bool = [_]bool{false} ** 3,
+    fallback_tried: [3]bool = @splat(false),
     /// Color emoji face, lazy-loaded on first emoji bake. Null = absent
     /// or unwanted; emoji_enabled=false (minimal profile) skips loading.
     emoji_face: ?c.FT_Face = null,
@@ -913,7 +913,7 @@ pub const Face = struct {
         const mark_gid = c.FT_Get_Char_Index(ef, 0x20E3);
         if (mark_gid == 0) return 0;
         const bases = [_]u21{ '0', '1', '2', '3', '4', '5', '6', '7', '8', '9', '#', '*' };
-        var base_gids: [12]u32 = .{0} ** 12;
+        var base_gids: [12]u32 = @splat(0);
         for (bases, 0..) |b, i| base_gids[i] = c.FT_Get_Char_Index(ef, @intCast(b));
         const table = loadSfntTable(gpa, ef, 0x47535542) orelse return 0; // 'GSUB'
         defer gpa.free(table);

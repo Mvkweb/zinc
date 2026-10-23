@@ -506,8 +506,8 @@ test "kitty decode-all bounded" {
 
 test "cubic scale preserves constants + subsamples exactly" {
     // Constant image reproduces (weights sum to 1).
-    var src: [64]u32 = [_]u32{0xFF182838} ** 64;
-    var dst: [16]u32 = [_]u32{0} ** 16;
+    var src: [64]u32 = @splat(0xFF182838);
+    var dst: [16]u32 = @splat(0);
     scaleRgbaCubic(&src, 8, 8, &dst, 4, 4);
     for (dst) |p| {
         try std.testing.expect(@abs(@as(i32, @intCast((p >> 24) & 0xFF)) - 0xFF) <= 1);
@@ -522,7 +522,7 @@ test "cubic scale preserves constants + subsamples exactly" {
         const v: u32 = @as(u32, @intCast((i % 8) * 32));
         ramp[i] = 0xFF000000 | (v << 16);
     }
-    var small: [16]u32 = [_]u32{0} ** 16;
+    var small: [16]u32 = @splat(0);
     scaleRgbaCubic(&ramp, 8, 8, &small, 4, 4);
     // Interior taps stay exact (B-spline reproduces linears); the edge
     // softens (approximation, not interpolation — that is the point).
@@ -532,7 +532,7 @@ test "cubic scale preserves constants + subsamples exactly" {
     try std.testing.expectEqual(@as(u32, 0xFFC00000), small[3]);
     // Fractional ratios must also reproduce constants (weights sum to 1
     // at every t; a broken kernel darkens/ripples here instead).
-    var tiny: [9]u32 = [_]u32{0} ** 9;
+    var tiny: [9]u32 = @splat(0);
     scaleRgbaCubic(&src, 8, 8, &tiny, 3, 3);
     for (tiny) |p| {
         try std.testing.expect(@abs(@as(i32, @intCast((p >> 24) & 0xFF)) - 0xFF) <= 2);
@@ -613,13 +613,13 @@ test "mipmap box-halve averages + constant chain" {
         const y = i / 4;
         src[i] = if ((x + y) % 2 == 0) 0xFFFFFFFF else 0xFF000000;
     }
-    var half: [4]u32 = [_]u32{0} ** 4;
+    var half: [4]u32 = @splat(0);
     boxHalve(&src, 4, 4, &half, 2, 2);
     for (half) |p| try std.testing.expectEqual(@as(u32, 0xFF808080), p);
     // Constant image survives the full chain exactly.
-    var flat: [64]u32 = [_]u32{0xFF182838} ** 64;
-    var tiny: [4]u32 = [_]u32{0} ** 4;
-    var scratch: [128]u32 = [_]u32{0} ** 128;
+    var flat: [64]u32 = @splat(0xFF182838);
+    var tiny: [4]u32 = @splat(0);
+    var scratch: [128]u32 = @splat(0);
     scaleRgbaMipmap(&flat, 8, 8, &tiny, 2, 2, &scratch);
     for (tiny) |p| {
         try std.testing.expect(@abs(@as(i32, @intCast((p >> 24) & 0xFF)) - 0xFF) <= 1);

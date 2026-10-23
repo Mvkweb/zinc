@@ -283,7 +283,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
         find_matches: std.ArrayList(search_mod.Match) = .empty,
         find_idx: usize = 0,
         find_saved_off: usize = 0,
-        find_vis: [64]FindVis = [_]FindVis{.{ .m = .{ .row = 0, .col = 0, .erow = 0, .ecol = 0 }, .idx = 0 }} ** 64,
+        find_vis: [64]FindVis = @splat(.{ .m = .{ .row = 0, .col = 0, .erow = 0, .ecol = 0 }, .idx = 0 }),
         find_vis_n: usize = 0,
         /// Keyboard copy mode (Ctrl+Shift+Space): absolute-row copy cursor
         /// over scrollback + grid, v selects, y/Enter yanks via selection.
@@ -387,7 +387,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// Baked keycap ligatures by base (0-9, '#' = 10, '*' = 11).
         /// Null = not yet attempted; a blank (w == 0) entry = tried and
         /// missing, so frames never re-bake a miss (fallback owns it).
-        keycap_baked: [12]?atlas_mod.Baked = [_]?atlas_mod.Baked{null} ** 12,
+        keycap_baked: [12]?atlas_mod.Baked = @splat(null),
         /// Debug knobs, read from the environment ONCE at open (never in
         /// the PTY/render hot path: getenv scans environ per call).
         trace_on: bool = false,
@@ -806,7 +806,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             try self.recreatePool();
 
             // Spawn the shell.
-            const term = try gpa.dupeZ(u8, cfg.term_env);
+            const term = try gpa.dupeSentinel(u8, cfg.term_env, 0);
             defer gpa.free(term);
             const child = pty_mod.spawnShell(self.ctx.grid.cols, self.ctx.grid.rows, term) catch return error.PtyFailed;
             self.pty_pid = child.pid;
@@ -1003,7 +1003,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
         }
 
         fn glyphFor(self: *Self, cp: u21, style: ft_mod.Style) ?atlas_mod.Baked {
-            const key: u32 = @as(u32, cp) * 4 + @intFromEnum(style);
+            const key: u32 = @as(u32, cp) * 4 + @backingInt(style);
             if (self.glyphs.get(key)) |b| return b;
             const ca: ?*atlas_mod.ColorAtlas = if (cfg.emoji) &self.color_atlas else null;
             const baked = self.ft_face.bake(&self.atlas, ca, cp, style) catch |err| blk: {
@@ -2234,7 +2234,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // removed last image must repaint the text beneath (ghost
             // otherwise). Presence bit transitions force that frame.
             if (cfg.kitty_gfx and self.ctx.images.placements.items.len > 0) ob |= 256;
-            ob |= @as(u32, @intFromEnum(self.ctx.decscusr_style orelse .block)) << 8;
+            ob |= @as(u32, @backingInt(self.ctx.decscusr_style orelse .block)) << 8;
             if (self.ctx.decscusr_blink orelse false) ob |= 0x1000;
             if (ob != self.last_overlay) {
                 self.ctx.grid.markAllDirty();
@@ -2996,7 +2996,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 K.End => .end,
                 K.Insert => .insert,
                 K.ISO_Left_Tab => .backtab,
-                K.F1...K.F1 + 11 => @enumFromInt(@intFromEnum(input_kb.Key.f1) + (sym - K.F1)),
+                K.F1...K.F1 + 11 => @fromBackingInt(@intCast(@backingInt(input_kb.Key.f1) + (sym - K.F1))),
                 else => null,
             };
             var out: [32]u8 = undefined;

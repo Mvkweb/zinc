@@ -45,7 +45,7 @@ pub fn Cell(comptime cfg: config_mod.Config) type {
 
         rune: Rune = ' ',
         /// Combining marks (width-0 glyphs overlaid on this cell).
-        combining: [cfg.font_max_combining]u32 = [_]u32{0} ** cfg.font_max_combining,
+        combining: [cfg.font_max_combining]u32 = @splat(0),
         combining_count: u8 = 0,
         fg: u32 = COLOR_DEFAULT,
         bg: u32 = COLOR_DEFAULT,

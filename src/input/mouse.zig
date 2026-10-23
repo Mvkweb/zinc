@@ -21,7 +21,7 @@ pub const MouseMode = enum {
 pub fn encodeSgr(btn: Button, pressed: bool, col: u16, row: u16, out: []u8) ![]u8 {
     const marker: u8 = if (pressed) 'M' else 'm';
     return std.fmt.bufPrint(out, "\x1b[<{d};{d};{d}{c}", .{
-        @intFromEnum(btn),
+        @backingInt(btn),
         col + 1,
         row + 1,
         marker,

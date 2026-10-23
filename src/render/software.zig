@@ -116,7 +116,7 @@ test "damage union + blend" {
     d.add(5, 5, 10, 10);
     try std.testing.expectEqual(@as(i32, 15), d.w);
     try std.testing.expect(blendArgb(0xFF000000, 0xFFFFFFFF, 128) != 0xFF000000);
-    var buf: [16]u32 = [_]u32{0} ** 16;
+    var buf: [16]u32 = @splat(0);
     fillRect(&buf, 4, 4, 0, 0, 2, 2, 0xFF112233, null);
     try std.testing.expectEqual(@as(u32, 0xFF112233), buf[0]);
 }
@@ -154,7 +154,7 @@ test "blendArgb matches exact reference" {
 }
 
 test "fillRect clips once, reports tight damage" {
-    var buf: [16]u32 = [_]u32{0xFF000000} ** 16;
+    var buf: [16]u32 = @splat(0xFF000000);
     var d = Damage{};
     fillRect(&buf, 4, 4, 2, 2, 4, 4, 0xFF112233, &d); // half OOB
     try std.testing.expectEqual(@as(u32, 0xFF112233), buf[2 * 4 + 2]);
@@ -170,7 +170,7 @@ test "fillRect clips once, reports tight damage" {
 }
 
 test "fillRectBlend fades over pixels, skips OOB" {
-    var buf: [16]u32 = [_]u32{0xFF000000} ** 16;
+    var buf: [16]u32 = @splat(0xFF000000);
     fillRectBlend(&buf, 4, 4, 1, 1, 2, 2, 0xFFFFFFFF, 128, null);
     try std.testing.expectEqual(@as(u32, 0xFF000000), buf[0]);
     try std.testing.expect(buf[1 * 4 + 1] != 0xFF000000 and buf[1 * 4 + 1] != 0xFFFFFFFF);
@@ -274,7 +274,7 @@ pub fn blitColorGlyph(
 test "blitGlyph paints coverage" {
     // 2x2 atlas, full coverage block at (0,0).
     const atlas_px = [_]u8{ 255, 255, 255, 255 };
-    var buf: [16]u32 = [_]u32{0xFF000000} ** 16;
+    var buf: [16]u32 = @splat(0xFF000000);
     const dmg = blitGlyph(&buf, 4, 4, &atlas_px, 2, 0, 0, 2, 2, 0, 2, 1, 2, 0xFFFFFFFF);
     try std.testing.expect(!dmg.empty);
     try std.testing.expect(buf[1 * 4 + 1] != 0xFF000000);
@@ -284,7 +284,7 @@ test "blitGlyph paints coverage" {
 test "blitColorGlyph blends premultiplied BGRA, skips transparent + OOB" {
     // 2x2 atlas: opaque red, transparent, premult half green, opaque blue.
     const atlas_px = [_]u32{ 0xFFFF0000, 0x00000000, 0x80008000, 0xFF0000FF };
-    var buf: [16]u32 = [_]u32{0xFF000000} ** 16;
+    var buf: [16]u32 = @splat(0xFF000000);
     const dmg = blitColorGlyph(&buf, 4, 4, &atlas_px, 2, 0, 0, 2, 2, 0, 2, 1, 2);
     try std.testing.expect(!dmg.empty);
     try std.testing.expectEqual(@as(u32, 0xFFFF0000), buf[0 * 4 + 1]);
@@ -344,7 +344,7 @@ pub fn blitRgba(
 test "blitRgba blends + clips" {
     // 2x2: opaque red, transparent, half green over black, opaque blue.
     const img = [_]u32{ 0xFFFF0000, 0x00000000, 0x8000FF00, 0xFF0000FF };
-    var buf: [16]u32 = [_]u32{0xFF000000} ** 16;
+    var buf: [16]u32 = @splat(0xFF000000);
     const dmg = blitRgba(&buf, 4, 4, &img, 2, 2, 2, 1, 1);
     try std.testing.expect(!dmg.empty);
     try std.testing.expectEqual(@as(u32, 0xFFFF0000), buf[1 * 4 + 1]);
@@ -352,7 +352,7 @@ test "blitRgba blends + clips" {
     try std.testing.expectEqual(@as(u32, 0xFF008000), buf[2 * 4 + 1]);
     try std.testing.expectEqual(@as(u32, 0xFF0000FF), buf[2 * 4 + 2]);
     // Clipped draw: only img(1,1) lands on buf2(0,0).
-    var buf2: [4]u32 = [_]u32{0xFF000000} ** 4;
+    var buf2: [4]u32 = @splat(0xFF000000);
     const d2 = blitRgba(&buf2, 2, 2, &img, 2, 2, 2, -1, -1);
     try std.testing.expect(!d2.empty);
     try std.testing.expectEqual(@as(u32, 0xFF0000FF), buf2[0]);
@@ -406,7 +406,7 @@ pub fn drawMicroDigit(buf: []u32, stride: u32, height: u32, x: i32, y: i32, digi
 }
 
 test "micro digits draw + clip" {
-    var buf: [64]u32 = [_]u32{0xFF000000} ** 64;
+    var buf: [64]u32 = @splat(0xFF000000);
     const d = drawMicroDigit(&buf, 8, 8, 1, 1, 8, 0xFFFFFFFF, 1);
     try std.testing.expect(!d.empty);
     // Digit 8 top row is solid: pixels (1..3, 1) set, (0, 1) clear.
@@ -417,13 +417,13 @@ test "micro digits draw + clip" {
     try std.testing.expect(drawMicroDigit(&buf, 8, 8, 0, 0, 10, 0xFFFFFFFF, 1).empty);
     try std.testing.expect(drawMicroDigit(&buf, 8, 8, 100, 100, 5, 0xFFFFFFFF, 1).empty);
     // All digits produce damage on a big buffer.
-    var big: [256]u32 = [_]u32{0} ** 256;
+    var big: [256]u32 = @splat(0);
     var dd: u8 = 0;
     while (dd < 10) : (dd += 1) {
         try std.testing.expect(!drawMicroDigit(&big, 16, 16, 0, 0, dd, 0xFFFFFFFF, 1).empty);
     }
     // Scale 2 fills 2x2 blocks: digit 1's top row (only middle pixel).
-    var s2: [256]u32 = [_]u32{0xFF000000} ** 256;
+    var s2: [256]u32 = @splat(0xFF000000);
     try std.testing.expect(!drawMicroDigit(&s2, 16, 16, 0, 0, 1, 0xFFFFFFFF, 2).empty);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), s2[0 * 16 + 2]);
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), s2[1 * 16 + 3]);

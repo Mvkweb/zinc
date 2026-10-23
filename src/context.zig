@@ -59,12 +59,12 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         osc_buf: std.ArrayList(u8),
         /// Split multibyte tail carried into the next parse() call. A char
         /// straddling two PTY reads must not become U+FFFD tofu.
-        utf8_carry: [4]u8 = [_]u8{0} ** 4,
+        utf8_carry: [4]u8 = @splat(0),
         utf8_carry_len: u8 = 0,
         utf8_carry_need: u8 = 0,
         /// Shell working directory from OSC 7 (empty = unknown). Used to
         /// resolve relative Ctrl+click file paths.
-        cwd_buf: [4096]u8 = [_]u8{0} ** 4096,
+        cwd_buf: [4096]u8 = @splat(0),
         cwd_len: usize = 0,
         /// Row-switch write tracking for per-row cwd stamps (click
         /// resolution): the last viewport row stamped, and whether the
@@ -86,11 +86,11 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         scratch_backing: []u8,
         write_cb: ?WriteCb = null,
         write_user: ?*anyopaque = null,
-        palette: [256]u32 = [_]u32{0} ** 256,
+        palette: [256]u32 = @splat(0),
         fg: u32 = cfg.fg,
         bg: u32 = cfg.bg,
         cursor_color: u32 = cfg.cursor_color,
-        title: [256]u8 = [_]u8{0} ** 256,
+        title: [256]u8 = @splat(0),
         title_len: usize = 0,
         /// Cursor blink phase. Reset to visible on any parsed output.
         blink_visible: bool = true,

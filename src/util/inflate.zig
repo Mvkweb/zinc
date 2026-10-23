@@ -46,9 +46,9 @@ const MAX_BITS = 15;
 
 /// Canonical Huffman decode tables (JPEG-style first-code per length).
 const Huffman = struct {
-    first: [16]i32 = [_]i32{0} ** 16,
-    count: [16]u16 = [_]u16{0} ** 16,
-    offs: [16]usize = [_]usize{0} ** 16,
+    first: [16]i32 = @splat(0),
+    count: [16]u16 = @splat(0),
+    offs: [16]usize = @splat(0),
     symbols: []u16, // sorted by (length, symbol); caller-owned frame storage
 };
 
@@ -159,7 +159,7 @@ pub fn decompressBounded(gpa: std.mem.Allocator, src: []const u8, max_out: usize
     }
     var fixed_lit_syms: [288]u16 = undefined;
     const fixed_lit = try buildHuffman(&fixed_lit_lens, 288, &fixed_lit_syms);
-    var fixed_dist_lens: [30]u8 = [_]u8{5} ** 30;
+    var fixed_dist_lens: [30]u8 = @splat(5);
     var fixed_dist_syms: [30]u16 = undefined;
     const fixed_dist = try buildHuffman(&fixed_dist_lens, 30, &fixed_dist_syms);
 
@@ -183,13 +183,13 @@ pub fn decompressBounded(gpa: std.mem.Allocator, src: []const u8, max_out: usize
                 const hdist: usize = @intCast(try br.take(5) + 1);
                 const hclen: usize = @intCast(try br.take(4) + 4);
                 if (hlit > 288 or hdist > 32 or hclen > 19) return error.InvalidData;
-                var cl_lens: [19]u8 = [_]u8{0} ** 19;
+                var cl_lens: [19]u8 = @splat(0);
                 for (CL_ORDER[0..hclen]) |sym| {
                     cl_lens[sym] = @intCast(try br.take(3));
                 }
                 var cl_syms: [19]u16 = undefined;
                 const cl = try buildHuffman(&cl_lens, 19, &cl_syms);
-                var lens: [320]u8 = [_]u8{0} ** 320;
+                var lens: [320]u8 = @splat(0);
                 const total = hlit + hdist;
                 var li: usize = 0;
                 var prev: u8 = 0;

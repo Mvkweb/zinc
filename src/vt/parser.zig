@@ -35,7 +35,7 @@ pub const Action = union(enum) {
 
 pub const Parser = struct {
     state: State = .ground,
-    params: [16]u16 = [_]u16{0} ** 16,
+    params: [16]u16 = @splat(0),
     param_count: u8 = 0,
     priv: bool = false,
     /// Set by '<', '=', '>' markers: a non-DEC sequence (modifyOtherKeys,
@@ -43,18 +43,18 @@ pub const Parser = struct {
     /// '?' alone keeps DEC semantics (DECSET/RM, kitty-kb queries).
     csi_alt: bool = false,
     /// Parallel to params: true when the entry followed a ':' (sub-param).
-    sub: [16]bool = [_]bool{false} ** 16,
+    sub: [16]bool = @splat(false),
     osc_len: usize = 0,
     esc_pending: bool = false, // saw ESC inside osc/apc/dcs (possible ST)
     utf8_acc: u21 = 0,
     utf8_remaining: u3 = 0,
 
     pub fn resetParams(self: *Parser) void {
-        self.params = [_]u16{0} ** 16;
+        self.params = @splat(0);
         self.param_count = 0;
         self.priv = false;
         self.csi_alt = false;
-        self.sub = [_]bool{false} ** 16;
+        self.sub = @splat(false);
     }
 
     /// Feed one byte; returns an action or null. OSC payload bytes are

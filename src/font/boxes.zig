@@ -55,7 +55,7 @@ fn vline(buf: []u32, stride: u32, height: u32, cx: u32, y0: u32, cy: u32, h: u32
 }
 
 test "boxes paint line" {
-    var buf: [64]u32 = [_]u32{0} ** 64;
+    var buf: [64]u32 = @splat(0);
     draw(&buf, 8, 8, 0x2500, 0, 0, 8, 8, 0xFFFFFFFF);
     try std.testing.expect(buf[4 * 8] != 0);
 }

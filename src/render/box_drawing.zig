@@ -388,7 +388,7 @@ fn drawBoxDrawing(
 }
 
 test "block element coverage" {
-    var buf = [_]u32{0} ** (10 * 20);
+    var buf: [10 * 20]u32 = @splat(0);
     var dmg = software.Damage{};
     // Full block
     try std.testing.expect(draw(&buf, 10, 20, 0, 0, 10, 20, 0x2588, 0xFFFFFFFF, &dmg));
@@ -396,7 +396,7 @@ test "block element coverage" {
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), buf[199]);
 
     // Box drawing horizontal
-    var buf2 = [_]u32{0} ** (10 * 20);
+    var buf2: [10 * 20]u32 = @splat(0);
     var dmg2 = software.Damage{};
     try std.testing.expect(draw(&buf2, 10, 20, 0, 0, 10, 20, 0x2500, 0xFFFFFFFF, &dmg2));
     // Mid row should be painted

@@ -578,7 +578,7 @@ test "horizontal reflow does not pull unrelated scrollback rows" {
     defer g.deinit();
 
     // Push 3 lines to scrollback (20 'S' characters each)
-    var dummy: [20]cell_mod.Cell(cfg) = [_]cell_mod.Cell(cfg){.{}} ** 20;
+    var dummy: [20]cell_mod.Cell(cfg) = @splat(.{});
     for (&dummy) |*c| c.setRune('S');
     g.pushScrollbackRow(&dummy);
     g.pushScrollbackRow(&dummy);
@@ -703,7 +703,7 @@ test "mixed-width scrollback heals even on height-only resize" {
     g.at(0, 0).setRune('A');
     g.scrollUp(true); // sb = [A...] at width 4
     // Simulate a stale narrow row left by an earlier thin excursion.
-    var stale: [2]cell_mod.Cell(cfg) = [_]cell_mod.Cell(cfg){.{}} ** 2;
+    var stale: [2]cell_mod.Cell(cfg) = @splat(.{});
     stale[0].setRune('X');
     stale[1].setRune('Y');
     g.pushScrollbackRow(&stale);
@@ -735,12 +735,12 @@ test "widen-back refills screen from scrollback" {
     var g = try G.init(std.testing.allocator, 4, 2);
     defer g.deinit();
 
-    var head0: [4]cell_mod.Cell(cfg) = [_]cell_mod.Cell(cfg){.{}} ** 4;
+    var head0: [4]cell_mod.Cell(cfg) = @splat(.{});
     head0[0].setRune('A');
     head0[1].setRune('B');
     head0[2].setRune('C');
     head0[3].setRune('D');
-    var head1: [4]cell_mod.Cell(cfg) = [_]cell_mod.Cell(cfg){.{}} ** 4;
+    var head1: [4]cell_mod.Cell(cfg) = @splat(.{});
     head1[0].setRune('E');
     head1[1].setRune('F');
     head1[2].setRune('G');
@@ -776,7 +776,7 @@ test "pull heals chain split across scrollback boundary" {
     defer g.deinit();
 
     // sb tail "CD" (2-col wrapped row) continues onto screen row 0 "EF" (one logical "CDEF").
-    var tail: [2]cell_mod.Cell(cfg) = [_]cell_mod.Cell(cfg){.{}} ** 2;
+    var tail: [2]cell_mod.Cell(cfg) = @splat(.{});
     tail[0].setRune('C');
     tail[1].setRune('D');
     tail[1].wrapped = true;

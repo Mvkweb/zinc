@@ -7,7 +7,7 @@ const std = @import("std");
 pub const MAX_COLORS = 256;
 
 pub const Sixel = struct {
-    palette: [MAX_COLORS]u32 = [_]u32{0} ** MAX_COLORS,
+    palette: [MAX_COLORS]u32 = @splat(0),
     w: u32 = 0,
     h: u32 = 0,
     cur_x: u32 = 0,
@@ -76,7 +76,7 @@ test "sixel hls + band paint" {
     try std.testing.expectEqual(@as(u32, 0xFF000000), Sixel.hlsToRgb(0, 0, 0));
     try std.testing.expectEqual(@as(u32, 0xFFFFFFFF), Sixel.hlsToRgb(0, 100, 0));
     var sx = Sixel{};
-    var px: [64]u32 = [_]u32{0} ** 64;
+    var px: [64]u32 = @splat(0);
     sx.paintBand(&px, 8, 0b101010, 0xFFFF0000);
     try std.testing.expectEqual(@as(u32, 1), sx.cur_x);
     try std.testing.expect(px[8] != 0); // second row bit set

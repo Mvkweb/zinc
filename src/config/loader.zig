@@ -126,7 +126,7 @@ pub fn loadOrCreate(gpa: std.mem.Allocator) RuntimeConfig {
     if (std.c.getenv("XDG_CONFIG_HOME")) |xdg| {
         const xdg_s = std.mem.span(xdg);
         if (xdg_s.len > 0) {
-            dir_path = std.fmt.bufPrintZ(&dir_buf, "{s}/zinc", .{xdg_s}) catch return RuntimeConfig{};
+            dir_path = std.mem.printSentinel(&dir_buf, "{s}/zinc", .{xdg_s}, 0) catch return RuntimeConfig{};
         }
     }
 
@@ -134,7 +134,7 @@ pub fn loadOrCreate(gpa: std.mem.Allocator) RuntimeConfig {
         if (std.c.getenv("HOME")) |home| {
             const home_s = std.mem.span(home);
             if (home_s.len > 0) {
-                dir_path = std.fmt.bufPrintZ(&dir_buf, "{s}/.config/zinc", .{home_s}) catch return RuntimeConfig{};
+                dir_path = std.mem.printSentinel(&dir_buf, "{s}/.config/zinc", .{home_s}, 0) catch return RuntimeConfig{};
             }
         }
     }
@@ -151,14 +151,14 @@ pub fn loadOrCreateAt(gpa: std.mem.Allocator, dir_path: [:0]const u8) RuntimeCon
     // Best-effort directory setup (EEXIST ignored, like before).
     if (std.mem.lastIndexOfScalar(u8, dir_path, '/')) |slash| {
         var parent_buf: [512:0]u8 = undefined;
-        if (std.fmt.bufPrintZ(&parent_buf, "{s}", .{dir_path[0..slash]}) catch null) |parent| {
+        if (std.mem.printSentinel(&parent_buf, "{s}", .{dir_path[0..slash]}, 0) catch null) |parent| {
             _ = linux.mkdir(parent.ptr, 0o755);
         }
     }
     _ = linux.mkdir(dir_path.ptr, 0o755);
 
     var file_buf: [512:0]u8 = undefined;
-    const file_path = std.fmt.bufPrintZ(&file_buf, "{s}/config", .{dir_path}) catch return cfg;
+    const file_path = std.mem.printSentinel(&file_buf, "{s}/config", .{dir_path}, 0) catch return cfg;
 
     // Try to open existing config file for reading
     const rc = linux.open(file_path.ptr, .{ .ACCMODE = .RDONLY }, 0);
@@ -183,7 +183,7 @@ pub fn loadOrCreateAt(gpa: std.mem.Allocator, dir_path: [:0]const u8) RuntimeCon
         // and config.new is only rewritten while it is itself outdated.
         if (needsMigration(buf[0..total_read])) {
             var new_buf: [512:0]u8 = undefined;
-            const new_path = std.fmt.bufPrintZ(&new_buf, "{s}/config.new", .{dir_path}) catch null;
+            const new_path = std.mem.printSentinel(&new_buf, "{s}/config.new", .{dir_path}, 0) catch null;
             if (new_path) |np| {
                 var stale = true;
                 const nrc = linux.open(np.ptr, .{ .ACCMODE = .RDONLY }, 0);

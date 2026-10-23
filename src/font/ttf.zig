@@ -63,13 +63,15 @@ pub fn numGlyphs(maxp: []const u8) ParseError!u16 {
 }
 
 test "ttf header rejects garbage" {
-    try std.testing.expectError(ParseError.TooShort, parseTableDir(&[_]u8{0} ** 4));
-    try std.testing.expectError(ParseError.BadMagic, parseTableDir(&[_]u8{0} ** 12));
+    const zeros4: [4]u8 = @splat(0);
+    const zeros12: [12]u8 = @splat(0);
+    try std.testing.expectError(ParseError.TooShort, parseTableDir(&zeros4));
+    try std.testing.expectError(ParseError.BadMagic, parseTableDir(&zeros12));
 }
 
 test "ttf synthetic header parses" {
     // sfnt 0x00010000, 1 table: 'head' at off 28 len 54.
-    var buf: [82]u8 = [_]u8{0} ** 82;
+    var buf: [82]u8 = @splat(0);
     buf[0] = 0;
     buf[1] = 1;
     buf[2] = 0;

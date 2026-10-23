@@ -106,7 +106,7 @@ fn smokeMain(gpa: std.mem.Allocator, io: std.Io) !void {
     var transcript = try std.ArrayList(u8).initCapacity(gpa, 8192);
     defer transcript.deinit(gpa);
     // Overlap window so queries split across reads are still matched.
-    var overlap: [16]u8 = [_]u8{0} ** 16;
+    var overlap: [16]u8 = @splat(0);
     var overlap_len: usize = 0;
     var total_bytes: usize = 0;
 
