@@ -2125,9 +2125,9 @@ test "kitty legacy tiled placement stores geometry" {
     ctx.onWrite(Sink.cb, &sink);
     ctx.cursor_col = 5;
     ctx.cursor_row = 3;
-    // 2x1 RGBA white ("/////////w==" = 8x 0xFF), transmit-and-place
+    // 2x1 RGBA white ("//////////8=" = 8x 0xFF), transmit-and-place
     // at the cursor (quiet).
-    ctx.parse("\x1b_Ga=t,f=32,s=2,v=1,i=50,q=2;/////////w==\x1b\\");
+    ctx.parse("\x1b_Ga=t,f=32,s=2,v=1,i=50,q=2;//////////8=\x1b\\");
     try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
     const base = ctx.images.placements.items[0];
     try std.testing.expectEqual(@as(u32, 0), base.src_w); // legacy: full image

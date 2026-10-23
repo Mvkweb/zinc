@@ -370,7 +370,7 @@ test "wordSpanAt catches bare ls names" {
     const G = grid_mod.Grid(.{});
     var g = try G.init(std.testing.allocator, 64, 4);
     defer g.deinit();
-    const line = "src main.zig";
+    const line = "src bin";
     for (line, 0..) |ch, i| g.at(@intCast(i), 0).setRune(ch);
     // spanAt rejects both (no slash/dot gate)...
     try std.testing.expect(spanAt(&g, 0, 1) == null);
@@ -379,9 +379,9 @@ test "wordSpanAt catches bare ls names" {
     const w0 = wordSpanAt(&g, 0, 1) orelse return error.Fail;
     try std.testing.expectEqual(@as(u16, 0), w0.c0);
     try std.testing.expectEqual(@as(u16, 2), w0.c1);
-    const w1 = wordSpanAt(&g, 0, 6) orelse return error.Fail;
+    const w1 = wordSpanAt(&g, 0, 5) orelse return error.Fail;
     var tbuf: [64]u8 = undefined;
-    try std.testing.expectEqualStrings("main.zig", spanText(&g, 0, w1, &tbuf));
+    try std.testing.expectEqualStrings("bin", spanText(&g, 0, w1, &tbuf));
     // Whitespace is not a word.
     try std.testing.expect(wordSpanAt(&g, 0, 3) == null);
 }
