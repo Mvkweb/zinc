@@ -19,7 +19,7 @@ If you want to see the full breakdown of everything zinc does, check [features.m
 
 ## Dependencies
 
-- Zig 0.16.0
+- Zig 0.17.0
 - wayland-client
 - libxkbcommon
 - freetype2
@@ -31,7 +31,7 @@ On Arch:
 sudo pacman -S zig wayland libxkbcommon freetype2 fontconfig
 ```
 
-Note: built with Zig 0.16.0.
+Note: built with Zig 0.17.0.
 
 ## Build
 
@@ -86,21 +86,15 @@ makepkg -si
 To uninstall, run the built-in uninstall command pointing to your prefix:
 
 ```bash
-zig build uninstall --prefix ~/.local
+zig build uninstall -Duninstall-prefix=$HOME/.local
 update-desktop-database ~/.local/share/applications
 ```
 
 Or for system-wide installs:
 
 ```bash
-sudo zig build uninstall --prefix /usr/local
+sudo zig build uninstall -Duninstall-prefix=/usr/local
 sudo update-desktop-database /usr/local/share/applications
 ```
 
 Your configuration at `~/.config/zinc/config` stays untouched.
-
-
-## Known issues
-
-- Hard resizes can strand one stray character. Content restores fine.
-  Cause unknown, see `src/term/reflow.zig`.

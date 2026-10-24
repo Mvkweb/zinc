@@ -10,8 +10,8 @@ arch=('x86_64' 'aarch64')
 url="https://github.com/Mvkweb/zinc"
 license=('MIT')
 depends=('wayland' 'libxkbcommon' 'freetype2' 'fontconfig')
-makedepends=('git' 'zig>=0.16' 'zig<0.17' 'pkgconf')
-# Requires Zig 0.16.x (see build.zig.zon minimum_zig_version).
+makedepends=('git' 'zig>=0.17' 'pkgconf')
+# Requires Zig 0.17.x (see build.zig.zon minimum_zig_version).
 source=("git+$url.git#tag=v$pkgver")
 sha256sums=('SKIP')
 

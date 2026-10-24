@@ -4,7 +4,6 @@ Type=Application
 Name=Zinc
 GenericName=Terminal Emulator
 Comment=A terminal written in Zig
-TryExec=zinc
 Exec=zinc
 Icon=io.github.mvkweb.zinc
 Terminal=false
