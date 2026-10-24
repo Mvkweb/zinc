@@ -252,7 +252,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
         cursor_style: config_mod.CursorStyle = cfg.cursor_style,
         cursor_blink: bool = cfg.cursor_blink,
         cursor_thick_px: f32 = cfg.cursor_thick_px,
-        cursor_mode: config_mod.CursorMode = cfg.cursor_mode,
         selection_single_cell: bool = cfg.selection_single_cell,
 
         display: ?*c.wl_display = null,
@@ -431,7 +430,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
         is_resizing: bool = false,
         last_activity_ms: i64 = 0,
         idle_trimmed: bool = false,
-        cursor_only_render: bool = false,
 
         pty_pid: i32 = 0,
         pty_fd: i32 = -1,
@@ -536,7 +534,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .cursor_style = runtime_cfg.cursor_style orelse cfg.cursor_style,
                 .cursor_blink = runtime_cfg.cursor_blink orelse cfg.cursor_blink,
                 .cursor_thick_px = runtime_cfg.cursor_thick_px orelse cfg.cursor_thick_px,
-                .cursor_mode = runtime_cfg.cursor_mode orelse cfg.cursor_mode,
                 .selection_single_cell = runtime_cfg.selection_single_cell orelse cfg.selection_single_cell,
                 .find_numbers = runtime_cfg.find_match_numbers orelse cfg.find_match_numbers,
                 .find_num_scale = runtime_cfg.find_number_scale orelse cfg.find_number_scale,
@@ -1852,7 +1849,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Cursor trail: fading departure cells under the live cursor.
             // Drawn first so the gliding cursor paints on top. Shares the
             // cursor's visibility: no ghosts while hidden.
-            const show_cursor = (!(self.ctx.decscusr_blink orelse self.cursor_blink) or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0 and !self.copy_active and !self.cursorSuppressedNow();
+            const show_cursor = (!(self.ctx.decscusr_blink orelse self.cursor_blink) or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0 and !self.copy_active;
             if (show_cursor and self.trail_ms > 0 and self.flow.trail_n > 0) {
                 const tcol = self.themed(self.ctx.cursor_color, false);
                 const tt: u32 = @intCast(@max(1, @as(i32, @intFromFloat(@ceil(self.cursor_thick_px)))));
@@ -1874,8 +1871,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Block cursor; hollow outline when unfocused; hidden on blink
             // phase, DECSET 25 reset, or while scrolled into history.
             if (show_cursor and self.ctx.cursor_col < visible_cols and self.ctx.cursor_row < visible_rows) {
-                // Glide: interpolated position, stretched toward the target
-                // while far from rest (clamped to one cell per axis).
+                // Glide: interpolated position, stretched horizontally toward the target
+                // while far from rest (clamped to one cell along the axis of travel).
+                // Height stays strictly within the cell so vertical travel never stabs into adjacent rows.
                 const gp = self.flow.cursorPx();
                 const ccx: i32 = px + gp.x;
                 const ccy: i32 = py + gp.y + fyshift;
@@ -1884,23 +1882,20 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 const chu: i32 = ch;
                 const t: i32 = @max(1, @as(i32, @intFromFloat(@ceil(self.cursor_thick_px))));
                 const tgtx: i32 = @as(i32, self.ctx.cursor_col) * cw;
-                const tgty: i32 = @as(i32, self.ctx.cursor_row) * ch;
                 const sdx: i32 = @min(cw, @as(i32, @intFromFloat(@round(@abs(@as(f32, @floatFromInt(tgtx - gp.x)) / 2.0)))));
-                const sdy: i32 = @min(ch, @as(i32, @intFromFloat(@round(@abs(@as(f32, @floatFromInt(tgty - gp.y)) / 2.0)))));
                 const sx0: i32 = if (tgtx < gp.x) -sdx else 0;
-                const sy0: i32 = if (tgty < gp.y) -sdy else 0;
                 if (self.ctx.focused) {
                     switch (self.ctx.decscusr_style orelse self.cursor_style) {
-                        .block => software.fillRect(self.pool_pixels, W, H, @intCast(@max(0, ccx + sx0)), @intCast(@max(0, ccy + sy0)), @intCast(cwu + sdx), @intCast(chu + sdy), cur, &dmg),
-                        .bar => software.fillRect(self.pool_pixels, W, H, @intCast(@max(0, ccx + sx0)), @intCast(@max(0, ccy + sy0)), @intCast(@min(t, cwu) + sdx), @intCast(chu + sdy), cur, &dmg),
-                        .underline => software.fillRect(self.pool_pixels, W, H, @intCast(@max(0, ccx + sx0)), @intCast(@max(0, ccy + chu - t + sy0)), @intCast(cwu + sdx), @intCast(t + sdy), cur, &dmg),
+                        .block => software.fillRect(self.pool_pixels, W, H, @intCast(@max(0, ccx + sx0)), @intCast(@max(0, ccy)), @intCast(cwu + sdx), @intCast(chu), cur, &dmg),
+                        .bar => software.fillRect(self.pool_pixels, W, H, @intCast(@max(0, ccx + sx0)), @intCast(@max(0, ccy)), @intCast(@min(t, cwu) + sdx), @intCast(chu), cur, &dmg),
+                        .underline => software.fillRect(self.pool_pixels, W, H, @intCast(@max(0, ccx + sx0)), @intCast(@max(0, ccy + chu - t)), @intCast(cwu + sdx), @intCast(t), cur, &dmg),
                     }
                 } else {
                     const ot: u32 = @intCast(@max(1, @divFloor(cw, 8)));
                     const ox: u32 = @intCast(@max(0, ccx + sx0));
-                    const oy: u32 = @intCast(@max(0, ccy + sy0));
+                    const oy: u32 = @intCast(@max(0, ccy));
                     const ow: u32 = @intCast(cwu + sdx);
-                    const oh: u32 = @intCast(chu + sdy);
+                    const oh: u32 = @intCast(chu);
                     software.fillRect(self.pool_pixels, W, H, ox, oy, ow, ot, cur, &dmg);
                     software.fillRect(self.pool_pixels, W, H, ox, oy + oh - ot, ow, ot, cur, &dmg);
                     software.fillRect(self.pool_pixels, W, H, ox, oy, ot, oh, cur, &dmg);
@@ -1965,130 +1960,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // it paints them, above.) Skipped mid-glide: fractional frames
             // paint interpolated rows, so flags settle exact at rest.
             if (full and !self.flow.scroll_moving) self.ctx.grid.markAllClean();
-            return dmg;
-        }
-
-        /// cursor-mode=auto: on the alt screen, suppress zinc's own cursor
-        /// when the tracked cell already holds an app-drawn fake caret
-        /// (reverse video, blank+underline, or a colored block/bar). Only
-        /// evaluated once the glide has landed — mid-flight frames keep
-        /// drawing so motion stays visible, and the settle frame's overlay
-        /// bit forces the repaint that drops the duplicate.
-        fn cursorSuppressedNow(self: *Self) bool {
-            if (!cfg.alt_screen or !self.ctx.alt_active) return false;
-            if (self.cursor_mode != .auto) return false;
-            if (!self.ctx.show_cursor or self.ctx.grid.view_offset != 0 or self.copy_active) return false;
-            if (!self.flow.settled()) return false;
-            if (self.ctx.cursor_col >= self.ctx.grid.cols or self.ctx.cursor_row >= self.ctx.grid.rows) return false;
-            const cell_ptr = self.ctx.grid.viewCell(self.ctx.cursor_col, self.ctx.cursor_row) orelse return false;
-            return cell_mod.looksAppDrawn(cell_ptr.*);
-        }
-
-        fn renderCursorCell(self: *Self) software.Damage {
-            var dmg = software.Damage{};
-            const W: u32 = @intCast(self.width);
-            const H: u32 = @intCast(self.height);
-            const offsets = self.cellOffsets();
-            const px: i32 = offsets.x;
-            const py: i32 = offsets.y;
-            const cw: i32 = self.cell_w;
-            const ch: i32 = self.cell_h;
-            const col = self.ctx.cursor_col;
-            const row = self.ctx.cursor_row;
-
-            // Match renderCells' row placement: while a scroll glide is in
-            // flight rows sit at a shifted y, and a single-cell fast frame
-            // cannot cover that — take the full path instead.
-            if (self.flow.scrollShiftPx(ch) != 0) return self.renderCells();
-
-            if (col >= self.ctx.grid.cols or row >= self.ctx.grid.rows) return dmg;
-            const ccx_i: i32 = px + @as(i32, col) * cw;
-            const ccy_i: i32 = py + @as(i32, row) * ch;
-            const ccx: u32 = @intCast(ccx_i);
-            const ccy: u32 = @intCast(ccy_i);
-            const cwu: u32 = @intCast(cw);
-            const chu: u32 = @intCast(ch);
-
-            // 1. Fill the cursor cell background
-            const cell_ptr = self.ctx.grid.viewCell(col, row);
-            const cell = if (cell_ptr) |cp| cp.* else cell_mod.Cell(cfg){};
-            const is_selected = self.isCellSelected(col, row, @min(self.ctx.grid.view_offset, self.ctx.grid.sb_len));
-            const is_reversed = cell.attr.reverse;
-            const is_def_bg = cell_mod.isDefaultColor(cell.bg) and !is_reversed and !is_selected;
-
-            var bg_straight: u32 = undefined;
-            if (is_selected) {
-                bg_straight = self.selection_bg & 0xFFFFFF;
-            } else if (is_reversed) {
-                bg_straight = self.resolveFg(cell.fg) & 0xFFFFFF;
-            } else if (cell_mod.isDefaultColor(cell.bg)) {
-                bg_straight = self.ctx.bg & 0xFFFFFF;
-            } else if (cell_mod.isIndexedColor(cell.bg)) {
-                bg_straight = self.ctx.palette[cell_mod.colorIndex(cell.bg)] & 0xFFFFFF;
-            } else {
-                bg_straight = cell.bg & 0xFFFFFF;
-            }
-            const bg_color = self.themed(bg_straight, is_def_bg);
-            software.fillRect(self.pool_pixels, W, H, ccx, ccy, cwu, chu, bg_color, &dmg);
-
-            // 2. Draw glyph if non-blank
-            if (cell.rune != 0 and cell.rune != ' ') {
-                const fg_straight = if (is_selected)
-                    self.selection_fg & 0xFFFFFF
-                else if (is_reversed)
-                    self.resolveBg(cell.bg) & 0xFFFFFF
-                else
-                    self.resolveFg(cell.fg) & 0xFFFFFF;
-                const fg_color = self.themed(fg_straight, false);
-                const cp = cellCp(cell.rune);
-                var drawn_box = false;
-                if (box_drawing.isBlockElement(cp)) {
-                    drawn_box = box_drawing.draw(self.pool_pixels, W, H, ccx, ccy, cw, ch, cp, fg_color, &dmg);
-                }
-                if (!drawn_box) {
-                    const style: ft_mod.Style = if (cell.attr.bold and cell.attr.italic)
-                        .bold_italic
-                    else if (cell.attr.bold)
-                        .bold
-                    else if (cell.attr.italic)
-                        .italic
-                    else
-                        .regular;
-                    // Native ligature or the base digit below (plate and
-                    // legend handled in the full-frame path; cursor-only
-                    // repaints of a ligature cell redraw it whole here).
-                    const lig = self.blitKeycapLigature(cellCp(cell.rune), cell.combining[0..cell.combining_count], ccx, ccy, W, H, &dmg);
-                    if (!lig) {
-                        const plate_dark = self.blitKeycapPlate(cell.combining[0..cell.combining_count], style, ccx, ccy, fg_color, W, H, &dmg);
-                        if (self.glyphFor(cp, style)) |g| {
-                            // Keycap legend keeps its baked contrast color here
-                            // too (cursor-only repaints must match full frames).
-                            const legend_fg = if (plate_dark) |dark| (if (dark) @as(u32, 0xFF000000) else @as(u32, 0xFFFFFFFF)) else fg_color;
-                            self.blitCellGlyph(g, ccx, ccy, legend_fg, W, H, &dmg);
-                        }
-                    }
-                }
-            }
-
-            // 3. Draw cursor overlay if visible
-            const show_cursor = (!(self.ctx.decscusr_blink orelse self.cursor_blink) or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0 and !self.cursorSuppressedNow();
-            if (show_cursor) {
-                const cur = self.themed(self.ctx.cursor_color, false);
-                const t: u32 = @intCast(@max(1, @as(i32, @intFromFloat(@ceil(self.cursor_thick_px)))));
-                if (self.ctx.focused) {
-                    switch (self.ctx.decscusr_style orelse self.cursor_style) {
-                        .block => software.fillRect(self.pool_pixels, W, H, ccx, ccy, cwu, chu, cur, &dmg),
-                        .bar => software.fillRect(self.pool_pixels, W, H, ccx, ccy, @min(t, cwu), chu, cur, &dmg),
-                        .underline => software.fillRect(self.pool_pixels, W, H, ccx, ccy + chu - t, cwu, t, cur, &dmg),
-                    }
-                } else {
-                    const ot: u32 = @intCast(@max(1, @divFloor(cw, 8)));
-                    software.fillRect(self.pool_pixels, W, H, ccx, ccy, cwu, ot, cur, &dmg);
-                    software.fillRect(self.pool_pixels, W, H, ccx, ccy + chu - ot, cwu, ot, cur, &dmg);
-                    software.fillRect(self.pool_pixels, W, H, ccx, ccy, ot, chu, cur, &dmg);
-                    software.fillRect(self.pool_pixels, W, H, ccx + cwu - ot, ccy, ot, chu, cur, &dmg);
-                }
-            }
             return dmg;
         }
 
@@ -2257,17 +2128,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // removed last image must repaint the text beneath (ghost
             // otherwise). Presence bit transitions force that frame.
             if (cfg.kitty_gfx and self.ctx.images.placements.items.len > 0) ob |= 256;
-            ob |= @as(u32, @backingInt(self.ctx.decscusr_style orelse .block)) << 8;
-            if (self.ctx.decscusr_blink orelse false) ob |= 0x1000;
-            // IME preedit paints glyph+underline overlay pixels that no
-            // cell owns; when it drops (ti-leave, enable reset, finish)
-            // no dirty row describes the erasure, so a presence change
-            // must force the full repaint that erases the stale overlay
-            // (the lingering underline "dot" after Ctrl+R overlays).
-            if (cfg.ime and self.ime.focused and self.ime.preedit_len > 0) ob |= 0x2000;
-            // Auto cursor suppression flips without any cell write; the
-            // settle frame must repaint the cell that held the cursor.
-            if (self.cursorSuppressedNow()) ob |= 0x4000;
+            const cur_style = self.ctx.decscusr_style orelse self.cursor_style;
+            ob |= (@as(u32, @backingInt(cur_style)) + 1) << 8;
+            if (self.ctx.decscusr_style != null) ob |= 0x800;
+            const cur_blink = self.ctx.decscusr_blink orelse self.cursor_blink;
+            if (cur_blink) ob |= 0x1000;
+            if (self.ctx.decscusr_blink != null) ob |= 0x2000;
+            // Preedit overlay and flow animation transitions: ending preedit
+            // or landing a cursor glide / smooth scroll must force a full
+            // frame so all intermediate pixels are wiped clean.
+            if (cfg.ime and self.ime.focused and self.ime.preedit_len > 0) ob |= 0x4000;
+            if (!self.flow.settled()) ob |= 0x8000;
             if (ob != self.last_overlay) {
                 self.ctx.grid.markAllDirty();
                 self.last_overlay = ob;
@@ -2302,23 +2173,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 if (stepped != self.sb_alpha) {
                     self.sb_alpha = stepped;
                     if (self.sb_alpha == 0) self.ctx.grid.markAllDirty();
-                    self.cursor_only_render = false;
                     self.needs_render = true;
                 }
                 self.sb_last_ms = flow_now;
             }
             const is_prof = self.profile_on;
             const t0: i64 = if (is_prof) context_mod.nowMs() else 0;
-            const is_cursor_only = self.cursor_only_render and
-                self.pending_resize == null and
-                self.resize_settle_ms == 0 and
-                !self.ctx.grid.dirty_all and
-                !self.copy_active and
-                !cursor_moved and
-                !(cfg.ime and self.ime.focused and self.ime.preedit_len > 0) and
-                self.flow.settled();
-            self.cursor_only_render = false;
-            const dmg = if (is_cursor_only) self.renderCursorCell() else self.renderCells();
+            const dmg = self.renderCells();
             const t1: i64 = if (is_prof) context_mod.nowMs() else 0;
             if (is_prof) {
                 prof_frames += 1;
@@ -2413,7 +2274,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
                 if ((fds[1].revents & linux.POLL.IN) != 0) {
                     self.markActivity();
-                    self.cursor_only_render = false;
                     const drain_t0 = context_mod.nowMs();
                     while (true) {
                         const rrc = linux.read(self.pty_fd, &pty_buf, pty_buf.len);
@@ -2449,7 +2309,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 }
                 if (nfds == 3 and (fds[2].revents & linux.POLL.IN) != 0) {
                     self.markActivity();
-                    self.cursor_only_render = false;
                     // Repeat tick: drain the timer, re-emit, go periodic.
                     var exp: u64 = 0;
                     _ = linux.read(self.repeat_fd, @ptrCast(&exp), 8);
@@ -2463,16 +2322,12 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     }
                 }
                 if (self.ctx.tick()) {
-                    if (!self.needs_render) {
-                        self.cursor_only_render = true;
-                    }
                     self.needs_render = true;
                 }
                 // Scrollbar fade/show glide needs frames until the target
                 // latches and opacity lands (present() does both; the
                 // zero landing takes one last full clean).
                 if (self.sbNeedsFrames(context_mod.nowMs())) {
-                    self.cursor_only_render = false;
                     self.needs_render = true;
                 }
                 if (self.needs_render and self.configured and !self.frame_pending) {
@@ -3054,7 +2909,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     }
                     if (cfg.scrollbar) {
                         self.sbBump();
-                        self.cursor_only_render = false;
                     }
                     self.needs_render = true;
                     return;
@@ -3931,7 +3785,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.ctx.grid.view_offset = scrollbar_mod.offsetAt(bg, self.ctx.grid.sb_len, by);
                 self.clearHover();
                 self.sbBump();
-                self.cursor_only_render = false;
                 self.needs_render = true;
                 return;
             }
@@ -3943,7 +3796,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
             _ = pointer;
             const self: *Self = @ptrCast(@alignCast(data));
             self.markActivity();
-            self.cursor_only_render = false;
             self.last_serial = serial;
             self.ptr_serial = serial;
             if (!cfg.mouse) return;
@@ -4001,7 +3853,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
                             self.ctx.grid.view_offset = scrollbar_mod.offsetAt(bg, self.ctx.grid.sb_len, by);
                             self.clearHover();
                             self.sbBump();
-                            self.cursor_only_render = false;
                             self.refreshCursor();
                             self.needs_render = true;
                             return;
@@ -4096,7 +3947,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
             _ = time;
             const self: *Self = @ptrCast(@alignCast(data));
             self.markActivity();
-            self.cursor_only_render = false;
             if (!cfg.mouse) return;
             if (axis != 0) return; // vertical only
             // Modern compositors pair every scroll with value120 (notches
@@ -4134,7 +3984,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.clearHover(); // content moved under the cursor
             if (cfg.scrollbar) {
                 self.sbBump();
-                self.cursor_only_render = false;
             }
             self.needs_render = true;
         }
@@ -4171,7 +4020,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
             _ = pointer;
             const self: *Self = @ptrCast(@alignCast(data));
             self.markActivity();
-            self.cursor_only_render = false;
             if (!cfg.mouse) return;
             if (axis != 0) return; // vertical only
             // First sighting promotes value120 to the single scroll
@@ -4213,7 +4061,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.clearHover(); // content moved under the cursor
             if (cfg.scrollbar) {
                 self.sbBump();
-                self.cursor_only_render = false;
             }
             self.needs_render = true;
         }
@@ -4275,7 +4122,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
             _ = tl;
             const self: *Self = @ptrCast(@alignCast(data));
             self.markActivity();
-            self.cursor_only_render = false;
             var is_resizing = false;
             if (states) |st| {
                 if (st.data) |ptr| {
@@ -4434,7 +4280,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
             _ = time;
             const self: *Self = @ptrCast(@alignCast(data));
             self.markActivity();
-            self.cursor_only_render = false;
             self.last_serial = serial;
             if (self.xkb_state == null) return;
             const keycode = key + 8; // evdev offset
@@ -4483,7 +4328,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 // painted or missing until the next pointer motion).
                 if (self.hover_active and had_ctrl != self.ctrlHeld()) {
                     self.ctx.grid.markRowsDirty(self.hover_row, self.hover_row);
-                    self.cursor_only_render = false;
                 }
                 self.needs_render = true;
             }

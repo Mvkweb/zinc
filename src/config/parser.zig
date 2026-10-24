@@ -5,7 +5,6 @@ const std = @import("std");
 const config_mod = @import("../config.zig");
 const input_kb = @import("../input/keyboard.zig");
 pub const CursorStyle = config_mod.CursorStyle;
-pub const CursorMode = config_mod.CursorMode;
 
 pub const RuntimeConfig = struct {
     font_size: ?f32 = null,
@@ -23,7 +22,6 @@ pub const RuntimeConfig = struct {
     bg_opacity: ?u8 = null,
     cursor_style: ?CursorStyle = null,
     cursor_blink: ?bool = null,
-    cursor_mode: ?CursorMode = null,
     cursor_thick_px: ?f32 = null,
     selection_single_cell: ?bool = null,
     cursor_glide: ?bool = null,
@@ -112,13 +110,6 @@ pub fn parseCursorStyle(raw: []const u8) ?CursorStyle {
     return null;
 }
 
-pub fn parseCursorMode(raw: []const u8) ?CursorMode {
-    const s = std.mem.trim(u8, raw, " \t\r\n\"'");
-    if (std.ascii.eqlIgnoreCase(s, "auto")) return .auto;
-    if (std.ascii.eqlIgnoreCase(s, "always")) return .always;
-    return null;
-}
-
 /// Strip a trailing ` #comment` (hash outside quotes): lets users annotate
 /// values without breaking quote stripping downstream. A leading `#`
 /// (colors) and quoted hashes are left alone.
@@ -195,8 +186,6 @@ pub fn parse(content: []const u8, cfg: *RuntimeConfig, gpa: std.mem.Allocator) v
             if (parseCursorStyle(val)) |cs| cfg.cursor_style = cs;
         } else if (std.ascii.eqlIgnoreCase(key, "cursor-blink") or std.ascii.eqlIgnoreCase(key, "cursor_blink")) {
             if (parseBool(val)) |b| cfg.cursor_blink = b;
-        } else if (std.ascii.eqlIgnoreCase(key, "cursor-mode") or std.ascii.eqlIgnoreCase(key, "cursor_mode")) {
-            if (parseCursorMode(val)) |m| cfg.cursor_mode = m;
         } else if (std.ascii.eqlIgnoreCase(key, "cursor-thickness") or std.ascii.eqlIgnoreCase(key, "cursor-thick") or std.ascii.eqlIgnoreCase(key, "cursor_thickness") or std.ascii.eqlIgnoreCase(key, "cursor_thick_px")) {
             if (std.fmt.parseFloat(f32, trimQuotes(val))) |ct| {
                 if (ct >= 0.5 and ct <= 16.0) cfg.cursor_thick_px = ct;
@@ -325,7 +314,6 @@ test "parse complete config content" {
         \\background-opacity = 0.85
         \\cursor-style = underline
         \\cursor-blink = false
-        \\cursor-mode = always
         \\cursor-thickness = 2.0
         \\selection-single-cell = true
         \\find-match-numbers = true
@@ -357,7 +345,6 @@ test "parse complete config content" {
     try std.testing.expectEqual(@as(?u8, 217), cfg.bg_opacity);
     try std.testing.expectEqual(@as(?CursorStyle, .underline), cfg.cursor_style);
     try std.testing.expectEqual(@as(?bool, false), cfg.cursor_blink);
-    try std.testing.expectEqual(@as(?CursorMode, .always), cfg.cursor_mode);
     try std.testing.expectEqual(@as(?f32, 2.0), cfg.cursor_thick_px);
     try std.testing.expectEqual(@as(?bool, true), cfg.selection_single_cell);
     try std.testing.expectEqual(@as(?bool, true), cfg.find_match_numbers);

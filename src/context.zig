@@ -1698,7 +1698,9 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// EL/ED/scroll/IL/DL fills use the pen bg, never defaults.
         fn penBlank(self: *const Self) cell_mod.Cell(cfg) {
             const CellT = cell_mod.Cell(cfg);
-            return CellT{ .bg = self.resolveColor(self.pen.bg) };
+            var c = CellT{ .bg = self.resolveColor(self.pen.bg) };
+            c.dirty = true;
+            return c;
         }
 
         fn defaultAnsi() [16]u32 {
@@ -1921,6 +1923,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 2 => @memset(row, blank),
                 else => {},
             }
+            self.grid.markRowsDirty(self.cursor_row, self.cursor_row);
         }
 
         /// ECH (CSI n X): erase n chars at/after the cursor (cursor stays).
@@ -1930,6 +1933,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             const row = self.grid.rowSlice(self.cursor_row);
             const n: usize = @min(@as(usize, count), cols -| self.cursor_col);
             @memset(row[self.cursor_col..][0..n], self.penBlank());
+            self.grid.markRowsDirty(self.cursor_row, self.cursor_row);
         }
 
         /// DCH (CSI n P): delete n chars at the cursor, shifting the rest
@@ -1946,6 +1950,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 std.mem.copyForwards(CellT, row[self.cursor_col..][0 .. tail - n], row[self.cursor_col + n ..][0 .. tail - n]);
             }
             @memset(row[cols - n ..][0..n], self.penBlank());
+            self.grid.markRowsDirty(self.cursor_row, self.cursor_row);
         }
 
         fn reset(self: *Self) void {
@@ -1988,8 +1993,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             if (now - self.blink_last_ms < cfg.cursor_blink_rate_ms) return false;
             self.blink_last_ms = now;
             self.blink_visible = !self.blink_visible;
-            const cell = self.grid.at(self.cursor_col, self.cursor_row);
-            cell.dirty = true;
+            self.grid.markRowsDirty(self.cursor_row, self.cursor_row);
             return true;
         }
 

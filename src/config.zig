@@ -7,13 +7,6 @@ const input_kb = @import("input/keyboard.zig");
 /// Terminal cursor shape.
 pub const CursorStyle = enum { block, underline, bar };
 
-/// `cursor-mode` runtime knob. `auto` hides zinc's own cursor on the
-/// alt-screen while the resident app has a cursor-like cell (fake block/
-/// bar/underline) at the tracked position — that state is the app's own
-/// caret, so drawing zinc's on top produces two cursors. `always` keeps
-/// zinc's cursor drawn regardless.
-pub const CursorMode = enum { auto, always };
-
 pub const Config = struct {
     // Terminal geometry.
     cols: u16 = 80,
@@ -108,8 +101,6 @@ pub const Config = struct {
     cursor_blink: bool = true,
     cursor_blink_rate_ms: u32 = 500,
     cursor_dynamic: bool = true,
-    /// See CursorMode: auto (double-cursor suppression on alt screen).
-    cursor_mode: CursorMode = .auto,
     /// Block, bar (beam), or underline. Foot.ini match: beam.
     cursor_style: CursorStyle = .bar,
     /// Bar/underline thickness in pixels (foot beam-thickness=1.5).
