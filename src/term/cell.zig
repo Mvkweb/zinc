@@ -73,6 +73,26 @@ pub fn Cell(comptime cfg: config_mod.Config) type {
     };
 }
 
+/// Heuristic: does the cell under the caret already look like a fake
+/// cursor the resident app drew? Used by cursor-mode=auto on the alt
+/// screen: reverse video, an underline over a blank cell, or a block/bar
+/// glyph (U+2580..U+259F) carrying real ink/bg color. Conservative —
+/// ordinary text, default-colored progress bars, and blank cells never
+/// qualify, so `always` stays a pure escape hatch.
+pub fn looksAppDrawn(cell: anytype) bool {
+    if (cell.attr.reverse) return true;
+    const cp: u32 = cell.rune;
+    const blank = cp == ' ' or cp == 0;
+    if (blank) {
+        if (cell.combining_count == 0 and (cell.ul_style != .none or cell.attr.underline)) return true;
+        return false;
+    }
+    if (cp >= 0x2580 and cp <= 0x259F) {
+        return !isDefaultColor(cell.fg) or !isDefaultColor(cell.bg);
+    }
+    return false;
+}
+
 test "cell default + combining capacity" {
     const C = Cell(.{});
     var c = C{};
@@ -98,4 +118,29 @@ test "cell default color sentinel" {
     try std.testing.expect(isDefaultColor(c.fg));
     try std.testing.expect(isDefaultColor(c.bg));
     try std.testing.expect(isDefaultColor(c.ul_color));
+}
+
+test "looksAppDrawn classifier" {
+    const C = Cell(.{});
+    // Plain default cell: never suppressed.
+    try std.testing.expect(!looksAppDrawn(C{}));
+    // Reverse video: classic TUI fake block cursor.
+    try std.testing.expect(looksAppDrawn(C{ .rune = ' ', .attr = .{ .reverse = true } }));
+    try std.testing.expect(looksAppDrawn(C{ .rune = 'x', .attr = .{ .reverse = true } }));
+    // Underline drawn on a blank cell (underline-style caret).
+    try std.testing.expect(looksAppDrawn(C{ .rune = ' ', .ul_style = .single }));
+    try std.testing.expect(looksAppDrawn(C{ .rune = 0, .attr = .{ .underline = true } }));
+    // Underline under real text stays normal terminal styling, not a caret.
+    try std.testing.expect(!looksAppDrawn(C{ .rune = 'A', .ul_style = .single }));
+    // Combining mark over a blank cell is content, not an empty caret.
+    try std.testing.expect(!looksAppDrawn(C{ .rune = ' ', .ul_style = .single, .combining_count = 1 }));
+    // Block/bar elements: only when they carry real (non-default) color.
+    try std.testing.expect(!looksAppDrawn(C{ .rune = 0x2588 }));
+    try std.testing.expect(looksAppDrawn(C{ .rune = 0x2588, .fg = 0x00FF0000 }));
+    try std.testing.expect(looksAppDrawn(C{ .rune = 0x258F, .bg = 0x00123456 }));
+    // Non-block glyph with color is ordinary styled text.
+    try std.testing.expect(!looksAppDrawn(C{ .rune = 'A', .fg = 0x00FF0000 }));
+    // ascii_only build: out-of-range rune degrades to '?', never a block.
+    const A = Cell(.{ .ascii_only = true });
+    try std.testing.expect(!looksAppDrawn(A{ .rune = '?', .fg = 0x00FF0000 }));
 }

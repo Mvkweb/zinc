@@ -252,6 +252,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
         cursor_style: config_mod.CursorStyle = cfg.cursor_style,
         cursor_blink: bool = cfg.cursor_blink,
         cursor_thick_px: f32 = cfg.cursor_thick_px,
+        cursor_mode: config_mod.CursorMode = cfg.cursor_mode,
         selection_single_cell: bool = cfg.selection_single_cell,
 
         display: ?*c.wl_display = null,
@@ -535,6 +536,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .cursor_style = runtime_cfg.cursor_style orelse cfg.cursor_style,
                 .cursor_blink = runtime_cfg.cursor_blink orelse cfg.cursor_blink,
                 .cursor_thick_px = runtime_cfg.cursor_thick_px orelse cfg.cursor_thick_px,
+                .cursor_mode = runtime_cfg.cursor_mode orelse cfg.cursor_mode,
                 .selection_single_cell = runtime_cfg.selection_single_cell orelse cfg.selection_single_cell,
                 .find_numbers = runtime_cfg.find_match_numbers orelse cfg.find_match_numbers,
                 .find_num_scale = runtime_cfg.find_number_scale orelse cfg.find_number_scale,
@@ -1850,7 +1852,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Cursor trail: fading departure cells under the live cursor.
             // Drawn first so the gliding cursor paints on top. Shares the
             // cursor's visibility: no ghosts while hidden.
-            const show_cursor = (!(self.ctx.decscusr_blink orelse self.cursor_blink) or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0 and !self.copy_active;
+            const show_cursor = (!(self.ctx.decscusr_blink orelse self.cursor_blink) or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0 and !self.copy_active and !self.cursorSuppressedNow();
             if (show_cursor and self.trail_ms > 0 and self.flow.trail_n > 0) {
                 const tcol = self.themed(self.ctx.cursor_color, false);
                 const tt: u32 = @intCast(@max(1, @as(i32, @intFromFloat(@ceil(self.cursor_thick_px)))));
@@ -1966,6 +1968,22 @@ pub fn App(comptime cfg: config_mod.Config) type {
             return dmg;
         }
 
+        /// cursor-mode=auto: on the alt screen, suppress zinc's own cursor
+        /// when the tracked cell already holds an app-drawn fake caret
+        /// (reverse video, blank+underline, or a colored block/bar). Only
+        /// evaluated once the glide has landed — mid-flight frames keep
+        /// drawing so motion stays visible, and the settle frame's overlay
+        /// bit forces the repaint that drops the duplicate.
+        fn cursorSuppressedNow(self: *Self) bool {
+            if (!cfg.alt_screen or !self.ctx.alt_active) return false;
+            if (self.cursor_mode != .auto) return false;
+            if (!self.ctx.show_cursor or self.ctx.grid.view_offset != 0 or self.copy_active) return false;
+            if (!self.flow.settled()) return false;
+            if (self.ctx.cursor_col >= self.ctx.grid.cols or self.ctx.cursor_row >= self.ctx.grid.rows) return false;
+            const cell_ptr = self.ctx.grid.viewCell(self.ctx.cursor_col, self.ctx.cursor_row) orelse return false;
+            return cell_mod.looksAppDrawn(cell_ptr.*);
+        }
+
         fn renderCursorCell(self: *Self) software.Damage {
             var dmg = software.Damage{};
             const W: u32 = @intCast(self.width);
@@ -1977,6 +1995,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const ch: i32 = self.cell_h;
             const col = self.ctx.cursor_col;
             const row = self.ctx.cursor_row;
+
+            // Match renderCells' row placement: while a scroll glide is in
+            // flight rows sit at a shifted y, and a single-cell fast frame
+            // cannot cover that — take the full path instead.
+            if (self.flow.scrollShiftPx(ch) != 0) return self.renderCells();
 
             if (col >= self.ctx.grid.cols or row >= self.ctx.grid.rows) return dmg;
             const ccx_i: i32 = px + @as(i32, col) * cw;
@@ -2048,7 +2071,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
 
             // 3. Draw cursor overlay if visible
-            const show_cursor = (!(self.ctx.decscusr_blink orelse self.cursor_blink) or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0;
+            const show_cursor = (!(self.ctx.decscusr_blink orelse self.cursor_blink) or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0 and !self.cursorSuppressedNow();
             if (show_cursor) {
                 const cur = self.themed(self.ctx.cursor_color, false);
                 const t: u32 = @intCast(@max(1, @as(i32, @intFromFloat(@ceil(self.cursor_thick_px)))));
@@ -2236,17 +2259,28 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (cfg.kitty_gfx and self.ctx.images.placements.items.len > 0) ob |= 256;
             ob |= @as(u32, @backingInt(self.ctx.decscusr_style orelse .block)) << 8;
             if (self.ctx.decscusr_blink orelse false) ob |= 0x1000;
+            // IME preedit paints glyph+underline overlay pixels that no
+            // cell owns; when it drops (ti-leave, enable reset, finish)
+            // no dirty row describes the erasure, so a presence change
+            // must force the full repaint that erases the stale overlay
+            // (the lingering underline "dot" after Ctrl+R overlays).
+            if (cfg.ime and self.ime.focused and self.ime.preedit_len > 0) ob |= 0x2000;
+            // Auto cursor suppression flips without any cell write; the
+            // settle frame must repaint the cell that held the cursor.
+            if (self.cursorSuppressedNow()) ob |= 0x4000;
             if (ob != self.last_overlay) {
                 self.ctx.grid.markAllDirty();
                 self.last_overlay = ob;
             }
             // Cursor motion without cell writes (CUP over clean area) would
             // ghost the block: repaint the rows it left and entered instead.
+            var cursor_moved = false;
             if (self.ctx.cursor_col != self.last_cur_col or self.ctx.cursor_row != self.last_cur_row) {
                 self.ctx.grid.markRowsDirty(self.last_cur_row, self.last_cur_row);
                 self.ctx.grid.markRowsDirty(self.ctx.cursor_row, self.ctx.cursor_row);
                 self.last_cur_col = self.ctx.cursor_col;
                 self.last_cur_row = self.ctx.cursor_row;
+                cursor_moved = true;
             }
             // IME candidate window tracks the cursor (moves, scrolls,
             // resizes). Sealed only when the rect actually moved.
@@ -2275,7 +2309,14 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             const is_prof = self.profile_on;
             const t0: i64 = if (is_prof) context_mod.nowMs() else 0;
-            const is_cursor_only = self.cursor_only_render and self.pending_resize == null and self.resize_settle_ms == 0 and self.flow.settled();
+            const is_cursor_only = self.cursor_only_render and
+                self.pending_resize == null and
+                self.resize_settle_ms == 0 and
+                !self.ctx.grid.dirty_all and
+                !self.copy_active and
+                !cursor_moved and
+                !(cfg.ime and self.ime.focused and self.ime.preedit_len > 0) and
+                self.flow.settled();
             self.cursor_only_render = false;
             const dmg = if (is_cursor_only) self.renderCursorCell() else self.renderCells();
             const t1: i64 = if (is_prof) context_mod.nowMs() else 0;
