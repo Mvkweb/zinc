@@ -1,7 +1,5 @@
 # Maintainer: Mvkweb <https://github.com/Mvkweb>
 # Local build while AUR submissions are closed: makepkg -si
-# NOTE: upstream is private for now, so plain `git clone` needs auth.
-# NOTE: needs release tag v$pkgver to exist; none exist yet.
 pkgname=zinc
 pkgver=0.1.0
 pkgrel=1
