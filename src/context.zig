@@ -18,6 +18,8 @@ const placeholder_mod = @import("gfx/placeholder.zig");
 const png_mod = @import("util/png.zig");
 const inflate_mod = @import("util/inflate.zig");
 const mouse_mod = @import("input/mouse.zig");
+const base64_mod = @import("util/base64.zig");
+const linux = std.os.linux;
 
 pub const WriteCb = *const fn (user_data: ?*anyopaque, data: []const u8) void;
 
@@ -310,8 +312,12 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 }
                 return;
             }
-            if (ctrl.medium != 'd') {
+            if (ctrl.medium != 'd' and ctrl.medium != 'f' and ctrl.medium != 't') {
                 self.replyKitty(id, q, "unsupported transmission medium");
+                return;
+            }
+            if (ctrl.medium == 'f' or ctrl.medium == 't') {
+                self.kittyTransmitFile(ctrl, payload);
                 return;
             }
             const bpp: usize = switch (ctrl.format) {
@@ -378,7 +384,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
             img.number = ctrl.request_num;
             const assigned = img.id;
-            if (ctrl.action == .transmit_and_place) {
+            if (ctrl.action == .transmit_and_place and !ctrl.unicode_placeholder) {
                 if (!self.placeExisting(img, ctrl)) {
                     _ = self.images.deleteImage(assigned);
                     self.replyKitty(id, q, "placement store full");
@@ -391,7 +397,12 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 self.emit(kitty_mod.formatOkI(&rbuf, assigned, ctrl.request_num));
                 return;
             }
-            self.replyPlaced(assigned, ctrl);
+            // Only send OK reply if client requested an id or placement-id.
+            // Anonymous prints (like fastfetch) have id=0 and placement_id=0;
+            // sending an unrequested OK reply leaks into the shell stdin as typed text.
+            if (id != 0 or ctrl.placement_id != 0) {
+                self.replyPlaced(id, ctrl);
+            }
         }
 
         /// PNG transmit (f=100): the file carries own dims (s/v ignored),
@@ -447,6 +458,117 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             self.finishStore(ctrl, img);
         }
 
+        /// File-path transmit (medium 'f' = read file, 't' = read and unlink).
+        /// Payload is the base64-encoded path. Supports PNG (f=100) or raw RGB/RGBA.
+        fn kittyTransmitFile(self: *Self, ctrl: kitty_mod.Control, payload: []const u8) void {
+            const id = ctrl.image_id;
+            const q = ctrl.quiet;
+            var path_buf: [4096]u8 = undefined;
+            if (payload.len == 0 or payload.len > 8192) {
+                self.replyKitty(id, q, "bad path");
+                return;
+            }
+            const path_len = base64_mod.decode(&path_buf, payload) catch {
+                self.replyKitty(id, q, "bad base64 path");
+                return;
+            };
+            if (path_len == 0 or path_len >= path_buf.len) {
+                self.replyKitty(id, q, "bad path");
+                return;
+            }
+            path_buf[path_len] = 0;
+            const zpath: [*:0]const u8 = path_buf[0..path_len :0];
+            const fd_rc = linux.open(zpath, .{ .ACCMODE = .RDONLY, .CLOEXEC = true }, 0);
+            const fd_err = linux.errno(fd_rc);
+            if (fd_err != .SUCCESS) {
+                self.replyKitty(id, q, "cannot open image file");
+                return;
+            }
+            const fd: i32 = @intCast(fd_rc);
+            defer _ = linux.close(fd);
+            if (ctrl.medium == 't') {
+                _ = linux.unlink(zpath);
+            }
+            const end_rc = linux.lseek(fd, 0, 2); // SEEK_END
+            if (linux.errno(end_rc) != .SUCCESS) {
+                self.replyKitty(id, q, "cannot seek image file");
+                return;
+            }
+            _ = linux.lseek(fd, 0, 0); // SEEK_SET
+            if (end_rc <= 0 or end_rc > cfg.kitty_b64_max_cap) {
+                self.replyKitty(id, q, "image too large");
+                return;
+            }
+            const file_sz: usize = @intCast(end_rc);
+            const file_bytes = self.gpa.alloc(u8, file_sz) catch {
+                self.replyKitty(id, q, "out of memory");
+                return;
+            };
+            defer self.gpa.free(file_bytes);
+            var nread: usize = 0;
+            while (nread < file_sz) {
+                const r = linux.read(fd, file_bytes.ptr + nread, file_sz - nread);
+                const rerr = linux.errno(r);
+                if (rerr != .SUCCESS or r == 0) {
+                    self.replyKitty(id, q, "cannot read image file");
+                    return;
+                }
+                nread += r;
+            }
+            if (ctrl.format == .png) {
+                const dec = png_mod.decodeRgba(self.gpa, file_bytes, cfg.kitty_b64_max_cap / 4) catch |e| {
+                    const msg: []const u8 = switch (e) {
+                        error.OutOfMemory => "out of memory",
+                        error.OverLimit => "image too large",
+                        else => "bad PNG data",
+                    };
+                    self.replyKitty(id, q, msg);
+                    return;
+                };
+                defer self.gpa.free(dec.pixels);
+                if (id != 0) _ = self.images.deleteImage(id);
+                if (self.images.total_bytes + dec.pixels.len * 4 > @as(usize, cfg.img_pool_max_bytes)) {
+                    self.replyKitty(id, q, "ENOMEM");
+                    return;
+                }
+                const img = self.images.insert(dec.w, dec.h, false) catch {
+                    self.replyKitty(id, q, "image store full");
+                    return;
+                };
+                @memcpy(img.pixels, dec.pixels);
+                self.finishStore(ctrl, img);
+                return;
+            }
+            const bpp: usize = switch (ctrl.format) {
+                .rgb => 3,
+                .rgba => 4,
+                else => {
+                    self.replyKitty(id, q, "unsupported format");
+                    return;
+                },
+            };
+            if (ctrl.img_w == 0 or ctrl.img_h == 0) {
+                self.replyKitty(id, q, "bad image dimensions");
+                return;
+            }
+            const expected: usize = @as(usize, ctrl.img_w) * ctrl.img_h * bpp;
+            if (file_bytes.len != expected) {
+                self.replyKitty(id, q, "size mismatch");
+                return;
+            }
+            if (id != 0) _ = self.images.deleteImage(id);
+            if (self.images.total_bytes + expected > @as(usize, cfg.img_pool_max_bytes)) {
+                self.replyKitty(id, q, "ENOMEM");
+                return;
+            }
+            const img = self.images.insert(ctrl.img_w, ctrl.img_h, false) catch {
+                self.replyKitty(id, q, "image store full");
+                return;
+            };
+            kitty_mod.swizzlePixels(img.pixels, file_bytes, ctrl.format);
+            self.finishStore(ctrl, img);
+        }
+
         /// zlib-compressed raw pixels (o=z): unwrap + inflate to the exact
         /// s*v*bpp size, then rejoin the raw path at swizzle time.
         fn kittyTransmitZlib(self: *Self, ctrl: kitty_mod.Control, payload: []const u8) void {
@@ -497,10 +619,13 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// Move the cursor past a placed image (spec default; C=1 skips).
         /// Right with wrap, then down clamped without scrolling (edge
         /// behavior is implementation-defined; clamping is ours).
-        fn advanceAfterImage(self: *Self, img_w: u32, img_h: u32) void {
+        fn advanceAfterImage(self: *Self, img_w: u32, img_h: u32, disp_cols: u32, disp_rows: u32) void {
             const cw: u32 = @max(1, self.cell_w_px);
             const ch: u32 = @max(1, self.cell_h_px);
-            var cols_needed: u32 = @min(@as(u32, 0xFFFF), (img_w + cw - 1) / cw);
+            var cols_needed: u32 = if (disp_cols > 0)
+                disp_cols
+            else
+                @min(@as(u32, 0xFFFF), (img_w + cw - 1) / cw);
             while (cols_needed > 0) : (cols_needed -= 1) {
                 if (self.cursor_col + 1 < self.grid.cols) {
                     self.cursor_col += 1;
@@ -512,7 +637,12 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     break;
                 }
             }
-            var rows_needed: u32 = @min(@as(u32, 0xFFFF), (img_h + ch - 1) / ch);
+            var rows_needed: u32 = if (disp_rows > 0)
+                disp_rows
+            else if (disp_cols > 0 and img_w > 0)
+                @max(1, (disp_cols * cw * img_h + (img_w * ch / 2)) / (img_w * ch))
+            else
+                @min(@as(u32, 0xFFFF), (img_h + ch - 1) / ch);
             if (rows_needed > 0) rows_needed -= 1; // first row already occupied
             while (rows_needed > 0) : (rows_needed -= 1) {
                 if (self.cursor_row + 1 < self.grid.rows) {
@@ -612,7 +742,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             slot.dest_cols = @intCast(@min(ctrl.disp_cols, 4096));
             slot.dest_rows = @intCast(@min(ctrl.disp_rows, 4096));
             self.images.sortPlacements();
-            if (ctrl.cursor_move) self.advanceAfterImage(img.w, img.h);
+            if (ctrl.cursor_move) self.advanceAfterImage(img.w, img.h, ctrl.disp_cols, ctrl.disp_rows);
             return true;
         }
 
@@ -638,9 +768,11 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 return;
             };
             const id = found.id;
-            if (!self.placeExisting(found, ctrl)) {
-                self.replyKitty(id, ctrl.quiet, "placement store full");
-                return;
+            if (!ctrl.unicode_placeholder) {
+                if (!self.placeExisting(found, ctrl)) {
+                    self.replyKitty(id, ctrl.quiet, "placement store full");
+                    return;
+                }
             }
             self.replyPlaced(id, ctrl);
         }
@@ -654,7 +786,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// OK would make clients send images into the void (yazi's KgpOld
         /// shm-first path fell back to nothing and previews stayed blank).
         fn kittyQuery(self: *Self, ctrl: kitty_mod.Control) void {
-            if (ctrl.medium != 'd') {
+            if (ctrl.medium != 'd' and ctrl.medium != 'f' and ctrl.medium != 't') {
                 self.replyKitty(ctrl.image_id, ctrl.quiet, "unsupported transmission medium");
                 return;
             }
@@ -1745,13 +1877,18 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                             _ = self.images.placements.swapRemove(i);
                             continue;
                         };
-                        const old = self.images.placements.items[i].clip_top;
-                        const sum = @as(u32, old) + ch;
+                        const pl = &self.images.placements.items[i];
+                        const step: u32 = if (pl.dest_rows > 0 and img.h > 0)
+                            @max(1, (img.h + pl.dest_rows - 1) / pl.dest_rows)
+                        else
+                            ch;
+                        const old = pl.clip_top;
+                        const sum = @as(u32, old) + step;
                         if (sum >= img.h) {
                             _ = self.images.placements.swapRemove(i);
                             continue;
                         }
-                        self.images.placements.items[i].clip_top = @intCast(@min(sum, 0xFFFF));
+                        pl.clip_top = @intCast(@min(sum, 0xFFFF));
                         i += 1;
                     } else {
                         self.images.placements.items[i].row -= 1;
@@ -2066,7 +2203,7 @@ test "kitty transmit RGBA end-to-end" {
     ctx.cursor_col = 2;
     ctx.cursor_row = 3;
     // 2x1 RGBA: red, green.
-    ctx.parse("\x1b_Ga=t,f=32,s=2,v=1,i=7;/wAA/wD/AP8=\x1b\\");
+    ctx.parse("\x1b_Ga=T,f=32,s=2,v=1,i=7;/wAA/wD/AP8=\x1b\\");
     try std.testing.expectEqual(@as(usize, 1), ctx.images.images.items.len);
     const img = &ctx.images.images.items[0];
     try std.testing.expectEqual(@as(u32, 7), img.id);
@@ -2129,16 +2266,13 @@ test "kitty legacy tiled placement stores geometry" {
     ctx.onWrite(Sink.cb, &sink);
     ctx.cursor_col = 5;
     ctx.cursor_row = 3;
-    // 2x1 RGBA white ("//////////8=" = 8x 0xFF), transmit-and-place
-    // at the cursor (quiet).
+    // 2x1 RGBA white ("//////////8=" = 8x 0xFF), transmit without placing (quiet).
     ctx.parse("\x1b_Ga=t,f=32,s=2,v=1,i=50,q=2;//////////8=\x1b\\");
-    try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
-    const base = ctx.images.placements.items[0];
-    try std.testing.expectEqual(@as(u32, 0), base.src_w); // legacy: full image
+    try std.testing.expectEqual(@as(usize, 0), ctx.images.placements.items.len);
     // One legacy tile: 1x1 source crop in a single cell, new placement id.
     ctx.parse("\x1b_Ga=p,i=50,p=7,x=0,y=0,w=1,h=1,c=1,r=1,q=2,C=1\x1b\\");
-    try std.testing.expectEqual(@as(usize, 2), ctx.images.placements.items.len);
-    const tile = ctx.images.placements.items[1];
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
+    const tile = ctx.images.placements.items[0];
     try std.testing.expectEqual(@as(u32, 50), tile.img_id);
     try std.testing.expectEqual(@as(u32, 7), tile.placement_id);
     try std.testing.expectEqual(@as(u32, 1), tile.src_w);
@@ -2147,7 +2281,7 @@ test "kitty legacy tiled placement stores geometry" {
     try std.testing.expectEqual(@as(u16, 3), tile.row);
     // Per-cell erase removes just the tile.
     ctx.parse("\x1b_Ga=d,d=i,i=50,p=7,q=2\x1b\\");
-    try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
+    try std.testing.expectEqual(@as(usize, 0), ctx.images.placements.items.len);
 }
 
 test "kitty chunked upload reassembles" {
@@ -2169,7 +2303,7 @@ test "kitty chunked upload reassembles" {
     ctx.cursor_row = 2;
     // Same 2x1 red/green ("redacted..." full b64 "/wAA/wD/AP8="), split
     // into m=1 + m=0 chunks. No reply until the final chunk.
-    ctx.parse("\x1b_Ga=t,f=32,s=2,v=1,i=9,m=1;/wAA/w\x1b\\");
+    ctx.parse("\x1b_Ga=T,f=32,s=2,v=1,i=9,m=1;/wAA/w\x1b\\");
     try std.testing.expect(ctx.kitty_pending);
     try std.testing.expectEqual(@as(usize, 0), sink.len);
     try std.testing.expectEqual(@as(usize, 0), ctx.images.images.items.len);
@@ -2223,7 +2357,7 @@ test "kitty geometry + cursor advance" {
     @memset(&b64, 'A');
     b64[43] = '=';
     var seq: [128]u8 = undefined;
-    const cmd = try std.fmt.bufPrint(&seq, "\x1b_Ga=t,f=32,s=4,v=2,X=3,Y=4,z=-5,p=2;{s}\x1b\\", .{b64[0..]});
+    const cmd = try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,X=3,Y=4,z=-5,p=2;{s}\x1b\\", .{b64[0..]});
     ctx.parse(cmd);
     try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
     const pl = ctx.images.placements.items[0];
@@ -2241,13 +2375,13 @@ test "kitty geometry + cursor advance" {
     ctx.cursor_col = 0;
     ctx.cursor_row = 0;
     sink.len = 0;
-    const cmd2 = try std.fmt.bufPrint(&seq, "\x1b_Ga=t,f=32,s=4,v=2,i=5,C=1;{s}\x1b\\", .{b64[0..]});
+    const cmd2 = try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,i=5,C=1;{s}\x1b\\", .{b64[0..]});
     ctx.parse(cmd2);
     try std.testing.expectEqual(@as(u16, 0), ctx.cursor_col);
     try std.testing.expectEqual(@as(u16, 0), ctx.cursor_row);
     try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "Gi=5;OK") != null);
     // Re-sending (image 1, placement 2) replaces in place: still 2.
-    const cmd3 = try std.fmt.bufPrint(&seq, "\x1b_Ga=t,f=32,s=4,v=2,i=1,p=2,C=1;{s}\x1b\\", .{b64[0..]});
+    const cmd3 = try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,i=1,p=2,C=1;{s}\x1b\\", .{b64[0..]});
     ctx.parse(cmd3);
     try std.testing.expectEqual(@as(usize, 2), ctx.images.placements.items.len);
     try std.testing.expectEqual(@as(u32, 1), ctx.images.placements.items[0].img_id);
@@ -2279,7 +2413,7 @@ test "kitty scroll-shift, clip, alt round-trip" {
     var seq: [1024]u8 = undefined;
     ctx.cursor_col = 0;
     ctx.cursor_row = 0;
-    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=t,f=32,s=4,v=40;{s}\x1b\\", .{b64[0..]}));
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=40;{s}\x1b\\", .{b64[0..]}));
     try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
     // Full-screen scroll clips the top-anchored image 10px at a time.
     ctx.scrollRegionUp();
@@ -2296,7 +2430,7 @@ test "kitty scroll-shift, clip, alt round-trip" {
     tiny[43] = '=';
     ctx.cursor_col = 0;
     ctx.cursor_row = 5;
-    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=t,f=32,s=4,v=2,i=2;{s}\x1b\\", .{tiny[0..]}));
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,i=2;{s}\x1b\\", .{tiny[0..]}));
     try std.testing.expectEqual(@as(u16, 5), ctx.images.placements.items[0].row);
     ctx.scrollRegionUp();
     try std.testing.expectEqual(@as(u16, 4), ctx.images.placements.items[0].row);
@@ -2359,12 +2493,12 @@ test "kitty unicode placeholder resolve + 16t" {
     };
     var sink = Sink{};
     ctx.onWrite(Sink.cb, &sink);
-    // Store 4x2 RGBA under id 9 (virtual placement: no pool placement).
+    // Store 4x2 RGBA under id 9 with U=1 (virtual placement: no pool placement).
     var b64: [44]u8 = undefined;
     @memset(&b64, 'A');
     b64[43] = '=';
     var seq: [160]u8 = undefined;
-    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,i=9,C=1;{s}\x1b\\", .{b64[0..]}));
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,U=1,f=32,s=4,v=2,i=9,C=1;{s}\x1b\\", .{b64[0..]}));
     try std.testing.expectEqual(@as(usize, 1), ctx.images.images.items.len);
     try std.testing.expectEqual(@as(usize, 0), ctx.images.placements.items.len);
     // Ratatui-style row: SGR id-color + placeholder + 3 diacritics
@@ -2414,7 +2548,7 @@ test "kitty put, request-id, delete matrix" {
     b64[43] = '=';
     var seq: [160]u8 = undefined;
     // 1. Store-only transmit, then display via a=p at (5,6).
-    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,i=21,C=1;{s}\x1b\\", .{b64[0..]}));
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=t,f=32,s=4,v=2,i=21,C=1;{s}\x1b\\", .{b64[0..]}));
     try std.testing.expectEqual(@as(usize, 1), ctx.images.images.items.len);
     try std.testing.expectEqual(@as(usize, 0), ctx.images.placements.items.len);
     ctx.cursor_col = 5;
@@ -2432,21 +2566,21 @@ test "kitty put, request-id, delete matrix" {
     try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "unknown image id") != null);
     // 3. I request: auto id + number stored + I reply.
     sink.len = 0;
-    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,I=13,C=1;{s}\x1b\\", .{b64[0..]}));
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=t,f=32,s=4,v=2,I=13,C=1;{s}\x1b\\", .{b64[0..]}));
     try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], ",I=13;OK") != null);
     try std.testing.expectEqual(@as(u32, 13), ctx.images.images.items[1].number);
     // 4. i+I conflict is EINVAL, nothing stored.
     sink.len = 0;
-    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,i=5,I=13,C=1;{s}\x1b\\", .{b64[0..]}));
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=t,f=32,s=4,v=2,i=5,I=13,C=1;{s}\x1b\\", .{b64[0..]}));
     try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "mutually exclusive") != null);
     try std.testing.expectEqual(@as(usize, 2), ctx.images.images.items.len);
     // 5. Two number-7 images placed; d=n removes the newest placement only.
-    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,I=7,C=1;{s}\x1b\\", .{b64[0..]}));
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=t,f=32,s=4,v=2,I=7,C=1;{s}\x1b\\", .{b64[0..]}));
     const id_a = ctx.images.images.items[2].id;
     ctx.cursor_col = 0;
     ctx.cursor_row = 0;
     ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=p,i={d}\x1b\\", .{id_a}));
-    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=4,v=2,I=7,C=1;{s}\x1b\\", .{b64[0..]}));
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=t,f=32,s=4,v=2,I=7,C=1;{s}\x1b\\", .{b64[0..]}));
     const id_b = ctx.images.images.items[3].id;
     ctx.cursor_col = 0;
     ctx.cursor_row = 1;
@@ -2469,6 +2603,37 @@ test "kitty put, request-id, delete matrix" {
     try std.testing.expectEqual(@as(usize, 1), ctx.images.images.items.len);
     try std.testing.expect(ctx.images.findImage(21) != null);
     try std.testing.expect(ctx.images.findImage(id_b) == null);
+}
+
+test "kitty file transmission t=f and t=t" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    const test_path = "/tmp/zinc_test_kitty_file.bin";
+    const fd = linux.open(test_path, .{ .ACCMODE = .WRONLY, .CREAT = true, .TRUNC = true, .CLOEXEC = true }, 0o600);
+    try std.testing.expect(linux.errno(fd) == .SUCCESS);
+    const f: i32 = @intCast(fd);
+    // 2x2 RGBA: 16 bytes.
+    const raw_data: [16]u8 = @splat(0xFF);
+    _ = linux.write(f, &raw_data, raw_data.len);
+    _ = linux.close(f);
+
+    // Encode path to base64
+    var b64_path: [128]u8 = undefined;
+    const b64_len = base64_mod.encode(&b64_path, test_path);
+
+    var seq: [256]u8 = undefined;
+    const cmd = try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=2,v=2,i=88,t=t,c=4,r=4;{s}\x1b\\", .{b64_path[0..b64_len]});
+    ctx.parse(cmd);
+
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.images.items.len);
+    try std.testing.expectEqual(@as(u32, 88), ctx.images.images.items[0].id);
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
+    try std.testing.expectEqual(@as(u16, 4), ctx.images.placements.items[0].dest_cols);
+    try std.testing.expectEqual(@as(u16, 4), ctx.images.placements.items[0].dest_rows);
+
+    // t=t unlinks the file automatically
+    const check_fd = linux.open(test_path, .{ .ACCMODE = .RDONLY }, 0);
+    try std.testing.expect(linux.errno(check_fd) != .SUCCESS);
 }
 
 test "decset alt-screen swaps grids" {

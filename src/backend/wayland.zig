@@ -961,6 +961,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.pool_pixels = pixels[0 .. size / 4];
             self.pool = pool;
             self.buffer = buf;
+            self.ctx.grid.markAllDirty();
             self.needs_render = true;
         }
 
@@ -1302,12 +1303,18 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     src = img.pixels[skip * @as(usize, img.w) ..];
                     sh = img.h - @as(u32, @intCast(skip));
                 }
+                const dr: i32 = if (pl.dest_rows > 0)
+                    @as(i32, pl.dest_rows)
+                else if (ch > 0)
+                    @max(1, @as(i32, @intCast(@divTrunc(img.h + @as(u32, @intCast(ch)) - 1, @as(u32, @intCast(ch))))))
+                else
+                    1;
                 const vr: i32 = @as(i32, pl.row) + voff;
-                if (vr < 0 or vr >= @as(i32, visible_rows)) continue;
+                if (vr + dr <= 0 or vr >= @as(i32, visible_rows)) continue;
                 if (pl.col >= visible_cols) continue;
-                // Legacy tiled placements (old a=p clients) crop + scale;
-                // everything else blits the full image 1:1.
-                if (pl.src_w > 0 and pl.src_h > 0) {
+                // Legacy tiled placements or scaled placements (c/r columns/rows specified)
+                // crop + scale; everything else blits the full image 1:1.
+                if ((pl.src_w > 0 and pl.src_h > 0) or pl.dest_cols > 0 or pl.dest_rows > 0) {
                     self.blitTiledPlacement(&pl, img, W, H, px, py, cw, ch, vr, dmg);
                     continue;
                 }
@@ -1342,16 +1349,26 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const sx: usize = pl.src_x;
             const sy_in: usize = pl.src_y;
             if (sx >= iw or sy_in >= ih) return;
-            const sw: usize = @min(@as(usize, pl.src_w), iw - sx);
-            const sh_full: usize = @min(@as(usize, pl.src_h), ih - sy_in);
+            const sw: usize = if (pl.src_w > 0) @min(@as(usize, pl.src_w), iw - sx) else iw - sx;
+            const sh_full: usize = if (pl.src_h > 0) @min(@as(usize, pl.src_h), ih - sy_in) else ih - sy_in;
             if (sw == 0 or sh_full == 0) return;
             // M4 clip eats source rows from the crop top (legacy parity:
             // remainder stays top-aligned at the placement origin).
             const skip: usize = @min(@as(usize, pl.clip_top), sh_full);
             const sh: usize = sh_full - skip;
             if (sh == 0) return;
-            const dc: i32 = @max(1, @as(i32, pl.dest_cols));
-            const dr: i32 = @max(1, @as(i32, pl.dest_rows));
+            const dc: i32 = if (pl.dest_cols > 0)
+                @max(1, @as(i32, pl.dest_cols))
+            else if (pl.dest_rows > 0 and ih > 0)
+                @max(1, @as(i32, @intCast(@divTrunc(@as(usize, pl.dest_rows) * @as(usize, @intCast(ch)) * iw + (ih * @as(usize, @intCast(cw)) / 2), ih * @as(usize, @intCast(cw))))))
+            else
+                @max(1, @as(i32, @intCast(@divTrunc(iw + @as(usize, @intCast(cw)) - 1, @as(usize, @intCast(cw))))));
+            const dr: i32 = if (pl.dest_rows > 0)
+                @max(1, @as(i32, pl.dest_rows))
+            else if (pl.dest_cols > 0 and iw > 0)
+                @max(1, @as(i32, @intCast(@divTrunc(@as(usize, pl.dest_cols) * @as(usize, @intCast(cw)) * ih + (iw * @as(usize, @intCast(ch)) / 2), iw * @as(usize, @intCast(ch))))))
+            else
+                @max(1, @as(i32, @intCast(@divTrunc(ih + @as(usize, @intCast(ch)) - 1, @as(usize, @intCast(ch))))));
             const dw: usize = @intCast(dc * cw);
             const dh_full: usize = @intCast(dr * ch);
             if (dw == 0 or dh_full == 0) return;
@@ -1976,13 +1993,18 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const cols: u16 = @intCast(@max(15, @divFloor(w - 2 * @as(i32, @intCast(pad_x)), self.cell_w)));
             const rows: u16 = @intCast(@max(3, @divFloor(h - 2 * @as(i32, @intCast(pad_y)), self.cell_h)));
 
-            if (cols == self.ctx.grid.cols and rows == self.ctx.grid.rows) return;
+            if (cols == self.ctx.grid.cols and rows == self.ctx.grid.rows) {
+                self.ctx.grid.markAllDirty();
+                self.needs_render = true;
+                return;
+            }
 
             // Debounce all interactive resizes by 100ms (Foot parity: resize-delay-ms = 100).
             // Compositors like Hyprland and Sway omit XDG_TOPLEVEL_STATE_RESIZING,
             // so we debounce all size changes while the main loop runs.
             // Consecutive configure events while dragging push the deadline forward.
             self.resize_settle_ms = context_mod.nowMs() + 100;
+            self.ctx.grid.markAllDirty();
             self.needs_render = true;
         }
 
@@ -1997,12 +2019,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const pad_y = self.currentPadY();
             const cols: u16 = @intCast(@max(15, @divFloor(self.width - 2 * @as(i32, @intCast(pad_x)), self.cell_w)));
             const rows: u16 = @intCast(@max(3, @divFloor(self.height - 2 * @as(i32, @intCast(pad_y)), self.cell_h)));
-            if (cols == self.ctx.grid.cols and rows == self.ctx.grid.rows) return;
+            if (cols == self.ctx.grid.cols and rows == self.ctx.grid.rows) {
+                self.ctx.grid.markAllDirty();
+                self.needs_render = true;
+                return;
+            }
             self.ctx.resize(cols, rows);
             if (self.pty_fd >= 0) {
                 pty_mod.resizePty(self.pty_fd, cols, rows, @intCast(@min(self.width, 32767)), @intCast(@min(self.height, 32767)));
             }
             if (cfg.find and self.find_active) self.researchFind();
+            self.ctx.grid.markAllDirty();
             self.needs_render = true;
         }
 
@@ -2230,9 +2257,19 @@ pub fn App(comptime cfg: config_mod.Config) type {
             var pty_buf: [65536]u8 = undefined;
             while (self.running) {
                 while (c.wl_display_prepare_read(self.display) != 0) {
-                    _ = c.wl_display_dispatch_pending(self.display);
+                    if (c.wl_display_dispatch_pending(self.display) < 0) {
+                        self.running = false;
+                        break;
+                    }
                 }
-                _ = c.wl_display_flush(self.display);
+                if (!self.running) break;
+                if (c.wl_display_flush(self.display) < 0) {
+                    const err = c.wl_display_get_error(self.display);
+                    if (err != 0 and err != @backingInt(linux.E.AGAIN)) {
+                        self.running = false;
+                        break;
+                    }
+                }
                 var fds = [_]linux.pollfd{
                     .{ .fd = wl_fd, .events = linux.POLL.IN, .revents = 0 },
                     .{ .fd = self.pty_fd, .events = linux.POLL.IN, .revents = 0 },
@@ -2262,11 +2299,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 }
                 const prc = linux.poll(&fds, nfds, poll_timeout);
                 if (linux.errno(prc) == .SUCCESS and (fds[0].revents & linux.POLL.IN) != 0) {
-                    _ = c.wl_display_read_events(self.display);
+                    if (c.wl_display_read_events(self.display) < 0) {
+                        self.running = false;
+                        break;
+                    }
                 } else {
                     _ = c.wl_display_cancel_read(self.display);
                 }
-                _ = c.wl_display_dispatch_pending(self.display);
+                if (c.wl_display_dispatch_pending(self.display) < 0) {
+                    self.running = false;
+                    break;
+                }
 
                 if (self.resize_settle_ms > 0 and context_mod.nowMs() >= self.resize_settle_ms) {
                     self.settleResize();
@@ -3177,8 +3220,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const deadline = context_mod.nowMs() + 10_000;
             while (len < buf.len and context_mod.nowMs() < deadline) {
                 while (c.wl_display_prepare_read(self.display) != 0) {
-                    _ = c.wl_display_dispatch_pending(self.display);
+                    if (c.wl_display_dispatch_pending(self.display) < 0) break;
                 }
+                if (c.wl_display_get_error(self.display) != 0) break;
                 _ = c.wl_display_flush(self.display);
                 var pfds = [_]linux.pollfd{
                     .{ .fd = fds[0], .events = linux.POLL.IN, .revents = 0 },
@@ -3186,11 +3230,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 };
                 const pr = linux.poll(&pfds, 2, 250);
                 if (linux.errno(pr) == .SUCCESS and (pfds[1].revents & linux.POLL.IN) != 0) {
-                    _ = c.wl_display_read_events(self.display);
+                    if (c.wl_display_read_events(self.display) < 0) break;
                 } else {
                     _ = c.wl_display_cancel_read(self.display);
                 }
-                _ = c.wl_display_dispatch_pending(self.display);
+                if (c.wl_display_dispatch_pending(self.display) < 0) break;
                 if ((pfds[0].revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR)) == 0) continue;
                 const r = linux.read(fds[0], buf.ptr + len, buf.len - len);
                 if (linux.errno(r) != .SUCCESS or r == 0) break;
@@ -4107,8 +4151,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
         }
 
         fn appOnPing(data: ?*anyopaque, wm: ?*P.WmBase, serial: u32) callconv(.c) void {
-            _ = data;
+            const self: *Self = @ptrCast(@alignCast(data));
             c.wl_proxy_marshal(@ptrCast(wm), P.wm_base.PONG, serial);
+            _ = c.wl_display_flush(self.display);
         }
 
         fn appOnXdgConfigure(data: ?*anyopaque, xs: ?*P.XdgSurface, serial: u32) callconv(.c) void {
@@ -4116,6 +4161,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             c.wl_proxy_marshal(@ptrCast(xs), P.xdg_surface.ACK_CONFIGURE, serial);
             c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_COMMIT);
             self.configured = true;
+            self.needs_render = true;
         }
 
         fn appOnToplevelConfigure(data: ?*anyopaque, tl: ?*P.XdgToplevel, w: i32, h: i32, states: ?*P.Array) callconv(.c) void {
@@ -4141,8 +4187,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (w > 0 and h > 0 and (w != self.width or h != self.height)) {
                 self.pending_resize = .{ .w = w, .h = h };
                 self.needs_render = true;
-            } else if (drag_ended and self.resize_settle_ms > 0) {
-                self.settleResize();
+            } else if (drag_ended) {
+                if (self.resize_settle_ms > 0) {
+                    self.settleResize();
+                } else {
+                    self.ctx.grid.markAllDirty();
+                    self.needs_render = true;
+                }
             }
         }
 
@@ -4203,6 +4254,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             _ = keys;
             const self: *Self = @ptrCast(@alignCast(data));
             self.ctx.setFocus(true);
+            self.needs_render = true;
         }
 
         fn appOnKbLeave(data: ?*anyopaque, kb: ?*P.Keyboard, serial: u32, surface: ?*anyopaque) callconv(.c) void {
@@ -4213,6 +4265,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.ctx.setFocus(false);
             // Safety: some compositors skip ti-leave on focus loss.
             if (cfg.ime) self.imeDisable();
+            self.needs_render = true;
         }
 
         fn appOnTiEnter(data: ?*anyopaque, ti_obj: ?*anyopaque, surface: ?*P.Surface) callconv(.c) void {

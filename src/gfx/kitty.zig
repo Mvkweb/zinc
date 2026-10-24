@@ -7,8 +7,8 @@ const base64 = @import("../util/base64.zig");
 const inflate_mod = @import("../util/inflate.zig");
 
 pub const Action = enum(u8) {
-    transmit = 'T',
-    transmit_and_place = 't',
+    transmit = 't',
+    transmit_and_place = 'T',
     query = 'q',
     delete = 'd',
     put = 'p',
@@ -35,8 +35,8 @@ pub const Transmit = struct {
 
 pub fn parseAction(c: u8) Action {
     return switch (c) {
-        'T' => .transmit,
-        't' => .transmit_and_place,
+        't' => .transmit,
+        'T' => .transmit_and_place,
         'q' => .query,
         'd' => .delete,
         'p' => .put,
@@ -77,6 +77,7 @@ pub const Control = struct {
     src_h: u32 = 0,
     disp_cols: u32 = 0, // c
     disp_rows: u32 = 0, // r
+    unicode_placeholder: bool = false, // U=1 (virtual placement for U+10EEEE cells; no cursor placement)
     parse_err: ?[]const u8 = null,
 };
 
@@ -208,7 +209,10 @@ pub fn parseControl(ctrl: []const u8) Control {
                     else => c.disp_rows = n,
                 }
             },
-            else => {}, // U/... : unicode + forward-compat keys.
+            'U' => {
+                if (std.mem.eql(u8, val, "1")) c.unicode_placeholder = true;
+            },
+            else => {}, // forward-compat keys.
         }
     }
     return c;
@@ -276,6 +280,7 @@ pub fn swizzlePixels(dst: []u32, src: []const u8, format: Format) void {
 
 /// Success reply: ESC _ G i=<id>;OK ESC \. Caller provides scratch (>=32B).
 pub fn formatOk(out: []u8, id: u32) []u8 {
+    if (id == 0) return std.fmt.bufPrint(out, "\x1b_G;OK\x1b\\", .{}) catch out[0..0];
     return std.fmt.bufPrint(out, "\x1b_Gi={d};OK\x1b\\", .{id}) catch out[0..0];
 }
 
@@ -414,20 +419,25 @@ test "kitty action + scale identity" {
 
 test "kitty control parse" {
     const c = parseControl("a=t,f=32,s=32,v=16,i=7,q=0,m=0");
-    try std.testing.expectEqual(Action.transmit_and_place, c.action);
+    try std.testing.expectEqual(Action.transmit, c.action);
     try std.testing.expectEqual(Format.rgba, c.format);
     try std.testing.expectEqual(@as(u32, 32), c.img_w);
     try std.testing.expectEqual(@as(u32, 16), c.img_h);
     try std.testing.expectEqual(@as(u32, 7), c.image_id);
+    try std.testing.expect(!c.unicode_placeholder);
     try std.testing.expect(c.parse_err == null);
     // Unknown keys skipped, malformed token recorded once.
     const c2 = parseControl("a=T,f=24,s=8,v=8,z=5,foo,x");
-    try std.testing.expectEqual(Action.transmit, c2.action);
+    try std.testing.expectEqual(Action.transmit_and_place, c2.action);
     try std.testing.expect(c2.parse_err != null);
     // Bad int keeps field zeroed.
     const c3 = parseControl("a=t,f=32,s=x,v=8");
     try std.testing.expect(c3.parse_err != null);
     try std.testing.expectEqual(@as(u32, 0), c3.img_w);
+    // U=1 sets unicode_placeholder flag.
+    const c4 = parseControl("a=T,f=32,s=32,v=16,U=1");
+    try std.testing.expectEqual(Action.transmit_and_place, c4.action);
+    try std.testing.expect(c4.unicode_placeholder);
 }
 
 test "kitty legacy place geometry parse" {
