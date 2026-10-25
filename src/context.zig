@@ -1146,12 +1146,30 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                         self.scroll_bot = bot;
                     }
                 },
-                't' => { // XTWINOPS: 16 reports the text area in pixels
-                    // (ratatui-image sizes cover art from this).
-                    if (n(params, 0, 0) == 16) {
-                        var rbuf: [32]u8 = undefined;
-                        const msg = std.fmt.bufPrint(&rbuf, "\x1b[6;{d};{d}t", .{ self.cell_h_px, self.cell_w_px }) catch null;
-                        if (msg) |m| self.emit(m);
+                't' => { // XTWINOPS:
+                    // 14: report text area size in pixels (CSI 4 ; height ; width t)
+                    // 16: report cell size in pixels (CSI 6 ; height ; width t)
+                    // 18: report text area size in chars (CSI 8 ; rows ; cols t)
+                    const op = n(params, 0, 0);
+                    switch (op) {
+                        14 => {
+                            var rbuf: [48]u8 = undefined;
+                            const h = @as(u32, self.grid.rows) * self.cell_h_px;
+                            const w = @as(u32, self.grid.cols) * self.cell_w_px;
+                            const msg = std.fmt.bufPrint(&rbuf, "\x1b[4;{d};{d}t", .{ h, w }) catch null;
+                            if (msg) |m| self.emit(m);
+                        },
+                        16 => {
+                            var rbuf: [32]u8 = undefined;
+                            const msg = std.fmt.bufPrint(&rbuf, "\x1b[6;{d};{d}t", .{ self.cell_h_px, self.cell_w_px }) catch null;
+                            if (msg) |m| self.emit(m);
+                        },
+                        18 => {
+                            var rbuf: [32]u8 = undefined;
+                            const msg = std.fmt.bufPrint(&rbuf, "\x1b[8;{d};{d}t", .{ self.grid.rows, self.grid.cols }) catch null;
+                            if (msg) |m| self.emit(m);
+                        },
+                        else => {},
                     }
                 },
                 'S' => self.scrollRegionUpN(n(params, 0, 1)), // SU
@@ -2519,10 +2537,16 @@ test "kitty unicode placeholder resolve + 16t" {
     // Image freed: the virtual placement dissolves.
     ctx.parse("\x1b_Ga=d,d=A\x1b\\");
     try std.testing.expect(ctx.resolvePlaceholder(0, 0) == null);
-    // XTWINOPS 16t reports the headless cell size (8x16).
+    // XTWINOPS 14t/16t/18t reports pixel area, cell size, and char dimensions.
+    sink.len = 0;
+    ctx.parse("\x1b[14t");
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "[4;") != null);
     sink.len = 0;
     ctx.parse("\x1b[16t");
     try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "[6;16;8t") != null);
+    sink.len = 0;
+    ctx.parse("\x1b[18t");
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "[8;24;80t") != null);
 }
 
 test "kitty put, request-id, delete matrix" {

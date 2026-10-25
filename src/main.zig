@@ -83,7 +83,7 @@ fn smokeMain(gpa: std.mem.Allocator, io: std.Io) !void {
     log(io, "smoke: spawn shell\n");
     // TERM=dumb: fish/dash use a plain reader (no probes, no highlighting),
     // so the run is deterministic. Still a real shell on a real PTY.
-    const child = pty_mod.spawnShell(config_mod.active.cols, config_mod.active.rows, "dumb") catch |err| {
+    const child = pty_mod.spawnShell(config_mod.active.cols, config_mod.active.rows, 0, 0, "dumb") catch |err| {
         var eb: [128]u8 = undefined;
         var w = std.Io.File.stderr().writer(io, &eb);
         try w.interface.print("smoke: pty spawn failed: {t}\n", .{err});

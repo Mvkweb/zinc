@@ -49,11 +49,9 @@ pub fn shellPath() [*:0]const u8 {
     return "/bin/sh";
 }
 
-/// Fork a shell on a new PTY sized cols x rows. Returns parent side.
-/// `term_env` sets $TERM in the child (e.g. "dumb" for deterministic
-/// harness runs, "xterm-256color" for real use). Caller owns fd (close)
-/// and must reap pid (waitpid).
-pub fn spawnShell(cols: u16, rows: u16, term_env: ?[*:0]const u8) SpawnError!Child {
+/// Fork a shell on a new PTY sized cols x rows (and px_w x px_h pixels).
+/// Returns parent side. `term_env` sets $TERM in the child.
+pub fn spawnShell(cols: u16, rows: u16, px_w: u16, px_h: u16, term_env: ?[*:0]const u8) SpawnError!Child {
     const master_rc = linux.open("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true, .NONBLOCK = true }, 0);
     const master_err = linux.errno(master_rc);
     if (master_err != .SUCCESS) return error.OpenPtmx;
@@ -81,19 +79,19 @@ pub fn spawnShell(cols: u16, rows: u16, term_env: ?[*:0]const u8) SpawnError!Chi
 
     if (pid_rc == 0) {
         // Child: new session, attach slave as controlling terminal.
-        childMain(master, slave_path, cols, rows, term_env);
+        childMain(master, slave_path, cols, rows, px_w, px_h, term_env);
         unreachable; // childMain execs or exits.
     }
 
     return .{ .pid = @intCast(pid_rc), .fd = master };
 }
 
-fn childMain(master: i32, slave_path: [*:0]u8, cols: u16, rows: u16, term_env: ?[*:0]const u8) noreturn {
+fn childMain(master: i32, slave_path: [*:0]u8, cols: u16, rows: u16, px_w: u16, px_h: u16, term_env: ?[*:0]const u8) noreturn {
     if (linux.errno(linux.setsid()) != .SUCCESS) linux.exit(1);
     const slave_rc = linux.open(slave_path, .{ .ACCMODE = .RDWR }, 0);
     if (linux.errno(slave_rc) != .SUCCESS) linux.exit(1);
     const slave: i32 = @intCast(slave_rc);
-    var ws = Winsize{ .ws_row = rows, .ws_col = cols, .ws_xpixel = 0, .ws_ypixel = 0 };
+    var ws = Winsize{ .ws_row = rows, .ws_col = cols, .ws_xpixel = px_w, .ws_ypixel = px_h };
     _ = linux.ioctl(slave, TIOCSWINSZ, @intFromPtr(&ws));
     _ = linux.close(master);
     if (linux.errno(linux.dup2(slave, 0)) != .SUCCESS) linux.exit(1);

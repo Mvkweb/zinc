@@ -463,6 +463,15 @@ pub fn App(comptime cfg: config_mod.Config) type {
             return if (self.ctx.alt_active) self.alt_pad_y else self.pad_y;
         }
 
+        fn ptyPixels(self: *const Self, cols: u16, rows: u16) struct { w: u16, h: u16 } {
+            const w: u32 = @as(u32, cols) * @as(u32, @intCast(@max(1, self.cell_w)));
+            const h: u32 = @as(u32, rows) * @as(u32, @intCast(@max(1, self.cell_h)));
+            return .{
+                .w = @intCast(@min(w, 32767)),
+                .h = @intCast(@min(h, 32767)),
+            };
+        }
+
         // -- lifecycle ------------------------------------------------------
 
         pub fn open(gpa: std.mem.Allocator, io: std.Io) (AppError || std.mem.Allocator.Error)!*Self {
@@ -804,10 +813,16 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             try self.recreatePool();
 
+            // Kitty cursor-advance math needs real cell pixels (defaults fit
+            // headless tests until this runs).
+            self.ctx.cell_w_px = @intCast(@max(1, self.cell_w));
+            self.ctx.cell_h_px = @intCast(@max(1, self.cell_h));
+
             // Spawn the shell.
             const term = try gpa.dupeSentinel(u8, cfg.term_env, 0);
             defer gpa.free(term);
-            const child = pty_mod.spawnShell(self.ctx.grid.cols, self.ctx.grid.rows, term) catch return error.PtyFailed;
+            const pty_px = self.ptyPixels(self.ctx.grid.cols, self.ctx.grid.rows);
+            const child = pty_mod.spawnShell(self.ctx.grid.cols, self.ctx.grid.rows, pty_px.w, pty_px.h, term) catch return error.PtyFailed;
             self.pty_pid = child.pid;
             self.pty_fd = child.fd;
             // Shell query replies (DA/DSR/...) go straight back to the PTY.
@@ -816,10 +831,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Key-repeat timer (soft-fail: no repeat, but a working terminal).
             const tfd = linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true });
             if (linux.errno(tfd) == .SUCCESS) self.repeat_fd = @intCast(tfd);
-            // Kitty cursor-advance math needs real cell pixels (defaults fit
-            // headless tests until this runs).
-            self.ctx.cell_w_px = @intCast(@max(1, self.cell_w));
-            self.ctx.cell_h_px = @intCast(@max(1, self.cell_h));
             self.last_activity_ms = context_mod.nowMs();
             _ = malloc_trim(0);
 
@@ -2026,7 +2037,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             self.ctx.resize(cols, rows);
             if (self.pty_fd >= 0) {
-                pty_mod.resizePty(self.pty_fd, cols, rows, @intCast(@min(self.width, 32767)), @intCast(@min(self.height, 32767)));
+                const pty_px = self.ptyPixels(cols, rows);
+                pty_mod.resizePty(self.pty_fd, cols, rows, pty_px.w, pty_px.h);
             }
             if (cfg.find and self.find_active) self.researchFind();
             self.ctx.grid.markAllDirty();
@@ -2054,7 +2066,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (cols != self.ctx.grid.cols or rows != self.ctx.grid.rows) {
                 self.ctx.resize(cols, rows);
                 if (self.pty_fd >= 0) {
-                    pty_mod.resizePty(self.pty_fd, cols, rows, @intCast(@min(self.width, 32767)), @intCast(@min(self.height, 32767)));
+                    const pty_px = self.ptyPixels(cols, rows);
+                    pty_mod.resizePty(self.pty_fd, cols, rows, pty_px.w, pty_px.h);
                 }
             }
             self.needs_render = true;
@@ -2101,7 +2114,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
             self.ctx.resize(cols, rows);
             if (self.pty_fd >= 0) {
-                pty_mod.resizePty(self.pty_fd, cols, rows, @intCast(@min(self.width, 32767)), @intCast(@min(self.height, 32767)));
+                const pty_px = self.ptyPixels(cols, rows);
+                pty_mod.resizePty(self.pty_fd, cols, rows, pty_px.w, pty_px.h);
             }
             self.ctx.grid.markAllDirty();
             self.clearHover();
