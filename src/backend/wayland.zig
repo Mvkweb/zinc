@@ -174,6 +174,7 @@ extern fn xkb_context_new(flags: c_int) ?*XkbContext;
 extern fn xkb_context_unref(ctx: ?*XkbContext) void;
 extern fn xkb_keymap_new_from_string(ctx: ?*XkbContext, str: [*]const u8, format: c_int, flags: c_int) ?*XkbKeymap;
 extern fn xkb_keymap_unref(map: ?*XkbKeymap) void;
+extern fn xkb_keymap_key_repeats(map: ?*XkbKeymap, keycode: u32) c_int;
 extern fn xkb_state_new(map: ?*XkbKeymap) ?*XkbState;
 extern fn xkb_state_unref(state: ?*XkbState) void;
 extern fn xkb_state_update_mask(state: ?*XkbState, dep: u32, lat: u32, lock: u32, dep_lo: u32, lat_lo: u32, lock_lo: u32) c_int;
@@ -829,7 +830,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.ctx.onWrite(ptyWrite, @ptrFromInt(@as(usize, @intCast(child.fd))));
 
             // Key-repeat timer (soft-fail: no repeat, but a working terminal).
-            const tfd = linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true });
+            const tfd = linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
             if (linux.errno(tfd) == .SUCCESS) self.repeat_fd = @intCast(tfd);
             self.last_activity_ms = context_mod.nowMs();
             _ = malloc_trim(0);
@@ -2366,16 +2367,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 }
                 if (nfds == 3 and (fds[2].revents & linux.POLL.IN) != 0) {
                     self.markActivity();
-                    // Repeat tick: drain the timer, re-emit, go periodic.
+                    // Repeat tick: drain the timer and re-emit.
                     var exp: u64 = 0;
                     _ = linux.read(self.repeat_fd, @ptrCast(&exp), 8);
                     if (self.repeat_armed) {
                         self.handleSym(self.repeat_sym, self.repeat_keycode);
-                        if (self.repeat_rate > 0) {
-                            self.repeatSet(self.repeat_rate, self.repeat_rate);
-                        } else {
-                            self.repeatDisarm();
-                        }
                     }
                 }
                 if (self.ctx.tick()) {
@@ -2505,6 +2501,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// interval_ms (0 = one-shot). All-zero disarms.
         fn repeatSet(self: *Self, value_ms: i64, interval_ms: i64) void {
             if (self.repeat_fd < 0) return;
+            var exp: u64 = 0;
+            _ = linux.read(self.repeat_fd, @ptrCast(&exp), 8);
             const spec = linux.itimerspec{
                 .it_interval = .{
                     .sec = @intCast(@divFloor(interval_ms, 1000)),
@@ -4267,6 +4265,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             _ = surface;
             _ = keys;
             const self: *Self = @ptrCast(@alignCast(data));
+            self.repeatDisarm();
             self.ctx.setFocus(true);
             self.needs_render = true;
         }
@@ -4276,6 +4275,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             _ = serial;
             _ = surface;
             const self: *Self = @ptrCast(@alignCast(data));
+            self.repeatDisarm();
             self.ctx.setFocus(false);
             // Safety: some compositors skip ti-leave on focus loss.
             if (cfg.ime) self.imeDisable();
@@ -4369,14 +4369,18 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
 
             self.handleSym(sym, keycode);
-            // Arm repeat for non-modifier keys (modifiers live >= 0xFFE0).
+            // Arm repeat for keys configured to repeat in keymap.
             // Clipboard chords never repeat (would re-fire copy/paste).
             const is_clip_chord = (c_held and s_held) and (sym == 'C' or sym == 'c' or sym == 'V' or sym == 'v');
-            if (sym < 0xFFE0 and !is_clip_chord and self.repeat_delay > 0 and self.repeat_fd >= 0) {
+            const repeats = xkb_keymap_key_repeats(self.xkb_map, keycode) == 1;
+            if (repeats and !is_clip_chord and self.repeat_delay > 0 and self.repeat_rate > 0 and self.repeat_fd >= 0) {
                 self.repeat_sym = sym;
                 self.repeat_keycode = keycode;
                 self.repeat_armed = true;
-                self.repeatSet(self.repeat_delay, 0);
+                const interval_ms: i64 = @divTrunc(@as(i64, 1000), self.repeat_rate);
+                self.repeatSet(self.repeat_delay, interval_ms);
+            } else {
+                self.repeatDisarm();
             }
         }
 
