@@ -18,3 +18,11 @@ FEATURES.md
 
 # Local manual test scripts (kitty harness, not shipped)
 scripts/
+
+# Arch Linux packaging artifacts (makepkg)
+/pkg/
+/zinc/
+/src/stage/
+/src/zinc/
+*.pkg.tar.*
+

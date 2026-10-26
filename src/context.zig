@@ -401,7 +401,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             // Anonymous prints (like fastfetch) have id=0 and placement_id=0;
             // sending an unrequested OK reply leaks into the shell stdin as typed text.
             if (id != 0 or ctrl.placement_id != 0) {
-                self.replyPlaced(id, ctrl);
+                self.replyPlaced(if (id != 0) id else assigned, ctrl);
             }
         }
 
@@ -1447,9 +1447,31 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             const win = window[0 .. self.q_overlap_len + chunk.len];
 
             var replied = false;
-            if (hasCsi(win, 'c')) {
-                self.emit("\x1b[?1;2c"); // primary DA: VT100
+            // XTGETTCAP: one "unsupported" reply per query in the window.
+            var rest = win;
+            while (std.mem.indexOf(u8, rest, "\x1bP+q")) |pos| {
+                self.emit("\x1bP0+r\x1b\\"); // XTGETTCAP: unsupported
+                rest = rest[pos + 4 ..];
                 replied = true;
+            }
+            // OSC 10/11/12 color queries, answered from the theme.
+            const osc_answers = [_]struct { pat: []const u8, code: []const u8, color: u32 }{
+                .{ .pat = "]10;?", .code = "10", .color = self.fg },
+                .{ .pat = "]11;?", .code = "11", .color = self.bg },
+                .{ .pat = "]12;?", .code = "12", .color = self.cursor_color },
+            };
+            for (osc_answers) |oa| {
+                if (std.mem.indexOf(u8, win, oa.pat) != null) {
+                    var ob: [64]u8 = undefined;
+                    const r: u32 = (oa.color >> 16) & 0xFF;
+                    const g: u32 = (oa.color >> 8) & 0xFF;
+                    const b: u32 = oa.color & 0xFF;
+                    const msg = std.fmt.bufPrint(&ob, "\x1b]{s};rgb:{x:0>2}{x:0>2}/{x:0>2}{x:0>2}/{x:0>2}{x:0>2}\x1b\\", .{
+                        oa.code, r, r, g, g, b, b,
+                    }) catch null;
+                    if (msg) |m| self.emit(m);
+                    replied = true;
+                }
             }
             if (std.mem.indexOf(u8, win, "\x1b[>c") != null) {
                 self.emit("\x1b[>1;10;0c"); // secondary DA
@@ -1465,35 +1487,12 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 if (msg) |m| self.emit(m);
                 replied = true;
             }
-            var rest = win;
-            while (std.mem.indexOf(u8, rest, "\x1bP+q")) |pos| {
-                self.emit("\x1bP0+r\x1b\\"); // XTGETTCAP: unsupported
-                rest = rest[pos + 4 ..];
-                replied = true;
-            }
-            // OSC 10/11/12 color queries, answered from the theme.
-            const osc_answers = [_]struct { pat: []const u8, color: u32 }{
-                .{ .pat = "]10;?", .color = self.fg },
-                .{ .pat = "]11;?", .color = self.bg },
-                .{ .pat = "]12;?", .color = self.cursor_color },
-            };
-            for (osc_answers) |oa| {
-                if (std.mem.indexOf(u8, win, oa.pat) != null) {
-                    var ob: [64]u8 = undefined;
-                    const num = std.mem.indexOf(u8, oa.pat, "?").?;
-                    const code = oa.pat[0..num];
-                    const r: u32 = (oa.color >> 16) & 0xFF;
-                    const g: u32 = (oa.color >> 8) & 0xFF;
-                    const b: u32 = oa.color & 0xFF;
-                    const msg = std.fmt.bufPrint(&ob, "\x1b]{s};rgb:{x:0>2}{x:0>2}/{x:0>2}{x:0>2}/{x:0>2}{x:0>2}\x1b\\", .{
-                        code, r, r, g, g, b, b,
-                    }) catch null;
-                    if (msg) |m| self.emit(m);
-                    replied = true;
-                }
-            }
             if (std.mem.indexOf(u8, win, "\x1b[?u") != null) {
                 self.emit("\x1b[?0u"); // kitty keyboard: no progressive flags
+                replied = true;
+            }
+            if (hasCsi(win, 'c')) {
+                self.emit("\x1b[?1;2c"); // primary DA: VT100
                 replied = true;
             }
             if (replied) {

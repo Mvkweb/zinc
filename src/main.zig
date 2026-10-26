@@ -355,8 +355,24 @@ fn answerQueries(fd: i32, overlap: *[16]u8, overlap_len: *usize, chunk: []const 
     const win = window[0 .. overlap_len.* + chunk.len];
 
     var replied = false;
-    if (hasCsi(win, 'c')) {
-        pty_mod.writeAll(fd, "\x1b[?1;2c"); // primary DA: VT100
+    // XTGETTCAP: one "unsupported" reply per query in the window.
+    var rest = win;
+    while (std.mem.indexOf(u8, rest, "\x1bP+q")) |pos| {
+        pty_mod.writeAll(fd, "\x1bP0+r\x1b\\");
+        rest = rest[pos + 4 ..];
+        replied = true;
+    }
+    // OSC 10/11/12 color queries: answer from our palette (bg black).
+    if (std.mem.indexOf(u8, win, "]10;?") != null) {
+        pty_mod.writeAll(fd, "\x1b]10;rgb:ffff/ffff/ffff\x1b\\");
+        replied = true;
+    }
+    if (std.mem.indexOf(u8, win, "]11;?") != null) {
+        pty_mod.writeAll(fd, "\x1b]11;rgb:0000/0000/0000\x1b\\");
+        replied = true;
+    }
+    if (std.mem.indexOf(u8, win, "]12;?") != null) {
+        pty_mod.writeAll(fd, "\x1b]12;rgb:ffff/ffff/ffff\x1b\\");
         replied = true;
     }
     if (std.mem.indexOf(u8, win, "\x1b[>c") != null) {
@@ -374,29 +390,13 @@ fn answerQueries(fd: i32, overlap: *[16]u8, overlap_len: *usize, chunk: []const 
         if (msg) |m| pty_mod.writeAll(fd, m);
         replied = true;
     }
-    // XTGETTCAP: one "unsupported" reply per query in the window.
-    var rest = win;
-    while (std.mem.indexOf(u8, rest, "\x1bP+q")) |pos| {
-        pty_mod.writeAll(fd, "\x1bP0+r\x1b\\");
-        rest = rest[pos + 4 ..];
-        replied = true;
-    }
-    // OSC 10/11/12 color queries: answer from our palette (bg black).
-    if (std.mem.indexOf(u8, win, "]10;?") != null) {
-        pty_mod.writeAll(fd, "\x1b]10;rgb:ff/ff/ff\x1b\\");
-        replied = true;
-    }
-    if (std.mem.indexOf(u8, win, "]11;?") != null) {
-        pty_mod.writeAll(fd, "\x1b]11;rgb:00/00/00\x1b\\");
-        replied = true;
-    }
-    if (std.mem.indexOf(u8, win, "]12;?") != null) {
-        pty_mod.writeAll(fd, "\x1b]12;rgb:ff/ff/ff\x1b\\");
-        replied = true;
-    }
     // Kitty keyboard query (CSI ? u): report no progressive flags.
     if (std.mem.indexOf(u8, win, "\x1b[?u") != null) {
         pty_mod.writeAll(fd, "\x1b[?0u");
+        replied = true;
+    }
+    if (hasCsi(win, 'c')) {
+        pty_mod.writeAll(fd, "\x1b[?1;2c"); // primary DA: VT100
         replied = true;
     }
     if (replied) {
