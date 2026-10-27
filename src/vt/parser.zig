@@ -116,7 +116,7 @@ pub const Parser = struct {
                     '0'...'9' => {
                         const d: u16 = b - '0';
                         const i: usize = @min(self.param_count, 15);
-                        self.params[i] = self.params[i] * 10 + d;
+                        self.params[i] = self.params[i] *| 10 +| d;
                         return null;
                     },
                     ';' => {
@@ -328,4 +328,24 @@ test "non-DEC markers swallowed, DEC still dispatches" {
         },
         else => return error.Fail,
     }
+}
+
+test "large and overflowing CSI params saturate safely" {
+    var p = Parser{};
+    var dispatched = false;
+    // 99999 exceeds u16 (65535); saturating math clamps at maxInt(u16) without panic.
+    for ("\x1b[99999;99999999H") |b| {
+        if (p.feed(b)) |act| {
+            switch (act) {
+                .csi_dispatch => |d| {
+                    dispatched = true;
+                    try std.testing.expectEqual(@as(u8, 'H'), d.final);
+                    try std.testing.expectEqual(@as(u16, std.math.maxInt(u16)), d.params[0]);
+                    try std.testing.expectEqual(@as(u16, std.math.maxInt(u16)), d.params[1]);
+                },
+                else => return error.Fail,
+            }
+        }
+    }
+    try std.testing.expect(dispatched);
 }
