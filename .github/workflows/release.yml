@@ -1,0 +1,35 @@
+name: Create release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: write
+
+    env:
+      RELEASE_NAME: zinc-${{ github.ref_name }}
+
+    steps:
+      - name: Checkout source
+        uses: actions/checkout@v4
+
+      - name: Build release archive
+        run: |
+          mkdir -p ".release/$RELEASE_NAME"
+          rsync -av --exclude={'.*','zig-cache','zig-out','references','scratch'} . ".release/$RELEASE_NAME"
+          tar -C .release -czf "$RELEASE_NAME.tar.gz" "$RELEASE_NAME"
+          cp "$RELEASE_NAME.tar.gz" zinc-latest.tar.gz
+
+      - name: Publish GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            ${{ env.RELEASE_NAME }}.tar.gz
+            zinc-latest.tar.gz
+          generate_release_notes: true
