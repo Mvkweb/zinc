@@ -176,7 +176,12 @@ pub const xdg_toplevel = struct {
     pub const version: c_int = 7;
     pub const SET_TITLE: u32 = 2;
     pub const SET_APP_ID: u32 = 3;
+    pub const SHOW_WINDOW_MENU: u32 = 4;
+    pub const MOVE: u32 = 5;
     pub const SET_MIN_SIZE: u32 = 8;
+    pub const SET_MAXIMIZED: u32 = 9;
+    pub const UNSET_MAXIMIZED: u32 = 10;
+    pub const SET_MINIMIZED: u32 = 13;
 
     var methods = [_]c.wl_message{
         .{ .name = "destroy", .signature = "", .types = null },
@@ -218,7 +223,64 @@ pub fn linkAll() void {
     wm_base.link(core.surface);
     cursor_shape.link(core.pointer);
     text_input.link(core.seat, core.surface);
+    decoration.link(&xdg_toplevel.interface);
 }
+
+// ---------------------------------------------------------------------------
+// zxdg_decoration_manager_v1 / zxdg_toplevel_decoration_v1 (xdg-decoration-unstable-v1,
+// version 1; server-side decorations).
+// manager requests: destroy=0, get_toplevel_decoration=1 ("no")
+// toplevel_decoration requests: destroy=0, set_mode=1 ("u"), unset_mode=2 ("")
+// toplevel_decoration events: configure=0 ("u")
+// ---------------------------------------------------------------------------
+
+pub const decoration = struct {
+    pub const version: c_int = 1;
+    pub const MANAGER_DESTROY: u32 = 0;
+    pub const MANAGER_GET_TOPLEVEL_DECORATION: u32 = 1;
+    pub const TOPLEVEL_DECORATION_DESTROY: u32 = 0;
+    pub const TOPLEVEL_DECORATION_SET_MODE: u32 = 1;
+    pub const TOPLEVEL_DECORATION_UNSET_MODE: u32 = 2;
+
+    pub const MODE_CLIENT_SIDE: u32 = 1;
+    pub const MODE_SERVER_SIDE: u32 = 2;
+
+    var types_get_toplevel = [_]?*const c.wl_interface{ null, null };
+    var manager_methods = [_]c.wl_message{
+        .{ .name = "destroy", .signature = "", .types = null },
+        .{ .name = "get_toplevel_decoration", .signature = "no", .types = &types_get_toplevel },
+    };
+    pub var manager_interface: c.wl_interface = .{
+        .name = "zxdg_decoration_manager_v1",
+        .version = version,
+        .method_count = 2,
+        .methods = &manager_methods,
+        .event_count = 0,
+        .events = null,
+    };
+
+    var toplevel_methods = [_]c.wl_message{
+        .{ .name = "destroy", .signature = "", .types = null },
+        .{ .name = "set_mode", .signature = "u", .types = null },
+        .{ .name = "unset_mode", .signature = "", .types = null },
+    };
+    var toplevel_events = [_]c.wl_message{
+        .{ .name = "configure", .signature = "u", .types = null },
+    };
+    pub var toplevel_interface: c.wl_interface = .{
+        .name = "zxdg_toplevel_decoration_v1",
+        .version = version,
+        .method_count = 3,
+        .methods = &toplevel_methods,
+        .event_count = 1,
+        .events = &toplevel_events,
+    };
+
+    pub fn link(toplevel_iface: *const c.wl_interface) void {
+        types_get_toplevel[0] = @ptrCast(&toplevel_interface);
+        types_get_toplevel[1] = toplevel_iface;
+    }
+};
 
 // ---------------------------------------------------------------------------
 // wp_cursor_shape_manager_v1 (cursor-shape-v1, version 1; server-side
@@ -398,6 +460,11 @@ test "xdg tables sane + linked" {
     try std.testing.expectEqual(@as(u32, 2), wm_base.GET_XDG_SURFACE);
     try std.testing.expectEqual(@as(u32, 1), xdg_surface.GET_TOPLEVEL);
     try std.testing.expectEqual(@as(u32, 4), xdg_surface.ACK_CONFIGURE);
+    try std.testing.expectEqual(@as(u32, 4), xdg_toplevel.SHOW_WINDOW_MENU);
+    try std.testing.expectEqual(@as(u32, 5), xdg_toplevel.MOVE);
+    try std.testing.expectEqual(@as(u32, 9), xdg_toplevel.SET_MAXIMIZED);
+    try std.testing.expectEqual(@as(u32, 10), xdg_toplevel.UNSET_MAXIMIZED);
+    try std.testing.expectEqual(@as(u32, 13), xdg_toplevel.SET_MINIMIZED);
     // Cursor-shape tables (cursor-shape-v1): names, counts, linkage.
     try expectName(&cursor_shape.manager_interface, "wp_cursor_shape_manager_v1");
     try expectName(&cursor_shape.device_interface, "wp_cursor_shape_device_v1");
@@ -433,4 +500,19 @@ test "xdg tables sane + linked" {
     try std.testing.expectEqual(@as(u32, 5), text_input.EVENT_DONE);
     try std.testing.expectEqualStrings("sii", std.mem.span(text_input.input_methods[3].signature));
     try std.testing.expectEqualStrings("?sii", std.mem.span(text_input.input_events[2].signature));
+    // decoration tables: names, counts, linkage, opcodes.
+    try expectName(&decoration.manager_interface, "zxdg_decoration_manager_v1");
+    try expectName(&decoration.toplevel_interface, "zxdg_toplevel_decoration_v1");
+    try std.testing.expectEqual(@as(c_int, 2), decoration.manager_interface.method_count);
+    try std.testing.expectEqual(@as(c_int, 3), decoration.toplevel_interface.method_count);
+    try std.testing.expectEqual(@as(c_int, 1), decoration.toplevel_interface.event_count);
+    try std.testing.expect(decoration.types_get_toplevel[0] != null);
+    try std.testing.expect(decoration.types_get_toplevel[1] != null);
+    try expectName(decoration.types_get_toplevel[0].?, "zxdg_toplevel_decoration_v1");
+    try expectName(decoration.types_get_toplevel[1].?, "xdg_toplevel");
+    try std.testing.expectEqual(@as(u32, 1), decoration.MANAGER_GET_TOPLEVEL_DECORATION);
+    try std.testing.expectEqual(@as(u32, 1), decoration.TOPLEVEL_DECORATION_SET_MODE);
+    try std.testing.expectEqual(@as(u32, 2), decoration.TOPLEVEL_DECORATION_UNSET_MODE);
+    try std.testing.expectEqual(@as(u32, 1), decoration.MODE_CLIENT_SIDE);
+    try std.testing.expectEqual(@as(u32, 2), decoration.MODE_SERVER_SIDE);
 }

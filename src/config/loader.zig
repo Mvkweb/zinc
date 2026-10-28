@@ -54,6 +54,11 @@ pub const DEFAULT_CONFIG_TEMPLATE =
     \\alt-padding-x = 0
     \\alt-padding-y = 0
     \\
+    \\# --- Window Decorations ---
+    \\# decorations: auto (SSD on KDE/Sway, CSD on GNOME), none (borderless everywhere),
+    \\# csd (always draw built-in header bar), or server (always request SSD).
+    \\decorations = auto
+    \\
     \\# --- Theme Colors (hex format: #RRGGBB) ---
     \\# Dark background and soft white text (matches Foot defaults).
     \\background = #0b0f11
@@ -352,17 +357,17 @@ test "template stamp matches CURRENT_CONFIG_VERSION" {
 
 test "template documents every supported key" {
     const keys = [_][]const u8{
-        "font-size",            "font-family",           "padding-x",
-        "padding-y",            "alt-padding-x",         "alt-padding-y",
-        "background",           "foreground",            "selection-background",
-        "selection-foreground", "cursor-color",          "link-color",
-        "background-opacity",   "cursor-style",          "cursor-blink",
-        "cursor-thickness",     "cursor-glide",          "cursor-glide-ms",
-        "cursor-trail-ms",      "smooth-scroll",         "smooth-scroll-ms",
-        "scroll-step",          "selection-single-cell", "find-match-numbers",
-        "find-number-scale",    "editor-command",        "editor-command-terminal",
-        "dir-cd-mod",           "dir-open-mod",          "dir-cd-ls",
-        "config-version",
+        "font-size",               "font-family",          "padding-x",
+        "padding-y",               "alt-padding-x",        "alt-padding-y",
+        "decorations",             "background",           "foreground",
+        "selection-background",    "selection-foreground", "cursor-color",
+        "link-color",              "background-opacity",   "cursor-style",
+        "cursor-blink",            "cursor-thickness",     "cursor-glide",
+        "cursor-glide-ms",         "cursor-trail-ms",      "smooth-scroll",
+        "smooth-scroll-ms",        "scroll-step",          "selection-single-cell",
+        "find-match-numbers",      "find-number-scale",    "editor-command",
+        "editor-command-terminal", "dir-cd-mod",           "dir-open-mod",
+        "dir-cd-ls",               "config-version",
     };
     for (keys) |k| {
         try std.testing.expect(std.mem.indexOf(u8, DEFAULT_CONFIG_TEMPLATE, k) != null);
