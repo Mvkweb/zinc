@@ -12,6 +12,7 @@ const atlas_mod = @import("atlas.zig");
 const kitty_mod = @import("../gfx/kitty.zig");
 // Shared emoji-range rule (bake gate matches the wide-cell rule).
 const utf8_mod = @import("../util/utf8.zig");
+const trimMemory = @import("../util/malloc.zig").trimMemory;
 
 pub const Error = error{
     NoFont,
@@ -336,12 +337,10 @@ pub const fc = struct {
         if (initialized) {
             c.FcFini();
             initialized = false;
-            _ = malloc_trim(0);
+            trimMemory();
         }
     }
 };
-
-extern "c" fn malloc_trim(pad: usize) c_int;
 
 /// Candidate load order: ZINC_FONT env > config path > well-known monos.
 /// Each entry is tried via FT_New_Face until one loads; nothing is probed
