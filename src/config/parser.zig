@@ -5,10 +5,12 @@ const std = @import("std");
 const config_mod = @import("../config.zig");
 const input_kb = @import("../input/keyboard.zig");
 pub const CursorStyle = config_mod.CursorStyle;
+pub const DecorationMode = config_mod.DecorationMode;
 
 pub const RuntimeConfig = struct {
     font_size: ?f32 = null,
     font_family: ?[]const u8 = null,
+    decorations: ?DecorationMode = null,
     pad_x: ?u32 = null,
     pad_y: ?u32 = null,
     alt_pad_x: ?u32 = null,
@@ -218,6 +220,17 @@ pub fn parse(content: []const u8, cfg: *RuntimeConfig, gpa: std.mem.Allocator) v
             if (std.fmt.parseInt(u8, trimQuotes(val), 10)) |s| {
                 if (s >= 1 and s <= 3) cfg.find_number_scale = s;
             } else |_| {}
+        } else if (std.ascii.eqlIgnoreCase(key, "decorations") or std.ascii.eqlIgnoreCase(key, "decoration") or std.ascii.eqlIgnoreCase(key, "window-decorations") or std.ascii.eqlIgnoreCase(key, "window_decorations")) {
+            const v = trimQuotes(val);
+            if (std.ascii.eqlIgnoreCase(v, "auto")) {
+                cfg.decorations = .auto;
+            } else if (std.ascii.eqlIgnoreCase(v, "none") or std.ascii.eqlIgnoreCase(v, "false") or std.ascii.eqlIgnoreCase(v, "no") or std.ascii.eqlIgnoreCase(v, "0")) {
+                cfg.decorations = .none;
+            } else if (std.ascii.eqlIgnoreCase(v, "csd") or std.ascii.eqlIgnoreCase(v, "client")) {
+                cfg.decorations = .csd;
+            } else if (std.ascii.eqlIgnoreCase(v, "server") or std.ascii.eqlIgnoreCase(v, "ssd") or std.ascii.eqlIgnoreCase(v, "true") or std.ascii.eqlIgnoreCase(v, "yes") or std.ascii.eqlIgnoreCase(v, "1")) {
+                cfg.decorations = .server;
+            }
         } else if (std.ascii.eqlIgnoreCase(key, "editor-command") or std.ascii.eqlIgnoreCase(key, "editor_command") or std.ascii.eqlIgnoreCase(key, "editor")) {
             const cmd = trimQuotes(val);
             if (cfg.editor_command) |old| gpa.free(old);
@@ -326,11 +339,14 @@ test "parse complete config content" {
         \\scroll-step = 5
         \\dir-cd-mod = ctrl
         \\dir-open-mod = shift
+        \\decorations = csd
     ;
 
     var cfg = RuntimeConfig{};
     defer cfg.deinit(std.testing.allocator);
     parse(text, &cfg, std.testing.allocator);
+
+    try std.testing.expectEqual(@as(?DecorationMode, .csd), cfg.decorations);
 
     try std.testing.expectEqual(@as(?f32, 14.5), cfg.font_size);
     try std.testing.expectEqualStrings("JetBrainsMono Nerd Font", cfg.font_family.?);

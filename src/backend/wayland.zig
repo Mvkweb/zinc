@@ -222,6 +222,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
         m: search_mod.Match,
         idx: usize,
     };
+    const CsdHover = enum { none, close, maximize, minimize };
+    const CsdIcon = enum { close, maximize, restore, minimize };
     return struct {
         gpa: std.mem.Allocator,
         io: std.Io,
@@ -415,6 +417,15 @@ pub fn App(comptime cfg: config_mod.Config) type {
         ddl: DataDeviceListener = undefined,
         dsl: DataSourceListener = undefined,
         dol: DataOfferListener = undefined,
+        tdl: ToplevelDecorationListener = undefined,
+        deco_manager: ?*anyopaque = null,
+        toplevel_deco: ?*anyopaque = null,
+        deco_pref: config_mod.DecorationMode = .auto,
+        csd_mode: bool = false,
+        is_maximized: bool = false,
+        is_fullscreen: bool = false,
+        csd_hover: CsdHover = .none,
+        last_title_click_time: u32 = 0,
 
         width: i32 = 0,
         height: i32 = 0,
@@ -449,8 +460,15 @@ pub fn App(comptime cfg: config_mod.Config) type {
         name_seat: u32 = 0,
         name_ddm: u32 = 0,
         name_cursor_shape: u32 = 0,
+        name_decoration: u32 = 0,
+        want_decoration_v: u32 = 1,
 
         const Self = @This();
+
+        fn headerHeight(self: *const Self) u32 {
+            if (!self.csd_mode or self.is_fullscreen) return 0;
+            return @intCast(@max(30, self.cell_h + 8));
+        }
 
         fn currentPadX(self: *const Self) u32 {
             return if (self.ctx.alt_active) self.alt_pad_x else self.pad_x;
@@ -662,10 +680,54 @@ pub fn App(comptime cfg: config_mod.Config) type {
             };
             _ = c.wl_proxy_add_listener(@ptrCast(tl), @ptrCast(&self.tll), @ptrCast(self));
 
+            self.deco_pref = self.runtime_cfg.decorations orelse cfg.decorations;
+            if (self.deco_pref == .csd) {
+                self.csd_mode = true;
+            } else if (self.deco_pref == .none or self.deco_pref == .server) {
+                self.csd_mode = false;
+            } else { // .auto
+                self.csd_mode = (self.name_decoration == 0);
+            }
+
+            if (self.name_decoration != 0) {
+                const dm_iface = &P.decoration.manager_interface;
+                self.deco_manager = @ptrCast(c.wl_proxy_marshal_constructor(
+                    @ptrCast(reg),
+                    P.core.REGISTRY_BIND,
+                    dm_iface,
+                    self.name_decoration,
+                    dm_iface.name,
+                    self.want_decoration_v,
+                    @as(?*anyopaque, null),
+                ));
+                if (self.deco_manager != null and tl != null) {
+                    self.toplevel_deco = @ptrCast(c.wl_proxy_marshal_constructor(
+                        @ptrCast(self.deco_manager),
+                        P.decoration.MANAGER_GET_TOPLEVEL_DECORATION,
+                        &P.decoration.toplevel_interface,
+                        @as(?*anyopaque, @ptrCast(tl)),
+                        @as(?*anyopaque, @ptrCast(tl)),
+                        @as(?*anyopaque, null),
+                    ));
+                    if (self.toplevel_deco) |td| {
+                        self.tdl = ToplevelDecorationListener{
+                            .configure = appOnToplevelDecorationConfigure,
+                        };
+                        _ = c.wl_proxy_add_listener(@ptrCast(td), @ptrCast(&self.tdl), @ptrCast(self));
+                        const mode: u32 = if (self.deco_pref == .csd or self.deco_pref == .none)
+                            P.decoration.MODE_CLIENT_SIDE
+                        else
+                            P.decoration.MODE_SERVER_SIDE;
+                        c.wl_proxy_marshal(@ptrCast(td), P.decoration.TOPLEVEL_DECORATION_SET_MODE, mode);
+                    }
+                }
+            }
+
             c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.SET_TITLE, @as([*:0]const u8, "zinc"));
             c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.SET_APP_ID, @as([*:0]const u8, "io.github.mvkweb.zinc"));
             const min_w = @as(i32, 15) * self.cell_w + 2 * @as(i32, @intCast(self.currentPadX()));
-            const min_h = @as(i32, 3) * self.cell_h + 2 * @as(i32, @intCast(self.currentPadY()));
+            const hh: i32 = @intCast(self.headerHeight());
+            const min_h = @as(i32, 3) * self.cell_h + 2 * @as(i32, @intCast(self.currentPadY())) + hh;
             c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.SET_MIN_SIZE, min_w, min_h);
             c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_COMMIT);
 
@@ -806,7 +868,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (self.width == 0) {
                 const pad: i32 = @intCast(self.currentPadX());
                 self.width = @as(i32, cfg.cols) * self.cell_w + 2 * pad;
-                self.height = @as(i32, cfg.rows) * self.cell_h + 2 * @as(i32, @intCast(self.currentPadY()));
+                self.height = @as(i32, cfg.rows) * self.cell_h + 2 * @as(i32, @intCast(self.currentPadY())) + hh;
             }
             try self.recreatePool();
 
@@ -882,6 +944,16 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.find_matches.deinit(self.gpa);
             if (self.seat) |s| c.wl_proxy_destroy(@ptrCast(s));
             if (self.toplevel) |t| c.wl_proxy_destroy(@ptrCast(t));
+            if (self.toplevel_deco) |td| {
+                c.wl_proxy_marshal(@ptrCast(td), P.decoration.TOPLEVEL_DECORATION_DESTROY);
+                c.wl_proxy_destroy(@ptrCast(td));
+                self.toplevel_deco = null;
+            }
+            if (self.deco_manager) |dm| {
+                c.wl_proxy_marshal(@ptrCast(dm), P.decoration.MANAGER_DESTROY);
+                c.wl_proxy_destroy(@ptrCast(dm));
+                self.deco_manager = null;
+            }
             if (self.xdg_surface) |x| c.wl_proxy_destroy(@ptrCast(x));
             if (self.surface) |s| c.wl_proxy_destroy(@ptrCast(s));
             if (self.wm_base) |w| c.wl_proxy_destroy(@ptrCast(w));
@@ -1030,15 +1102,16 @@ pub fn App(comptime cfg: config_mod.Config) type {
         fn cellOffsets(self: *Self) struct { x: i32, y: i32 } {
             const pad_x: i32 = @intCast(self.currentPadX());
             const pad_y: i32 = @intCast(self.currentPadY());
+            const hh: i32 = @intCast(self.headerHeight());
             const cw: i32 = self.cell_w;
             const ch: i32 = self.cell_h;
             const cols: i32 = @as(i32, self.ctx.grid.cols);
             const rows: i32 = @as(i32, self.ctx.grid.rows);
             const rem_x = @max(0, self.width - 2 * pad_x - cols * cw);
-            const rem_y = @max(0, self.height - 2 * pad_y - rows * ch);
+            const rem_y = @max(0, self.height - 2 * pad_y - hh - rows * ch);
             return .{
                 .x = pad_x + @divFloor(rem_x, 2),
-                .y = pad_y + @divFloor(rem_y, 2),
+                .y = hh + pad_y + @divFloor(rem_y, 2),
             };
         }
 
@@ -1225,6 +1298,136 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     dmgMerge(dmg, gdmg);
                 }
                 x += cw;
+            }
+        }
+
+        fn drawCsdIcon(self: *Self, icon: CsdIcon, cx: i32, cy: i32, col: u32, W: u32, H: u32, dmg: *software.Damage) void {
+            switch (icon) {
+                .close => {
+                    var i: i32 = -4;
+                    while (i <= 4) : (i += 1) {
+                        const px1 = cx + i;
+                        const py1 = cy + i;
+                        const px2 = cx + i;
+                        const py2 = cy - i;
+                        if (px1 >= 0 and py1 >= 0) software.fillRect(self.pool_pixels, W, H, @intCast(px1), @intCast(py1), 1, 1, col, dmg);
+                        if (px1 + 1 >= 0 and py1 >= 0) software.fillRect(self.pool_pixels, W, H, @intCast(px1 + 1), @intCast(py1), 1, 1, col, dmg);
+                        if (px2 >= 0 and py2 >= 0) software.fillRect(self.pool_pixels, W, H, @intCast(px2), @intCast(py2), 1, 1, col, dmg);
+                        if (px2 + 1 >= 0 and py2 >= 0) software.fillRect(self.pool_pixels, W, H, @intCast(px2 + 1), @intCast(py2), 1, 1, col, dmg);
+                    }
+                },
+                .maximize => {
+                    const sx = cx - 5;
+                    const sy = cy - 5;
+                    if (sx >= 0 and sy >= 0) {
+                        software.fillRect(self.pool_pixels, W, H, @intCast(sx), @intCast(sy), 10, 1, col, dmg);
+                        software.fillRect(self.pool_pixels, W, H, @intCast(sx), @intCast(sy + 9), 10, 1, col, dmg);
+                        software.fillRect(self.pool_pixels, W, H, @intCast(sx), @intCast(sy), 1, 10, col, dmg);
+                        software.fillRect(self.pool_pixels, W, H, @intCast(sx + 9), @intCast(sy), 1, 10, col, dmg);
+                    }
+                },
+                .restore => {
+                    const bx = cx - 3;
+                    const by = cy - 5;
+                    if (bx >= 0 and by >= 0) {
+                        software.fillRect(self.pool_pixels, W, H, @intCast(bx), @intCast(by), 8, 1, col, dmg);
+                        software.fillRect(self.pool_pixels, W, H, @intCast(bx + 7), @intCast(by), 1, 8, col, dmg);
+                        software.fillRect(self.pool_pixels, W, H, @intCast(bx), @intCast(by), 1, 3, col, dmg);
+                        software.fillRect(self.pool_pixels, W, H, @intCast(bx + 5), @intCast(by + 7), 3, 1, col, dmg);
+                    }
+                    const fx = cx - 5;
+                    const fy = cy - 3;
+                    if (fx >= 0 and fy >= 0) {
+                        software.fillRect(self.pool_pixels, W, H, @intCast(fx), @intCast(fy), 8, 1, col, dmg);
+                        software.fillRect(self.pool_pixels, W, H, @intCast(fx), @intCast(fy + 7), 8, 1, col, dmg);
+                        software.fillRect(self.pool_pixels, W, H, @intCast(fx), @intCast(fy), 1, 8, col, dmg);
+                        software.fillRect(self.pool_pixels, W, H, @intCast(fx + 7), @intCast(fy), 1, 8, col, dmg);
+                    }
+                },
+                .minimize => {
+                    const sx = cx - 5;
+                    const sy = cy;
+                    if (sx >= 0 and sy >= 0) {
+                        software.fillRect(self.pool_pixels, W, H, @intCast(sx), @intCast(sy), 10, 2, col, dmg);
+                    }
+                },
+            }
+        }
+
+        fn renderCsd(self: *Self, W: u32, H: u32, dmg: *software.Damage) void {
+            const hh = self.headerHeight();
+            if (hh == 0 or W == 0 or H == 0) return;
+
+            // 1. Header background (surface dark tone)
+            const bg_col: u32 = 0xFF14181B;
+            software.fillRect(self.pool_pixels, W, H, 0, 0, W, hh, bg_col, dmg);
+
+            // 2. Bottom 1px divider
+            const divider_col: u32 = 0xFF252A2E;
+            software.fillRect(self.pool_pixels, W, H, 0, hh - 1, W, 1, divider_col, dmg);
+
+            // 3. Window title text
+            const title_slice: []const u8 = if (self.ctx.title_len > 0)
+                self.ctx.title[0..self.ctx.title_len]
+            else
+                "zinc";
+
+            const cw = self.cell_w;
+            const ch = self.cell_h;
+            if (cw > 0 and ch > 0) {
+                const btn_area: i32 = 108; // 3 buttons * 36px
+                const avail_w = @as(i32, @intCast(W)) - btn_area - 20;
+                if (avail_w > 0) {
+                    const max_chars: usize = @intCast(@max(0, @divFloor(avail_w, cw)));
+                    const show_title = if (title_slice.len > max_chars) title_slice[0..max_chars] else title_slice;
+                    const tw = @as(i32, @intCast(show_title.len)) * cw;
+                    var tx = @divFloor(@as(i32, @intCast(W)) - tw, 2);
+                    if (tx < 16) tx = 16;
+                    if (tx + tw > @as(i32, @intCast(W)) - btn_area) {
+                        tx = @max(16, @as(i32, @intCast(W)) - btn_area - tw);
+                    }
+                    const ty = @max(0, @divFloor(@as(i32, @intCast(hh)) - ch, 2));
+                    self.drawBarText(show_title, 0xFFA0A5AA, tx, @intCast(ty), cw, ch, W, H, dmg);
+                }
+            }
+
+            // 4. Window control buttons (Close, Maximize/Restore, Minimize)
+            const btn_w: u32 = 36;
+            const btn_h: u32 = hh - 1;
+            const btn_cy: i32 = @as(i32, @intCast(hh / 2));
+
+            // Close button (rightmost: W - 36 .. W)
+            if (W >= btn_w) {
+                const close_x: u32 = W - btn_w;
+                if (self.csd_hover == .close) {
+                    software.fillRect(self.pool_pixels, W, H, close_x, 0, btn_w, btn_h, 0xFFE04343, dmg);
+                }
+                const close_col: u32 = if (self.csd_hover == .close) 0xFFFFFFFF else 0xFFAAAAAA;
+                const close_cx: i32 = @as(i32, @intCast(close_x)) + @as(i32, @intCast(btn_w / 2));
+                self.drawCsdIcon(.close, close_cx, btn_cy, close_col, W, H, dmg);
+            }
+
+            // Maximize button (middle: W - 72 .. W - 36)
+            if (W >= btn_w * 2) {
+                const max_x: u32 = W - btn_w * 2;
+                if (self.csd_hover == .maximize) {
+                    software.fillRectBlend(self.pool_pixels, W, H, @intCast(max_x), 0, btn_w, btn_h, 0x00FFFFFF, 0x22, dmg);
+                }
+                const max_col: u32 = if (self.csd_hover == .maximize) 0xFFFFFFFF else 0xFFAAAAAA;
+                const max_cx: i32 = @as(i32, @intCast(max_x)) + @as(i32, @intCast(btn_w / 2));
+                const max_icon: CsdIcon = if (self.is_maximized) .restore else .maximize;
+                self.drawCsdIcon(max_icon, max_cx, btn_cy, max_col, W, H, dmg);
+            }
+
+            // Minimize button (left of maximize: W - 108 .. W - 72)
+            if (W >= btn_w * 3) {
+                const min_x: u32 = W - btn_w * 3;
+                if (self.csd_hover == .minimize) {
+                    software.fillRectBlend(self.pool_pixels, W, H, @intCast(min_x), 0, btn_w, btn_h, 0x00FFFFFF, 0x22, dmg);
+                }
+                const min_col: u32 = if (self.csd_hover == .minimize) 0xFFFFFFFF else 0xFFAAAAAA;
+                const min_cx: i32 = @as(i32, @intCast(min_x)) + @as(i32, @intCast(btn_w / 2));
+                self.drawCsdIcon(.minimize, min_cx, btn_cy, min_col, W, H, dmg);
             }
         }
 
@@ -1980,6 +2183,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     software.fillRectBlend(self.pool_pixels, W, H, bg.x, bg.thumb_y, @intCast(scrollbar_mod.BAR_W), @intCast(bg.thumb_h), tcol, self.sb_alpha, &dmg);
                 }
             }
+            if (self.csd_mode) {
+                self.renderCsd(W, H, &dmg);
+            }
             // Full repaint painted everything: clear all flags so later
             // dirty-row frames stay truthful. (Dirty path clears rows as
             // it paints them, above.) Skipped mid-glide: fractional frames
@@ -1998,8 +2204,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.height = h;
             const pad_x = self.currentPadX();
             const pad_y = self.currentPadY();
+            const hh: i32 = @intCast(self.headerHeight());
             const cols: u16 = @intCast(@max(15, @divFloor(w - 2 * @as(i32, @intCast(pad_x)), self.cell_w)));
-            const rows: u16 = @intCast(@max(3, @divFloor(h - 2 * @as(i32, @intCast(pad_y)), self.cell_h)));
+            const rows: u16 = @intCast(@max(3, @divFloor(h - 2 * @as(i32, @intCast(pad_y)) - hh, self.cell_h)));
 
             if (cols == self.ctx.grid.cols and rows == self.ctx.grid.rows) {
                 self.ctx.grid.markAllDirty();
@@ -2025,8 +2232,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // real size lands mid-repaint and strands erased spans).
             const pad_x = self.currentPadX();
             const pad_y = self.currentPadY();
+            const hh: i32 = @intCast(self.headerHeight());
             const cols: u16 = @intCast(@max(15, @divFloor(self.width - 2 * @as(i32, @intCast(pad_x)), self.cell_w)));
-            const rows: u16 = @intCast(@max(3, @divFloor(self.height - 2 * @as(i32, @intCast(pad_y)), self.cell_h)));
+            const rows: u16 = @intCast(@max(3, @divFloor(self.height - 2 * @as(i32, @intCast(pad_y)) - hh, self.cell_h)));
             if (cols == self.ctx.grid.cols and rows == self.ctx.grid.rows) {
                 self.ctx.grid.markAllDirty();
                 self.needs_render = true;
@@ -2058,8 +2266,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (cfg.copy_mode and self.copy_active) self.exitCopyMode();
             const pad_x = self.currentPadX();
             const pad_y = self.currentPadY();
+            const hh: i32 = @intCast(self.headerHeight());
             const cols: u16 = @intCast(@max(15, @divFloor(self.width - 2 * @as(i32, @intCast(pad_x)), self.cell_w)));
-            const rows: u16 = @intCast(@max(3, @divFloor(self.height - 2 * @as(i32, @intCast(pad_y)), self.cell_h)));
+            const rows: u16 = @intCast(@max(3, @divFloor(self.height - 2 * @as(i32, @intCast(pad_y)) - hh, self.cell_h)));
             if (cols != self.ctx.grid.cols or rows != self.ctx.grid.rows) {
                 self.ctx.resize(cols, rows);
                 if (self.pty_fd >= 0) {
@@ -2106,8 +2315,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
             const pad_x = self.currentPadX();
             const pad_y = self.currentPadY();
+            const hh: i32 = @intCast(self.headerHeight());
             const cols: u16 = @intCast(@max(15, @divFloor(self.width - 2 * @as(i32, @intCast(pad_x)), self.cell_w)));
-            const rows: u16 = @intCast(@max(3, @divFloor(self.height - 2 * @as(i32, @intCast(pad_y)), self.cell_h)));
+            const rows: u16 = @intCast(@max(3, @divFloor(self.height - 2 * @as(i32, @intCast(pad_y)) - hh, self.cell_h)));
 
             self.ctx.resize(cols, rows);
             if (self.pty_fd >= 0) {
@@ -2346,8 +2556,16 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         // back to halfblocks.
                         const prev_mouse_mode = self.ctx.mouse_mode;
                         const prev_alt = self.ctx.alt_active;
+                        const prev_title_len = self.ctx.title_len;
                         self.ctx.parse(pty_buf[0..rrc]);
                         self.ctx.answerQueries(pty_buf[0..rrc]);
+                        if (self.ctx.title_len != prev_title_len and self.toplevel != null) {
+                            var zbuf: [257:0]u8 = undefined;
+                            const tlen = @min(self.ctx.title_len, 256);
+                            @memcpy(zbuf[0..tlen], self.ctx.title[0..tlen]);
+                            zbuf[tlen] = 0;
+                            c.wl_proxy_marshal(@ptrCast(self.toplevel), P.xdg_toplevel.SET_TITLE, zbuf[0..tlen :0].ptr);
+                        }
                         if (self.ctx.mouse_mode != prev_mouse_mode) {
                             if (self.ctx.mouse_mode != .off and cfg.selection and self.sel.active) {
                                 self.sel.clear();
@@ -2425,6 +2643,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
         fn imeRectNow(self: *const Self) [4]i32 {
             const px: i32 = @intCast(self.currentPadX());
             const py: i32 = @intCast(self.currentPadY());
+            const hh: i32 = @intCast(self.headerHeight());
             var col: i32 = self.ctx.cursor_col;
             if (self.ime.preedit_len > 0) {
                 const t = self.ime.preeditSlice();
@@ -2440,7 +2659,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             col = @min(col, @as(i32, self.ctx.grid.cols));
             return .{
                 px + col * self.cell_w,
-                py + @as(i32, self.ctx.cursor_row) * self.cell_h,
+                hh + py + @as(i32, self.ctx.cursor_row) * self.cell_h,
                 self.cell_w,
                 self.cell_h,
             };
@@ -2524,15 +2743,19 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// Current bar geometry (interpolated offset, so the thumb glides
         /// with the content instead of stepping row to row).
         fn sbGeom(self: *Self) scrollbar_mod.Geom {
-            return scrollbar_mod.layout(
+            const hh: i32 = @intCast(self.headerHeight());
+            var g = scrollbar_mod.layout(
                 self.width,
-                self.height,
+                self.height - hh,
                 @intCast(self.currentPadY()),
                 self.cell_h,
                 self.ctx.grid.rows,
                 self.ctx.grid.sb_len,
                 self.flow.shown_off,
             );
+            g.track_y += hh;
+            g.thumb_y += hh;
+            return g;
         }
 
         /// Bar visibility this frame: history + primary screen + local
@@ -3708,6 +3931,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
         }
 
         fn currentShape(self: *Self) u32 {
+            if (self.csd_mode and @divFloor(self.ptr_sy, 256) < self.headerHeight()) {
+                return P.cursor_shape.SHAPE_DEFAULT;
+            }
             const mods = self.currentMods();
             if (cfg.scrollbar and self.sb_dragging) {
                 return P.cursor_shape.SHAPE_GRABBING;
@@ -3762,6 +3988,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.ptr_inside = false;
             self.cursor_shape = 0;
             self.sb_hover = false;
+            if (self.csd_hover != .none) {
+                self.csd_hover = .none;
+                self.needs_render = true;
+            }
             // A release outside the window never arrives: end a drag here
             // rather than strand the capture (re-enter starts clean).
             self.sb_dragging = false;
@@ -3775,6 +4005,33 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.markActivity();
             self.ptr_sx = sx;
             self.ptr_sy = sy;
+
+            if (self.csd_mode) {
+                const py: i32 = @divFloor(sy, 256);
+                const hh: i32 = @intCast(self.headerHeight());
+                if (py < hh) {
+                    const px: i32 = @divFloor(sx, 256);
+                    const btn_w: i32 = 36;
+                    var new_hover: CsdHover = .none;
+                    if (px >= self.width - btn_w) {
+                        new_hover = .close;
+                    } else if (px >= self.width - btn_w * 2) {
+                        new_hover = .maximize;
+                    } else if (px >= self.width - btn_w * 3) {
+                        new_hover = .minimize;
+                    }
+                    if (new_hover != self.csd_hover) {
+                        self.csd_hover = new_hover;
+                        self.needs_render = true;
+                    }
+                    self.clearHover();
+                    self.refreshCursor();
+                    return;
+                } else if (self.csd_hover != .none) {
+                    self.csd_hover = .none;
+                    self.needs_render = true;
+                }
+            }
             const mods = self.currentMods();
             // Scrollbar hover tracks the strip (grab cursor) while the bar
             // is latched or fading; a faded strip keeps the text beam.
@@ -3851,6 +4108,73 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.last_serial = serial;
             self.ptr_serial = serial;
             if (!cfg.mouse) return;
+
+            if (self.csd_mode) {
+                const py: i32 = @divFloor(self.ptr_sy, 256);
+                const hh: i32 = @intCast(self.headerHeight());
+                if (py < hh) {
+                    if (button == 0x110) { // BTN_LEFT
+                        if (state == 1) { // Press
+                            const px: i32 = @divFloor(self.ptr_sx, 256);
+                            const btn_w: i32 = 36;
+                            if (px >= self.width - btn_w) {
+                                self.running = false;
+                                return;
+                            } else if (px >= self.width - btn_w * 2) {
+                                if (self.toplevel) |tl| {
+                                    if (self.is_maximized) {
+                                        c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.UNSET_MAXIMIZED);
+                                    } else {
+                                        c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.SET_MAXIMIZED);
+                                    }
+                                }
+                                return;
+                            } else if (px >= self.width - btn_w * 3) {
+                                if (self.toplevel) |tl| {
+                                    c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.SET_MINIMIZED);
+                                }
+                                return;
+                            } else {
+                                // Titlebar drag or double-click to toggle maximize
+                                if (time -| self.last_title_click_time < 300) {
+                                    self.last_title_click_time = 0;
+                                    if (self.toplevel) |tl| {
+                                        if (self.is_maximized) {
+                                            c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.UNSET_MAXIMIZED);
+                                        } else {
+                                            c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.SET_MAXIMIZED);
+                                        }
+                                    }
+                                    return;
+                                }
+                                self.last_title_click_time = time;
+                                if (self.seat != null and self.toplevel != null) {
+                                    c.wl_proxy_marshal(
+                                        @ptrCast(self.toplevel),
+                                        P.xdg_toplevel.MOVE,
+                                        @as(?*anyopaque, @ptrCast(self.seat)),
+                                        serial,
+                                    );
+                                }
+                                return;
+                            }
+                        }
+                    } else if (button == 0x111 and state == 1) { // BTN_RIGHT
+                        if (self.seat != null and self.toplevel != null) {
+                            c.wl_proxy_marshal(
+                                @ptrCast(self.toplevel),
+                                P.xdg_toplevel.SHOW_WINDOW_MENU,
+                                @as(?*anyopaque, @ptrCast(self.seat)),
+                                serial,
+                                @divFloor(self.ptr_sx, 256),
+                                @divFloor(self.ptr_sy, 256),
+                            );
+                        }
+                        return;
+                    }
+                    return;
+                }
+            }
             const mods = self.currentMods();
             // Scrollbar drag release lands here even if a mouse app
             // grabbed the screen mid-drag (never strand the capture).
@@ -4149,6 +4473,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.name_cursor_shape = name;
             } else if (std.mem.eql(u8, iname, "zwp_text_input_manager_v3")) {
                 self.name_ti_manager = name;
+            } else if (std.mem.eql(u8, iname, "zxdg_decoration_manager_v1")) {
+                self.name_decoration = name;
+                self.want_decoration_v = @min(version, 1);
             }
         }
 
@@ -4172,22 +4499,47 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.needs_render = true;
         }
 
+        fn appOnToplevelDecorationConfigure(data: ?*anyopaque, deco: ?*anyopaque, mode: u32) callconv(.c) void {
+            _ = deco;
+            const self: *Self = @ptrCast(@alignCast(data));
+            if (self.deco_pref == .auto) {
+                const want_csd = (mode == P.decoration.MODE_CLIENT_SIDE);
+                if (self.csd_mode != want_csd) {
+                    self.csd_mode = want_csd;
+                    if (self.configured) {
+                        self.handleResize(self.width, self.height);
+                        self.needs_render = true;
+                    }
+                }
+            }
+        }
+
         fn appOnToplevelConfigure(data: ?*anyopaque, tl: ?*P.XdgToplevel, w: i32, h: i32, states: ?*P.Array) callconv(.c) void {
             _ = tl;
             const self: *Self = @ptrCast(@alignCast(data));
             self.markActivity();
             var is_resizing = false;
+            var is_maximized = false;
+            var is_fullscreen = false;
             if (states) |st| {
                 if (st.data) |ptr| {
                     const count = st.size / @sizeOf(u32);
                     const s_slice: [*]const u32 = @ptrCast(@alignCast(ptr));
                     for (s_slice[0..count]) |s| {
-                        if (s == 3) { // XDG_TOPLEVEL_STATE_RESIZING
+                        if (s == 1) { // XDG_TOPLEVEL_STATE_MAXIMIZED
+                            is_maximized = true;
+                        } else if (s == 2) { // XDG_TOPLEVEL_STATE_FULLSCREEN
+                            is_fullscreen = true;
+                        } else if (s == 3) { // XDG_TOPLEVEL_STATE_RESIZING
                             is_resizing = true;
-                            break;
                         }
                     }
                 }
+            }
+            if (self.is_maximized != is_maximized or self.is_fullscreen != is_fullscreen) {
+                self.is_maximized = is_maximized;
+                self.is_fullscreen = is_fullscreen;
+                self.needs_render = true;
             }
             const drag_ended = self.is_resizing and !is_resizing;
             self.is_resizing = is_resizing;
@@ -4499,6 +4851,10 @@ const TextInputListener = extern struct {
     commit_string: ?*const fn (?*anyopaque, ?*anyopaque, ?[*:0]const u8) callconv(.c) void,
     delete_surrounding_text: ?*const fn (?*anyopaque, ?*anyopaque, u32, u32) callconv(.c) void,
     done: ?*const fn (?*anyopaque, ?*anyopaque, u32) callconv(.c) void,
+};
+
+const ToplevelDecorationListener = extern struct {
+    configure: ?*const fn (?*anyopaque, ?*anyopaque, u32) callconv(.c) void,
 };
 test "shm buffer resize" {
     var b = ShmBuffer{};

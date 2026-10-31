@@ -7,6 +7,9 @@ const input_kb = @import("input/keyboard.zig");
 /// Terminal cursor shape.
 pub const CursorStyle = enum { block, underline, bar };
 
+/// Window decorations mode.
+pub const DecorationMode = enum { auto, none, csd, server };
+
 pub const Config = struct {
     // Terminal geometry.
     cols: u16 = 80,
@@ -38,6 +41,8 @@ pub const Config = struct {
     truecolor: bool = true,
     pad_x: u32 = 25,
     pad_y: u32 = 25,
+    /// Window decorations (auto = SSD if compositor supports it, CSD on GNOME; none = borderless).
+    decorations: DecorationMode = .auto,
     /// Padding when in alt-screen (TUI apps like opencode/nvim/btop: edge-to-edge).
     alt_pad_x: u32 = 0,
     alt_pad_y: u32 = 0,
