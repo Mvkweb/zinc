@@ -4,12 +4,8 @@
 
 const std = @import("std");
 const c = @import("c");
+const trimMemory = @import("../util/malloc.zig").trimMemory;
 
-/// libc file append for ZINC_TRACE (see tracePty). pty.zig precedent.
-extern "c" fn fopen(path: [*:0]const u8, mode: [*:0]const u8) ?*anyopaque;
-extern "c" fn fwrite(ptr: [*]const u8, size: usize, nmemb: usize, stream: *anyopaque) usize;
-extern "c" fn fclose(stream: *anyopaque) c_int;
-extern "c" fn malloc_trim(pad: usize) c_int;
 const wl_proto = @import("wl_proto.zig");
 
 pub const BackendError = error{
@@ -833,7 +829,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const tfd = linux.timerfd_create(.MONOTONIC, .{ .CLOEXEC = true, .NONBLOCK = true });
             if (linux.errno(tfd) == .SUCCESS) self.repeat_fd = @intCast(tfd);
             self.last_activity_ms = context_mod.nowMs();
-            _ = malloc_trim(0);
+            trimMemory();
 
             return self;
         }
@@ -983,9 +979,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// /tmp/zinc-trace.bin for offline escape-stream analysis.
         fn tracePty(self: *const Self, bytes: []const u8) void {
             if (!self.trace_on) return;
-            const f = fopen("/tmp/zinc-trace.bin", "ab") orelse return;
-            _ = fwrite(bytes.ptr, 1, bytes.len, f);
-            _ = fclose(f);
+            const f = std.c.fopen("/tmp/zinc-trace.bin", "ab") orelse return;
+            _ = std.c.fwrite(bytes.ptr, 1, bytes.len, f);
+            _ = std.c.fclose(f);
         }
 
         fn dmgMerge(dst: *software.Damage, src: software.Damage) void {
@@ -2390,7 +2386,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 // Idle settle trimming: if no PTY or input activity for 2000ms, reclaim free arena memory to Linux.
                 const now_idle = context_mod.nowMs();
                 if (!self.idle_trimmed and (now_idle - self.last_activity_ms >= 2000)) {
-                    _ = malloc_trim(0);
+                    trimMemory();
                     self.idle_trimmed = true;
                 }
             }
