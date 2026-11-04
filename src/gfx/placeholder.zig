@@ -52,18 +52,28 @@ pub const DIACRITICS: [297]u32 = .{
 };
 
 // Floor pin: putCodepoint skips the combining/diacritic checks for cp <
-// 0x300, so no table entry may sit below it. Breaks loudly if violated.
+// 0x300, so no table entry may sit below it. Strictly ascending order is
+// what diacriticValue's binary search relies on. Breaks loudly if violated.
 comptime {
-    for (DIACRITICS) |d| {
+    for (DIACRITICS, 0..) |d, i| {
         if (d < 0x300) @compileError("diacritic entry below ASCII fast-path floor");
+        if (i > 0 and d <= DIACRITICS[i - 1]) @compileError("diacritic table must be strictly ascending");
     }
 }
 
 /// Reverse lookup: diacritic char -> number (image row/col/id-extra).
-/// Linear scan; only called for combining marks on placeholder cells.
+/// Binary search: putCodepoint asks for every codepoint >= U+0300 (CJK,
+/// Greek, box drawing), and a linear miss over 297 entries dominated
+/// non-ASCII parsing.
 pub fn diacriticValue(cp: u32) ?u16 {
-    for (DIACRITICS, 0..) |d, i| {
-        if (d == cp) return @intCast(i);
+    if (cp < DIACRITICS[0] or cp > DIACRITICS[DIACRITICS.len - 1]) return null;
+    var lo: usize = 0;
+    var hi: usize = DIACRITICS.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        const d = DIACRITICS[mid];
+        if (d == cp) return @intCast(mid);
+        if (d < cp) lo = mid + 1 else hi = mid;
     }
     return null;
 }
@@ -73,6 +83,17 @@ pub fn diacriticValue(cp: u32) ?u16 {
 /// symbols), so placeholders need their own classifier.
 pub fn isDiacritic(cp: u32) bool {
     return diacriticValue(cp) != null;
+}
+
+test "diacriticValue binary search matches every table index" {
+    for (DIACRITICS, 0..) |d, i| {
+        try std.testing.expectEqual(@as(?u16, @intCast(i)), diacriticValue(d));
+        // Gaps between entries must miss.
+        if (i + 1 < DIACRITICS.len and DIACRITICS[i + 1] > d + 1)
+            try std.testing.expectEqual(@as(?u16, null), diacriticValue(d + 1));
+    }
+    try std.testing.expectEqual(@as(?u16, null), diacriticValue(0x4E2D)); // CJK miss
+    try std.testing.expectEqual(@as(?u16, null), diacriticValue(0x2502)); // box drawing
 }
 
 test "diacritic table endpoints + miss" {

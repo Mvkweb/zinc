@@ -14,6 +14,9 @@ pub const BackendError = error{
     RoundtripFailed,
 };
 
+/// Painted cursor rect in surface pixels (glide-interpolated + stretch).
+const CurRect = struct { x: i32, y: i32, w: i32, h: i32 };
+
 pub const ShmBuffer = struct {
     w: i32 = 0,
     h: i32 = 0,
@@ -294,11 +297,15 @@ pub fn App(comptime cfg: config_mod.Config) type {
         copy_selecting: bool = false,
         /// Dirty-row render bookkeeping: last painted overlay bits (any
         /// change forces a full repaint — overlays paint without cell
-        /// writes) and last painted cursor cell (motion without writes
-        /// would ghost; both rows repaint instead).
+        /// writes) and last painted cursor rect (motion without writes
+        /// would ghost: glide, blink, CUP over clean cells). When it moves,
+        /// only the rows it left and entered repaint, never the window;
+        /// a hidden cursor repaints nothing.
         last_overlay: u32 = 0,
-        last_cur_col: u16 = 0,
-        last_cur_row: u16 = 0,
+        last_cur_rect: ?CurRect = null,
+        /// CSD header inputs as last painted: the header repaints only on
+        /// full frames or when these change (title, hover, maximize, W).
+        csd_sig: u64 = 0,
         /// Runtime badge knobs (file config overrides comptime defaults).
         find_numbers: bool = cfg.find_match_numbers,
         find_num_scale: u8 = cfg.find_number_scale,
@@ -570,6 +577,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .dir_cd_mod = runtime_cfg.dir_cd_mod orelse cfg.dir_cd_mod,
                 .dir_open_mod = runtime_cfg.dir_open_mod orelse cfg.dir_open_mod,
             };
+            self.ctx.blink_enabled = self.cursor_blink;
             errdefer {
                 self.deinit();
                 gpa.destroy(self);
@@ -1608,6 +1616,35 @@ pub fn App(comptime cfg: config_mod.Config) type {
             dmgMerge(dmg, idmg);
         }
 
+        /// Cursor bounding rect for every shape (block/bar/underline and
+        /// the unfocused outline all paint inside it): interpolated glide
+        /// position, stretched horizontally toward the target cell.
+        fn cursorRect(self: *const Self, px: i32, py: i32, cw: i32, ch: i32, fyshift: i32) CurRect {
+            const gp = self.flow.cursorPx();
+            const tgtx: i32 = @as(i32, self.ctx.cursor_col) * cw;
+            const sdx: i32 = @min(cw, @as(i32, @intFromFloat(@round(@abs(@as(f32, @floatFromInt(tgtx - gp.x)) / 2.0)))));
+            const sx0: i32 = if (tgtx < gp.x) -sdx else 0;
+            return .{ .x = px + gp.x + sx0, .y = py + gp.y + fyshift, .w = cw + sdx, .h = ch };
+        }
+
+        /// Dirty every grid row a painted rect overlaps (clamped).
+        fn markRectRowsDirty(self: *Self, r: CurRect, py: i32, ch: i32) void {
+            if (ch <= 0 or self.ctx.grid.rows == 0) return;
+            const last: i32 = @as(i32, self.ctx.grid.rows) - 1;
+            const top = std.math.clamp(@divFloor(r.y - py, ch), 0, last);
+            const bot = std.math.clamp(@divFloor(r.y + r.h - 1 - py, ch), 0, last);
+            self.ctx.grid.markRowsDirty(@intCast(top), @intCast(bot));
+        }
+
+        /// Everything the CSD header paints from; equal sig = same pixels.
+        fn csdSig(self: *const Self, W: u32) u64 {
+            var h = std.hash.Wyhash.init(W);
+            h.update(self.ctx.title[0..self.ctx.title_len]);
+            const k = [_]u32{ @backingInt(self.csd_hover), @intFromBool(self.is_maximized), self.headerHeight(), @intCast(self.cell_w), @intCast(self.cell_h) };
+            h.update(std.mem.asBytes(&k));
+            return h.final() | 1;
+        }
+
         /// Any dirty cell on a live row (dirty-row render gate).
         fn rowDirty(self: *Self, row: u16) bool {
             for (self.ctx.grid.rowSlice(row)) |*cell| {
@@ -1791,7 +1828,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // so the fast path cannot stale a pixel it doesn't understand.
             const full =
                 self.ctx.grid.dirty_all or
-                !self.flow.settled() or
+                self.flow.scroll_moving or
                 self.pending_resize != null or
                 self.resize_settle_ms > 0 or
                 voff != 0 or
@@ -1826,6 +1863,19 @@ pub fn App(comptime cfg: config_mod.Config) type {
             } else {
                 self.find_vis_n = 0;
             }
+            // Cursor rect up front: a moved or hidden cursor dirties the
+            // rows it left and entered, so glide/blink frames repaint those
+            // rows instead of the window.
+            const show_cursor = (!(self.ctx.decscusr_blink orelse self.cursor_blink) or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0 and !self.copy_active;
+            const cur_rect: ?CurRect = if (show_cursor and self.ctx.cursor_col < visible_cols and self.ctx.cursor_row < visible_rows)
+                self.cursorRect(px, py, cw, ch, fyshift)
+            else
+                null;
+            if (!full and !std.meta.eql(cur_rect, self.last_cur_rect)) {
+                if (self.last_cur_rect) |r| self.markRectRowsDirty(r, py, ch);
+                if (cur_rect) |r| self.markRectRowsDirty(r, py, ch);
+            }
+            self.last_cur_rect = cur_rect;
             // Tier 0 images (below cell backgrounds).
             self.blitImageTier(0, W, H, px, py, cw, ch, visible_cols, visible_rows, &dmg);
 
@@ -2077,7 +2127,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Cursor trail: fading departure cells under the live cursor.
             // Drawn first so the gliding cursor paints on top. Shares the
             // cursor's visibility: no ghosts while hidden.
-            const show_cursor = (!(self.ctx.decscusr_blink orelse self.cursor_blink) or self.ctx.blink_visible) and self.ctx.show_cursor and self.ctx.grid.view_offset == 0 and !self.copy_active;
             if (show_cursor and self.trail_ms > 0 and self.flow.trail_n > 0) {
                 const tcol = self.themed(self.ctx.cursor_color, false);
                 const tt: u32 = @intCast(@max(1, @as(i32, @intFromFloat(@ceil(self.cursor_thick_px)))));
@@ -2184,7 +2233,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 }
             }
             if (self.csd_mode) {
-                self.renderCsd(W, H, &dmg);
+                const sig = self.csdSig(W);
+                if (full or sig != self.csd_sig) {
+                    self.renderCsd(W, H, &dmg);
+                    self.csd_sig = sig;
+                }
             }
             // Full repaint painted everything: clear all flags so later
             // dirty-row frames stay truthful. (Dirty path clears rows as
@@ -2346,7 +2399,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // physics so no stale glide replays on reappear.
             const view_live = voff == 0 and !self.copy_active;
             const flow_visible = (!(self.ctx.decscusr_blink orelse self.cursor_blink) or self.ctx.blink_visible) and self.ctx.show_cursor and view_live;
-            self.flow.step(flow_now, self.ctx.cursor_col, self.ctx.cursor_row, voff, flow_visible, !view_live, self.cell_w, self.cell_h, self.glide, self.glide_ms, self.trail_ms, self.smooth_scroll, self.smooth_scroll_ms);
+            // DECTCEM-hidden cursors snap too: TUIs (btop) hop the hidden
+            // cursor across the screen every redraw, and gliding it would
+            // spend frames animating nothing anyone can see.
+            const flow_snap = !view_live or !self.ctx.show_cursor;
+            self.flow.step(flow_now, self.ctx.cursor_col, self.ctx.cursor_row, voff, flow_visible, flow_snap, self.cell_w, self.cell_h, self.glide, self.glide_ms, self.trail_ms, self.smooth_scroll, self.smooth_scroll_ms);
             // Drag-extend rides the INTERPOLATED viewport: extending on
             // the scroll event jumped the highlight ahead of the glide.
             // Whole travelled rows are consumed per frame (the fraction
@@ -2382,24 +2439,15 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const cur_blink = self.ctx.decscusr_blink orelse self.cursor_blink;
             if (cur_blink) ob |= 0x1000;
             if (self.ctx.decscusr_blink != null) ob |= 0x2000;
-            // Preedit overlay and flow animation transitions: ending preedit
-            // or landing a cursor glide / smooth scroll must force a full
-            // frame so all intermediate pixels are wiped clean.
+            // Preedit overlay and smooth-scroll transitions: ending preedit
+            // or landing a scroll glide must force a full frame so all
+            // intermediate pixels are wiped clean. Cursor glides track
+            // their own rect (last_cur_rect) and stay dirty-row frames.
             if (cfg.ime and self.ime.focused and self.ime.preedit_len > 0) ob |= 0x4000;
-            if (!self.flow.settled()) ob |= 0x8000;
+            if (self.flow.scroll_moving) ob |= 0x8000;
             if (ob != self.last_overlay) {
                 self.ctx.grid.markAllDirty();
                 self.last_overlay = ob;
-            }
-            // Cursor motion without cell writes (CUP over clean area) would
-            // ghost the block: repaint the rows it left and entered instead.
-            var cursor_moved = false;
-            if (self.ctx.cursor_col != self.last_cur_col or self.ctx.cursor_row != self.last_cur_row) {
-                self.ctx.grid.markRowsDirty(self.last_cur_row, self.last_cur_row);
-                self.ctx.grid.markRowsDirty(self.ctx.cursor_row, self.ctx.cursor_row);
-                self.last_cur_col = self.ctx.cursor_col;
-                self.last_cur_row = self.ctx.cursor_row;
-                cursor_moved = true;
             }
             // IME candidate window tracks the cursor (moves, scrolls,
             // resizes). Sealed only when the rect actually moved.
@@ -2437,6 +2485,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     prof_frames = 0;
                     prof_last_sec = now;
                 }
+            }
+            // Nothing painted (mode toggles, queries, title-only output,
+            // hidden-cursor blink landings): the buffer is unchanged, so
+            // skip the commit instead of damaging the whole surface.
+            if (dmg.empty and self.resize_settle_ms == 0 and self.flow.settled()) {
+                self.needs_render = false;
+                return;
             }
             c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_ATTACH, self.buffer, @as(i32, 0), @as(i32, 0));
             if (dmg.empty or self.resize_settle_ms > 0) {
@@ -2498,11 +2553,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 };
                 const nfds: usize = if (self.repeat_fd >= 0) 3 else 2;
                 var poll_timeout: i32 = self.ctx.getTimeoutMs();
-                if (self.needs_render and !self.frame_pending) {
-                    poll_timeout = 0;
-                } else if (self.needs_render) {
-                    poll_timeout = if (poll_timeout < 0) 16 else @min(poll_timeout, 16);
-                }
+                // A pending frame callback arrives on wl_fd (polled): no
+                // timer wake can present before it (present is gated on
+                // !frame_pending), and hidden windows may withhold it for
+                // good — a fallback timer just spins at 60Hz.
+                if (self.needs_render and !self.frame_pending) poll_timeout = 0;
                 if (self.resize_settle_ms > 0) {
                     const now = context_mod.nowMs();
                     if (now >= self.resize_settle_ms) {
@@ -2536,7 +2591,16 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     self.settleResize();
                 }
 
-                if ((fds[1].revents & linux.POLL.IN) != 0) {
+                // Shell gone with nothing left to read: Linux reports HUP
+                // without IN, so the read path below never sees EIO and
+                // poll() returns instantly forever (100% CPU, window stuck
+                // open). Pending output still drains first (IN wins).
+                const pty_rev = fds[1].revents;
+                if ((pty_rev & linux.POLL.IN) == 0 and (pty_rev & (linux.POLL.HUP | linux.POLL.ERR | linux.POLL.NVAL)) != 0) {
+                    self.running = false;
+                    break;
+                }
+                if ((pty_rev & linux.POLL.IN) != 0) {
                     self.markActivity();
                     const drain_t0 = context_mod.nowMs();
                     while (true) {
@@ -4506,6 +4570,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 const want_csd = (mode == P.decoration.MODE_CLIENT_SIDE);
                 if (self.csd_mode != want_csd) {
                     self.csd_mode = want_csd;
+                    self.csd_sig = 0;
                     if (self.configured) {
                         self.handleResize(self.width, self.height);
                         self.needs_render = true;

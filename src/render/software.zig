@@ -213,22 +213,70 @@ pub fn blitGlyph(
     const y1 = @min(oy + @as(i32, gh), ht);
     if (x0 >= x1 or y0 >= y1) return dmg;
     const a_stride: usize = atlas_stride;
-    const a_x: usize = ax;
+    const a_x: usize = ax + @as(usize, @intCast(x0 - ox));
     const a_y: usize = ay;
+    const n: usize = @intCast(x1 - x0);
     var yy = y0;
     while (yy < y1) : (yy += 1) {
-        const arow = (a_y + @as(usize, @intCast(yy - oy))) * a_stride;
-        const base = @as(usize, @intCast(yy)) * stride;
-        var xx = x0;
-        while (xx < x1) : (xx += 1) {
-            const cov = atlas_px[arow + a_x + @as(usize, @intCast(xx - ox))];
-            if (cov == 0) continue;
-            const idx = base + @as(usize, @intCast(xx));
-            buf[idx] = blendArgb(buf[idx], color, cov);
-        }
+        const arow = (a_y + @as(usize, @intCast(yy - oy))) * a_stride + a_x;
+        const base = @as(usize, @intCast(yy)) * stride + @as(usize, @intCast(x0));
+        blendCoverageRow(buf[base..][0..n], atlas_px[arow..][0..n], color);
     }
     dmg.add(x0, y0, x1 - x0, y1 - y0);
     return dmg;
+}
+
+const LANES = 8;
+const V8 = @Vector(LANES, u8);
+const V16 = @Vector(LANES, u16);
+const V32 = @Vector(LANES, u32);
+
+/// div255 in u16 lanes: every blend term is <= 65025, so v + 1 + (v>>8)
+/// peaks at 65280 and never overflows.
+fn div255v(v: V16) V16 {
+    return (v + @as(V16, @splat(1)) + (v >> @splat(8))) >> @splat(8);
+}
+
+/// blendArgb, LANES pixels at once, bit-identical to the scalar path.
+/// Coverage 0 is an exact identity (div255(x * 255) == x), so no lane
+/// masking is needed and zero-padded tails stay exact.
+fn blendLanes(d: V32, cov: V8, color: u32) V32 {
+    const a: V16 = cov;
+    const ia: V16 = @as(V16, @splat(255)) - a;
+    const m: V32 = @splat(0xFF);
+    const da: V16 = @intCast(d >> @splat(24));
+    const dr: V16 = @intCast((d >> @splat(16)) & m);
+    const dg: V16 = @intCast((d >> @splat(8)) & m);
+    const db: V16 = @intCast(d & m);
+    const sr: V16 = @splat(@intCast((color >> 16) & 0xFF));
+    const sg: V16 = @splat(@intCast((color >> 8) & 0xFF));
+    const sb: V16 = @splat(@intCast(color & 0xFF));
+    const oa: V32 = a + div255v(da * ia);
+    const orr: V32 = div255v(dr * ia + sr * a);
+    const og: V32 = div255v(dg * ia + sg * a);
+    const ob: V32 = div255v(db * ia + sb * a);
+    return (oa << @splat(24)) | (orr << @splat(16)) | (og << @splat(8)) | ob;
+}
+
+/// Coverage-blend one glyph row: full vectors, all-empty spans skipped
+/// (glyph margins), and a zero-padded final vector for the tail.
+fn blendCoverageRow(dst: []u32, cov: []const u8, color: u32) void {
+    var i: usize = 0;
+    while (i + LANES <= dst.len) : (i += LANES) {
+        const cv: V8 = cov[i..][0..LANES].*;
+        if (@reduce(.Or, cv) == 0) continue;
+        dst[i..][0..LANES].* = blendLanes(dst[i..][0..LANES].*, cv, color);
+    }
+    const rem = dst.len - i;
+    if (rem == 0) return;
+    var cb: [LANES]u8 = @splat(0);
+    @memcpy(cb[0..rem], cov[i..]);
+    const cv: V8 = cb;
+    if (@reduce(.Or, cv) == 0) return;
+    var db: [LANES]u32 = @splat(0);
+    @memcpy(db[0..rem], dst[i..]);
+    const out: [LANES]u32 = blendLanes(db, cv, color);
+    @memcpy(dst[i..], out[0..rem]);
 }
 
 /// Blit a premultiplied BGRA bitmap (color emoji) onto XRGB pixels.
@@ -252,23 +300,57 @@ pub fn blitColorGlyph(
 ) Damage {
     var dmg = Damage{};
     if (gw == 0 or gh == 0) return dmg;
-    var row: u16 = 0;
-    while (row < gh) : (row += 1) {
-        const yy = dy_baseline - yoff + row;
-        if (yy < 0 or yy >= height) continue;
-        var col: u16 = 0;
-        while (col < gw) : (col += 1) {
-            const xx = dx + xoff + col;
-            if (xx < 0 or xx >= stride) continue;
-            const src = atlas_px[(@as(usize, ay) + row) * atlas_stride + ax + col];
-            const a: u8 = @intCast((src >> 24) & 0xFF);
-            if (a == 0) continue;
-            const idx = @as(usize, @intCast(yy)) * stride + @as(usize, @intCast(xx));
+    // Clip once and report the clipped box (blitGlyph parity) instead of
+    // a min/max damage merge per painted pixel.
+    const ox = dx + @as(i32, xoff);
+    const oy = dy_baseline - @as(i32, yoff);
+    const x0 = @max(ox, 0);
+    const y0 = @max(oy, 0);
+    const x1 = @min(ox + @as(i32, gw), @as(i32, @intCast(stride)));
+    const y1 = @min(oy + @as(i32, gh), @as(i32, @intCast(height)));
+    if (x0 >= x1 or y0 >= y1) return dmg;
+    var yy = y0;
+    while (yy < y1) : (yy += 1) {
+        const arow = (@as(usize, ay) + @as(usize, @intCast(yy - oy))) * atlas_stride + ax;
+        const base = @as(usize, @intCast(yy)) * stride;
+        var xx = x0;
+        while (xx < x1) : (xx += 1) {
+            const src = atlas_px[arow + @as(usize, @intCast(xx - ox))];
+            if ((src >> 24) == 0) continue;
+            const idx = base + @as(usize, @intCast(xx));
             buf[idx] = blendPremult(buf[idx], src);
-            dmg.add(xx, yy, 1, 1);
         }
     }
+    dmg.add(x0, y0, x1 - x0, y1 - y0);
     return dmg;
+}
+
+test "blendLanes is bit-identical to blendArgb" {
+    // Every coverage value against varied dst alpha/channels and colors.
+    const dsts = [_]u32{ 0xFF000000, 0xE6181818, 0x00000000, 0x80FF7F01, 0xFFFFFFFF, 0x01020304 };
+    const colors = [_]u32{ 0xFFD8D8D8, 0xFF000000, 0xFFFFFFFF, 0xFF12AB7F };
+    for (dsts) |d| for (colors) |col| {
+        var c: u32 = 0;
+        while (c < 256) : (c += LANES) {
+            var cv: [LANES]u8 = undefined;
+            for (&cv, 0..) |*x, k| x.* = @intCast(c + k);
+            const out: [LANES]u32 = blendLanes(@splat(d), cv, col);
+            for (out, cv) |o, a| try std.testing.expectEqual(blendArgb(d, col, a), o);
+        }
+    };
+}
+
+test "blitGlyph rows match scalar blend incl. tails and clipping" {
+    // 19px-wide glyph: two full vectors + 3px tail; half off the left edge.
+    var atlas_px: [19 * 3]u8 = undefined;
+    for (&atlas_px, 0..) |*p, i| p.* = @intCast((i * 37) % 256);
+    var buf: [24 * 4]u32 = @splat(0xE6181818);
+    _ = blitGlyph(&buf, 24, 4, &atlas_px, 19, 0, 0, 19, 3, 0, 0, -5, 1, 0xFFD8D8D8);
+    for (0..3) |gy| for (5..19) |gx| {
+        const want = blendArgb(0xE6181818, 0xFFD8D8D8, atlas_px[gy * 19 + gx]);
+        try std.testing.expectEqual(want, buf[(1 + gy) * 24 + (gx - 5)]);
+    };
+    try std.testing.expectEqual(@as(u32, 0xE6181818), buf[14]); // row 0 untouched
 }
 
 test "blitGlyph paints coverage" {
