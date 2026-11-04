@@ -1388,6 +1388,56 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
         }
 
+        /// Could a query start at the ESC at `win[i]`? A superset of every
+        /// matcher in answerQueries (XTGETTCAP, OSC 10-12 `?`, DA1/DA2,
+        /// DSR 5n/6n, kitty `?u`), so a window with no candidate has
+        /// nothing to answer. Incomplete sequences at the end match no
+        /// matcher either; the overlap tail carries them to the next read.
+        fn queryAt(win: []const u8, i: usize) bool {
+            const r = win[i + 1 ..];
+            if (r.len == 0) return false;
+            switch (r[0]) {
+                'P' => return std.mem.startsWith(u8, r, "P+q"),
+                ']' => return r.len >= 5 and r[1] == '1' and r[2] >= '0' and r[2] <= '2' and r[3] == ';' and r[4] == '?',
+                '[' => {
+                    if (std.mem.startsWith(u8, r, "[>c")) return true;
+                    var j: usize = 1;
+                    while (j < r.len and (r[j] == '?' or r[j] == ';' or (r[j] >= '0' and r[j] <= '9'))) : (j += 1) {}
+                    return j < r.len and (r[j] == 'c' or r[j] == 'n' or r[j] == 'u');
+                },
+                else => return false,
+            }
+        }
+
+        fn anyQueryCandidate(win: []const u8) bool {
+            var i: usize = 0;
+            while (std.mem.indexOfScalarPos(u8, win, i, 0x1B)) |p| : (i = p + 1) {
+                if (queryAt(win, p)) return true;
+            }
+            return false;
+        }
+
+        /// Slide the 16-byte overlap tail over a query-free chunk (the
+        /// slow path keeps the same last 16 bytes when nothing replied).
+        fn pushOverlap(self: *Self, chunk: []const u8) void {
+            if (chunk.len >= 16) {
+                @memcpy(self.q_overlap[0..16], chunk[chunk.len - 16 ..]);
+                self.q_overlap_len = 16;
+            } else if (chunk.len > 0) {
+                const total = self.q_overlap_len + chunk.len;
+                if (total <= 16) {
+                    @memcpy(self.q_overlap[self.q_overlap_len..][0..chunk.len], chunk);
+                    self.q_overlap_len = total;
+                } else {
+                    const drop = total - 16;
+                    const keep_old = self.q_overlap_len - drop;
+                    std.mem.copyForwards(u8, self.q_overlap[0..keep_old], self.q_overlap[drop..self.q_overlap_len]);
+                    @memcpy(self.q_overlap[keep_old..][0..chunk.len], chunk);
+                    self.q_overlap_len = 16;
+                }
+            }
+        }
+
         /// Match `ESC [ [0-9;?]* <final>` (e.g. `[c`, `[0c`, `[5n`).
         fn hasCsi(win: []const u8, final: u8) bool {
             var i: usize = 0;
@@ -1409,35 +1459,18 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             // advance the overlap tail exactly like the slow path below
             // (last 16 bytes) and return. One memchr replaces ~10 scans
             // plus a window copy on data chunks.
-            if (std.mem.indexOfScalar(u8, chunk, 0x1B) == null) {
-                var tail_esc = false;
-                for (self.q_overlap[0..self.q_overlap_len]) |b| {
-                    if (b == 0x1B) {
-                        tail_esc = true;
-                        break;
-                    }
-                }
-                if (!tail_esc) {
-                    if (chunk.len >= 16) {
-                        @memcpy(self.q_overlap[0..16], chunk[chunk.len - 16 ..]);
-                        self.q_overlap_len = 16;
-                    } else if (chunk.len > 0) {
-                        const total = self.q_overlap_len + chunk.len;
-                        if (total <= 16) {
-                            @memcpy(self.q_overlap[self.q_overlap_len..][0..chunk.len], chunk);
-                            self.q_overlap_len = total;
-                        } else {
-                            const drop = total - 16;
-                            if (drop >= self.q_overlap_len) {
-                                @memcpy(self.q_overlap[0..16], chunk[drop - self.q_overlap_len ..][0..16]);
-                            } else {
-                                const keep_old = self.q_overlap_len - drop;
-                                std.mem.copyForwards(u8, self.q_overlap[0..keep_old], self.q_overlap[drop..self.q_overlap_len]);
-                                @memcpy(self.q_overlap[keep_old..][0..chunk.len], chunk);
-                            }
-                            self.q_overlap_len = 16;
-                        }
-                    }
+            //
+            // Escape-heavy output (SGR colors) has ESCs but no queries: one
+            // memchr hop per ESC with a prefix check replaces the 64KB
+            // window copy plus ~10 full substring scans per chunk. The seam
+            // (overlap tail + chunk head) catches queries split by a read.
+            if (!anyQueryCandidate(chunk)) {
+                var seam: [16 + 64]u8 = undefined;
+                const head = chunk[0..@min(chunk.len, 64)];
+                @memcpy(seam[0..self.q_overlap_len], self.q_overlap[0..self.q_overlap_len]);
+                @memcpy(seam[self.q_overlap_len..][0..head.len], head);
+                if (!anyQueryCandidate(seam[0 .. self.q_overlap_len + head.len])) {
+                    self.pushOverlap(chunk);
                     return;
                 }
             }
@@ -3227,6 +3260,39 @@ test "answerQueries skips ESC-less chunks identically" {
     ctx.answerQueries(big);
     try std.testing.expectEqual(@as(usize, 16), ctx.q_overlap_len);
     try std.testing.expectEqualStrings("xxxxxxxxxxxxxxxx", ctx.q_overlap[0..16]);
+}
+
+test "answerQueries: escape-heavy chunks without queries stay silent" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    const Sink = struct {
+        buf: [256]u8 = undefined,
+        len: usize = 0,
+        fn cb(user: ?*anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(user));
+            const n = @min(data.len, self.buf.len - self.len);
+            @memcpy(self.buf[self.len..][0..n], data[0..n]);
+            self.len += n;
+        }
+    };
+    var sink = Sink{};
+    ctx.onWrite(Sink.cb, &sink);
+    // SGR, CUP, ED, OSC title: all ESC, none a query.
+    ctx.answerQueries("\x1b[1;31mred\x1b[0m \x1b[38;2;1;2;3mtc\x1b[H\x1b[2J\x1b]0;title\x07tail0123456789");
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
+    try std.testing.expectEqualStrings("tail0123456789", ctx.q_overlap[2..16]);
+    // Query split after colored output: ESC+[ ends one read, 6n opens
+    // the next (seam path), and DA1 behind a long SGR run still answers.
+    ctx.answerQueries("\x1b[32mgreen\x1b[0m\x1b[");
+    ctx.answerQueries("6n\x1b[33mx\x1b[0m");
+    try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "R") != null);
+    sink.len = 0;
+    ctx.answerQueries("\x1b[0m\x1b[1m\x1b[4m\x1b[0c");
+    try std.testing.expectEqualStrings("\x1b[?1;2c", sink.buf[0..sink.len]);
+    // Plain text that merely looks like an OSC body is not a query.
+    sink.len = 0;
+    ctx.answerQueries("\x1b[0m echo ]10;? here");
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
 }
 
 test "ascii fast path keeps style across sgr runs" {
