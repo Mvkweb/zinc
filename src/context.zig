@@ -97,6 +97,9 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// Cursor blink phase. Reset to visible on any parsed output.
         blink_visible: bool = true,
         blink_last_ms: i64 = 0,
+        /// Runtime blink switch (config file); the App mirrors its knob
+        /// here so idle ticks stop when nothing would visibly blink.
+        blink_enabled: bool = cfg.cursor_blink,
         /// DECSET 25: cursor visibility.
         show_cursor: bool = true,
         /// Window focus + DECSET 1004 reporting.
@@ -2130,9 +2133,17 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             self.scroll_bot = self.grid.rows - 1;
         }
 
+        /// Blink phase is visible on screen: focused, shown (DECTCEM),
+        /// and blinking per DECSCUSR or the configured default. Hidden
+        /// (btop/htop/vim redraws) or steady cursors never wake the loop.
+        fn blinkLive(self: *const Self) bool {
+            return cfg.cursor_blink and self.focused and self.show_cursor and
+                (self.decscusr_blink orelse self.blink_enabled);
+        }
+
         /// Earliest ms until animated state needs redraw; -1 = static.
         pub fn getTimeoutMs(self: *const Self) i32 {
-            if (!cfg.cursor_blink or !self.focused) return -1;
+            if (!self.blinkLive()) return if (self.blink_visible) -1 else 0;
             const now = nowMs();
             const elapsed = now - self.blink_last_ms;
             if (elapsed >= cfg.cursor_blink_rate_ms) return 0;
@@ -2142,7 +2153,13 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// Advance time-based state (cursor blink). Returns true when the
         /// visual state changed and the frame must be re-rendered.
         pub fn tick(self: *Self) bool {
-            if (!cfg.cursor_blink or !self.focused) return false;
+            if (!self.blinkLive()) {
+                // Blinking stopped mid off-phase: land visible once.
+                if (self.blink_visible) return false;
+                self.blink_visible = true;
+                self.grid.markRowsDirty(self.cursor_row, self.cursor_row);
+                return true;
+            }
             const now = nowMs();
             if (now - self.blink_last_ms < cfg.cursor_blink_rate_ms) return false;
             self.blink_last_ms = now;
@@ -2883,6 +2900,34 @@ test "tick toggles blink after rate" {
     try std.testing.expect(!ctx.tick()); // too soon
     ctx.parse("x"); // output resets to visible
     try std.testing.expect(ctx.blink_visible);
+}
+
+test "blink stays asleep for hidden or steady cursors" {
+    var ctx = try Context(.{ .cursor_blink_rate_ms = 500 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.focused = true;
+    ctx.parse("\x1b[?25l"); // btop/htop: DECTCEM hide
+    ctx.blink_last_ms = nowMs() - 1000;
+    try std.testing.expect(!ctx.tick());
+    try std.testing.expectEqual(@as(i32, -1), ctx.getTimeoutMs());
+    ctx.parse("\x1b[?25h\x1b[2 q"); // shown, steady block
+    ctx.blink_last_ms = nowMs() - 1000;
+    try std.testing.expect(!ctx.tick());
+    try std.testing.expectEqual(@as(i32, -1), ctx.getTimeoutMs());
+    ctx.parse("\x1b[0 q"); // back to the configured (blinking) default
+    ctx.blink_enabled = false; // config: cursor-blink = false
+    ctx.blink_last_ms = nowMs() - 1000;
+    try std.testing.expect(!ctx.tick());
+    // Hidden mid off-phase: one landing frame back to visible, then idle.
+    ctx.blink_enabled = true;
+    ctx.blink_last_ms = nowMs() - 1000;
+    try std.testing.expect(ctx.tick());
+    try std.testing.expect(!ctx.blink_visible);
+    ctx.show_cursor = false;
+    try std.testing.expectEqual(@as(i32, 0), ctx.getTimeoutMs());
+    try std.testing.expect(ctx.tick());
+    try std.testing.expect(ctx.blink_visible);
+    try std.testing.expect(!ctx.tick());
 }
 
 test "context parse + sgr + osc title" {

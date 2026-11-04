@@ -98,6 +98,32 @@ pub fn build(b: *std.Build) void {
     check_step.dependOn(&check_exe.step);
     check_step.dependOn(&check_tests.step);
 
+    // Headless render benchmark (always ReleaseFast): real blitters +
+    // flow physics, no Wayland/PTY/fonts. Not part of check or install.
+    const bench_exe = b.addExecutable(.{
+        .name = "zinc-bench",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("bench/render_bench.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
+            .imports = &.{
+                .{ .name = "software", .module = b.createModule(.{
+                    .root_source_file = b.path("src/render/software.zig"),
+                    .target = target,
+                    .optimize = .ReleaseFast,
+                }) },
+                .{ .name = "flow", .module = b.createModule(.{
+                    .root_source_file = b.path("src/render/flow.zig"),
+                    .target = target,
+                    .optimize = .ReleaseFast,
+                }) },
+            },
+        }),
+    });
+    const bench_step = b.step("bench", "Run the headless render benchmark");
+    bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
+    check_step.dependOn(&bench_exe.step);
+
     // Desktop integration: `zig build install --prefix ~/.local` (or /usr
     // as root) lays out bin/ + share/applications + share/icons +
     // share/metainfo. Everything is prefix-relative — nothing here touches
