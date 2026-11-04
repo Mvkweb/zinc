@@ -2595,7 +2595,16 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     self.settleResize();
                 }
 
-                if ((fds[1].revents & linux.POLL.IN) != 0) {
+                // Shell gone with nothing left to read: Linux reports HUP
+                // without IN, so the read path below never sees EIO and
+                // poll() returns instantly forever (100% CPU, window stuck
+                // open). Pending output still drains first (IN wins).
+                const pty_rev = fds[1].revents;
+                if ((pty_rev & linux.POLL.IN) == 0 and (pty_rev & (linux.POLL.HUP | linux.POLL.ERR | linux.POLL.NVAL)) != 0) {
+                    self.running = false;
+                    break;
+                }
+                if ((pty_rev & linux.POLL.IN) != 0) {
                     self.markActivity();
                     const drain_t0 = context_mod.nowMs();
                     while (true) {
