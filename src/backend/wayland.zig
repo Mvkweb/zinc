@@ -3023,8 +3023,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const mods = self.currentMods();
 
             // Modifier-only press: hover-underline visibility may change.
-            if (sym == K.Control_L or sym == K.Control_R) {
-                if (cfg.hyperlinks) self.needs_render = true;
+            if (sym >= 0xFFE1 and sym <= 0xFFEE) {
+                if (cfg.hyperlinks and (sym == K.Control_L or sym == K.Control_R)) self.needs_render = true;
                 return;
             }
 
@@ -3169,8 +3169,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     self.closeFind();
                     return;
                 }
-                if (sym == K.Return) {
-                    self.findStep(if (mods.shift) -1 else 1);
+                if (sym == K.Return or sym == K.Tab or sym == K.ISO_Left_Tab) {
+                    self.findStep(if (mods.shift or sym == K.ISO_Left_Tab) -1 else 1);
                     return;
                 }
                 if (sym == K.Up) {
@@ -3188,7 +3188,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     }
                     return;
                 }
-                if (sym >= 0x20 and sym <= 0x7E) {
+                if (sym >= 0x20 and sym <= 0x7E and !mods.ctrl and !mods.alt) {
                     if (self.find_qlen < self.find_query.len) {
                         self.find_query[self.find_qlen] = @intCast(sym);
                         self.find_qlen += 1;
