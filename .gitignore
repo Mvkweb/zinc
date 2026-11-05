@@ -20,9 +20,6 @@ FEATURES.md
 scripts/
 
 # Arch Linux packaging artifacts (makepkg)
-/pkg/
-/zinc/
-/src/stage/
-/src/zinc/
 *.pkg.tar.*
-
+*.tar.gz
+*.log
