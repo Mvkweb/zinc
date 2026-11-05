@@ -14,6 +14,7 @@ pub const Image = struct {
     pixels: []u32 = &.{},
     ref_count: u32 = 0,
     is_sixel: bool = false,
+    visible: bool = true,
 };
 
 pub const Placement = struct {
@@ -153,6 +154,14 @@ pub const Pool = struct {
             while (j > 0 and lessPlacement(self.placements.items[j], self.placements.items[j - 1])) {
                 std.mem.swap(Placement, &self.placements.items[j], &self.placements.items[j - 1]);
                 j -= 1;
+            }
+        }
+    }
+
+    pub fn markInvisible(self: *Pool, img_id: ?ImageId) void {
+        for (self.images.items) |*im| {
+            if (img_id == null or im.id == img_id.?) {
+                im.visible = false;
             }
         }
     }

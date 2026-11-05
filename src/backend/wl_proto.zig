@@ -61,8 +61,16 @@ pub const core = struct {
     pub const SOURCE_OFFER: u32 = 0;
     pub const SOURCE_DESTROY: u32 = 1;
     // wl_data_offer.
+    pub const OFFER_ACCEPT: u32 = 0;
     pub const OFFER_RECEIVE: u32 = 1;
     pub const OFFER_DESTROY: u32 = 2;
+    pub const OFFER_FINISH: u32 = 3;
+    pub const OFFER_SET_ACTIONS: u32 = 4;
+
+    pub const DND_ACTION_NONE: u32 = 0;
+    pub const DND_ACTION_COPY: u32 = 1;
+    pub const DND_ACTION_MOVE: u32 = 2;
+    pub const DND_ACTION_ASK: u32 = 4;
 
     pub const SHM_FORMAT_ARGB8888: u32 = 0;
     pub const SHM_FORMAT_XRGB8888: u32 = 1;

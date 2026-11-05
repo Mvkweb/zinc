@@ -349,6 +349,15 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// Best text mime advertised by the current offer.
         offer_mime: [128]u8 = undefined,
         offer_mime_len: usize = 0,
+        incoming_offer: ?*P.DataOffer = null,
+        incoming_has_uri_list: bool = false,
+        incoming_has_text: bool = false,
+        incoming_mime: [128]u8 = undefined,
+        incoming_mime_len: usize = 0,
+        dnd_offer: ?*P.DataOffer = null,
+        dnd_serial: u32 = 0,
+        dnd_has_uri_list: bool = false,
+        dnd_has_text: bool = false,
         /// Ctrl+hover hyperlink state (screen coords, span, owned URI).
         hover_col: u16 = 0,
         hover_row: u16 = 0,
@@ -408,6 +417,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
         pool_pixels: []u32 = &.{},
         pool: ?*P.ShmPool = null,
         buffer: ?*P.Buffer = null,
+        last_placements_len: usize = 0,
         frame_cb: ?*P.Callback = null,
 
         /// Listener layouts MUST live in App: libwayland stores the pointer
@@ -824,8 +834,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // get_data_device call below (libwayland aborts on null objects).
             if (cfg.clipboard and self.name_ddm != 0) {
                 const seat = self.seat orelse null;
-                // TEMPORARY root-cause probe: proves which code runs.
-                std.debug.print("[zinc] ddm setup: name_ddm={d} seat_present={} want_v={d}\n", .{ self.name_ddm, seat != null, self.want_ddm_v });
                 if (seat == null) {
                     // No seat (yet): clipboard stays unavailable this run.
                 } else {
@@ -931,6 +939,18 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (self.cur_offer) |o| {
                 c.wl_proxy_marshal(@ptrCast(o), P.core.OFFER_DESTROY);
                 c.wl_proxy_destroy(@ptrCast(o));
+            }
+            if (self.dnd_offer) |o| {
+                if (o != self.cur_offer) {
+                    c.wl_proxy_marshal(@ptrCast(o), P.core.OFFER_DESTROY);
+                    c.wl_proxy_destroy(@ptrCast(o));
+                }
+            }
+            if (self.incoming_offer) |o| {
+                if (o != self.cur_offer and o != self.dnd_offer) {
+                    c.wl_proxy_marshal(@ptrCast(o), P.core.OFFER_DESTROY);
+                    c.wl_proxy_destroy(@ptrCast(o));
+                }
             }
             if (self.data_device) |d| {
                 c.wl_proxy_marshal(@ptrCast(d), P.core.DEVICE_RELEASE);
@@ -1839,7 +1859,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 (self.trail_ms > 0 and self.flow.trail_n > 0) or
                 (cfg.ime and self.ime.focused and self.ime.preedit_len > 0) or
                 (cfg.scrollbar and (self.sb_show or self.sb_alpha > 0)) or
-                (cfg.kitty_gfx and self.ctx.images.placements.items.len > 0);
+                (cfg.kitty_gfx and (self.ctx.images.placements.items.len > 0 or self.last_placements_len > 0));
+            if (cfg.kitty_gfx) {
+                self.last_placements_len = self.ctx.images.placements.items.len;
+            }
             if (full) {
                 software.fillRect(self.pool_pixels, W, H, 0, 0, W, H, bg_all, &dmg);
             }
@@ -3289,6 +3312,77 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
         }
 
+        // -- drag and drop (wl_data_device) ----------------------------------
+
+        fn percentDecode(src: []const u8, dst: []u8) []const u8 {
+            var si: usize = 0;
+            var di: usize = 0;
+            while (si < src.len and di < dst.len) {
+                if (src[si] == '%' and si + 2 < src.len) {
+                    if (std.fmt.parseInt(u8, src[si + 1 .. si + 3], 16)) |byte| {
+                        dst[di] = byte;
+                        di += 1;
+                        si += 3;
+                        continue;
+                    } else |_| {}
+                }
+                dst[di] = src[si];
+                di += 1;
+                si += 1;
+            }
+            return dst[0..di];
+        }
+
+        fn formatUriList(gpa: std.mem.Allocator, raw: []const u8) ![]u8 {
+            var out = try std.ArrayList(u8).initCapacity(gpa, raw.len);
+            errdefer out.deinit(gpa);
+
+            var dec_buf: [4096]u8 = undefined;
+            var lines = std.mem.splitScalar(u8, raw, '\n');
+            var first = true;
+            while (lines.next()) |line_raw| {
+                const line = std.mem.trim(u8, line_raw, " \r\t");
+                if (line.len == 0 or line[0] == '#') continue;
+
+                var path = line;
+                if (std.mem.startsWith(u8, path, "file://localhost/")) {
+                    path = path["file://localhost".len..];
+                } else if (std.mem.startsWith(u8, path, "file://")) {
+                    path = path["file://".len..];
+                }
+
+                const heap_buf = if (path.len > dec_buf.len) gpa.alloc(u8, path.len) catch null else null;
+                defer if (heap_buf) |b| gpa.free(b);
+                const target_buf = heap_buf orelse &dec_buf;
+                const decoded = percentDecode(path, target_buf);
+
+                if (!first) try out.append(gpa, ' ');
+                first = false;
+
+                var needs_quote = false;
+                for (decoded) |ch| {
+                    if (ch == ' ' or ch == '\t' or ch == '$' or ch == '`' or ch == '"' or ch == '\'' or ch == '&' or ch == ';' or ch == '(' or ch == ')') {
+                        needs_quote = true;
+                        break;
+                    }
+                }
+                if (needs_quote) {
+                    try out.append(gpa, '\'');
+                    for (decoded) |ch| {
+                        if (ch == '\'') {
+                            try out.appendSlice(gpa, "'\\''");
+                        } else {
+                            try out.append(gpa, ch);
+                        }
+                    }
+                    try out.append(gpa, '\'');
+                } else {
+                    try out.appendSlice(gpa, decoded);
+                }
+            }
+            return out.toOwnedSlice(gpa);
+        }
+
         // -- clipboard (wl_data_device_manager) -------------------------------
 
         fn mimeRank(mime: []const u8) u8 {
@@ -3301,77 +3395,256 @@ pub fn App(comptime cfg: config_mod.Config) type {
         fn appOnDeviceOffer(data: ?*anyopaque, device: ?*P.DataDevice, id: ?*P.DataOffer) callconv(.c) void {
             _ = device;
             const self: *Self = @ptrCast(@alignCast(data));
-            // A new offer supersedes the previous one.
-            if (self.cur_offer) |old| {
-                c.wl_proxy_marshal(@ptrCast(old), P.core.OFFER_DESTROY);
-                c.wl_proxy_destroy(@ptrCast(old));
+            const new_offer = id orelse return;
+
+            // If a previous incoming offer was never claimed by selection or enter, destroy it.
+            if (self.incoming_offer) |old| {
+                if (old != self.cur_offer and old != self.dnd_offer) {
+                    c.wl_proxy_marshal(@ptrCast(old), P.core.OFFER_DESTROY);
+                    c.wl_proxy_destroy(@ptrCast(old));
+                }
             }
-            self.cur_offer = id;
-            self.offer_mime_len = 0;
-            if (id) |offer| {
-                self.dol = DataOfferListener{
-                    .offer = appOnOfferMime,
-                    .source_actions = appOnOfferSourceActions,
-                    .action = appOnOfferAction,
-                };
-                _ = c.wl_proxy_add_listener(@ptrCast(offer), @ptrCast(&self.dol), @ptrCast(self));
-            }
+            self.incoming_offer = new_offer;
+            self.incoming_has_uri_list = false;
+            self.incoming_has_text = false;
+            self.incoming_mime_len = 0;
+
+            self.dol = DataOfferListener{
+                .offer = appOnOfferMime,
+                .source_actions = appOnOfferSourceActions,
+                .action = appOnOfferAction,
+            };
+            _ = c.wl_proxy_add_listener(@ptrCast(new_offer), @ptrCast(&self.dol), @ptrCast(self));
         }
 
         fn appOnDeviceEnter(data: ?*anyopaque, device: ?*P.DataDevice, serial: u32, surface: ?*P.Surface, sx: i32, sy: i32, offer: ?*P.DataOffer) callconv(.c) void {
-            _ = data;
             _ = device;
-            _ = serial;
             _ = surface;
             _ = sx;
             _ = sy;
-            _ = offer;
+            const self: *Self = @ptrCast(@alignCast(data));
+            const off = offer orelse return;
+
+            if (self.dnd_offer) |old| {
+                if (old != off and old != self.cur_offer and old != self.incoming_offer) {
+                    c.wl_proxy_marshal(@ptrCast(old), P.core.OFFER_DESTROY);
+                    c.wl_proxy_destroy(@ptrCast(old));
+                }
+            }
+
+            self.dnd_offer = off;
+            self.dnd_serial = serial;
+            if (off == self.incoming_offer) {
+                self.dnd_has_uri_list = self.incoming_has_uri_list;
+                self.dnd_has_text = self.incoming_has_text;
+                self.incoming_offer = null;
+            }
+
+            const mime: ?[*:0]const u8 = if (self.dnd_has_uri_list)
+                "text/uri-list"
+            else if (self.dnd_has_text)
+                "text/plain;charset=utf-8"
+            else
+                null;
+
+            if (mime) |m| {
+                c.wl_proxy_marshal(@ptrCast(off), P.core.OFFER_ACCEPT, serial, m);
+                if (self.want_ddm_v >= 3) {
+                    c.wl_proxy_marshal(@ptrCast(off), P.core.OFFER_SET_ACTIONS, P.core.DND_ACTION_COPY, P.core.DND_ACTION_COPY);
+                }
+            } else {
+                c.wl_proxy_marshal(@ptrCast(off), P.core.OFFER_ACCEPT, serial, @as(?*anyopaque, null));
+                if (self.want_ddm_v >= 3) {
+                    c.wl_proxy_marshal(@ptrCast(off), P.core.OFFER_SET_ACTIONS, P.core.DND_ACTION_NONE, P.core.DND_ACTION_NONE);
+                }
+            }
+            _ = c.wl_display_flush(self.display);
         }
 
         fn appOnDeviceLeave(data: ?*anyopaque, device: ?*P.DataDevice) callconv(.c) void {
             _ = data;
             _ = device;
+            // The cursor left our surface, but the drag session may still re-enter
+            // with the same offer. Do NOT destroy the offer here (matches Foot).
         }
 
         fn appOnDeviceMotion(data: ?*anyopaque, device: ?*P.DataDevice, time: u32, sx: i32, sy: i32) callconv(.c) void {
-            _ = data;
             _ = device;
             _ = time;
             _ = sx;
             _ = sy;
+            const self: *Self = @ptrCast(@alignCast(data));
+            const off = self.dnd_offer orelse return;
+            if (self.want_ddm_v >= 3) {
+                const action = if (self.dnd_has_uri_list or self.dnd_has_text)
+                    P.core.DND_ACTION_COPY
+                else
+                    P.core.DND_ACTION_NONE;
+                c.wl_proxy_marshal(@ptrCast(off), P.core.OFFER_SET_ACTIONS, action, action);
+                _ = c.wl_display_flush(self.display);
+            }
         }
 
         fn appOnDeviceDrop(data: ?*anyopaque, device: ?*P.DataDevice) callconv(.c) void {
-            _ = data;
             _ = device;
+            const self: *Self = @ptrCast(@alignCast(data));
+            const offer = self.dnd_offer orelse return;
+            // Drop takes exclusive ownership of the offer; clear it immediately
+            // so no concurrent or subsequent callback touches it.
+            self.dnd_offer = null;
+            if (self.incoming_offer == offer) self.incoming_offer = null;
+
+            const is_uri_list = self.dnd_has_uri_list;
+            const is_text = self.dnd_has_text;
+            const mime: [*:0]const u8 = if (is_uri_list)
+                "text/uri-list"
+            else if (is_text)
+                "text/plain;charset=utf-8"
+            else {
+                if (self.want_ddm_v >= 3) {
+                    c.wl_proxy_marshal(@ptrCast(offer), P.core.OFFER_FINISH);
+                }
+                c.wl_proxy_marshal(@ptrCast(offer), P.core.OFFER_DESTROY);
+                c.wl_proxy_destroy(@ptrCast(offer));
+                _ = c.wl_display_flush(self.display);
+                return;
+            };
+
+            var fds: [2]i32 = .{ -1, -1 };
+            if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) {
+                if (self.want_ddm_v >= 3) {
+                    c.wl_proxy_marshal(@ptrCast(offer), P.core.OFFER_FINISH);
+                }
+                c.wl_proxy_marshal(@ptrCast(offer), P.core.OFFER_DESTROY);
+                c.wl_proxy_destroy(@ptrCast(offer));
+                _ = c.wl_display_flush(self.display);
+                return;
+            }
+
+            c.wl_proxy_marshal(@ptrCast(offer), P.core.OFFER_RECEIVE, mime, fds[1]);
+            _ = linux.close(fds[1]);
+            _ = c.wl_display_flush(self.display);
+
+            const cap: usize = 1024 * 1024;
+            const buf = self.gpa.alloc(u8, cap) catch {
+                _ = linux.close(fds[0]);
+                if (self.want_ddm_v >= 3) {
+                    c.wl_proxy_marshal(@ptrCast(offer), P.core.OFFER_FINISH);
+                }
+                c.wl_proxy_marshal(@ptrCast(offer), P.core.OFFER_DESTROY);
+                c.wl_proxy_destroy(@ptrCast(offer));
+                _ = c.wl_display_flush(self.display);
+                return;
+            };
+            defer self.gpa.free(buf);
+
+            var len: usize = 0;
+            const wl_fd = c.wl_display_get_fd(self.display);
+            const deadline = context_mod.nowMs() + 5_000;
+            while (len < buf.len and context_mod.nowMs() < deadline) {
+                while (c.wl_display_prepare_read(self.display) != 0) {
+                    if (c.wl_display_dispatch_pending(self.display) < 0) break;
+                }
+                if (c.wl_display_get_error(self.display) != 0) break;
+                _ = c.wl_display_flush(self.display);
+                var pfds = [_]linux.pollfd{
+                    .{ .fd = fds[0], .events = linux.POLL.IN, .revents = 0 },
+                    .{ .fd = wl_fd, .events = linux.POLL.IN, .revents = 0 },
+                };
+                const pr = linux.poll(&pfds, 2, 250);
+                if (linux.errno(pr) == .SUCCESS and (pfds[1].revents & linux.POLL.IN) != 0) {
+                    if (c.wl_display_read_events(self.display) < 0) break;
+                } else {
+                    _ = c.wl_display_cancel_read(self.display);
+                }
+                if (c.wl_display_dispatch_pending(self.display) < 0) break;
+                if ((pfds[0].revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR)) == 0) continue;
+                const r = linux.read(fds[0], buf.ptr + len, buf.len - len);
+                if (linux.errno(r) != .SUCCESS or r == 0) break;
+                len += r;
+            }
+            _ = linux.close(fds[0]);
+
+            if (self.want_ddm_v >= 3) {
+                c.wl_proxy_marshal(@ptrCast(offer), P.core.OFFER_FINISH);
+            }
+            c.wl_proxy_marshal(@ptrCast(offer), P.core.OFFER_DESTROY);
+            c.wl_proxy_destroy(@ptrCast(offer));
+            _ = c.wl_display_flush(self.display);
+
+            if (len > 0) {
+                const dropped = buf[0..len];
+                if (is_uri_list) {
+                    if (formatUriList(self.gpa, dropped)) |formatted| {
+                        defer self.gpa.free(formatted);
+                        if (formatted.len > 0) {
+                            if (self.ctx.bracketed_paste) {
+                                self.sendToPty("\x1b[200~");
+                                self.sendToPty(formatted);
+                                self.sendToPty("\x1b[201~");
+                            } else {
+                                self.sendToPty(formatted);
+                            }
+                        }
+                    } else |_| {}
+                } else {
+                    if (self.ctx.bracketed_paste) {
+                        self.sendToPty("\x1b[200~");
+                        self.sendToPty(dropped);
+                        self.sendToPty("\x1b[201~");
+                    } else {
+                        self.sendToPty(dropped);
+                    }
+                }
+            }
         }
 
         fn appOnDeviceSelection(data: ?*anyopaque, device: ?*P.DataDevice, id: ?*P.DataOffer) callconv(.c) void {
             _ = device;
             const self: *Self = @ptrCast(@alignCast(data));
-            // Null offer: clipboard cleared elsewhere; drop our reference.
             if (id == null) {
                 if (self.cur_offer) |old| {
-                    c.wl_proxy_marshal(@ptrCast(old), P.core.OFFER_DESTROY);
-                    c.wl_proxy_destroy(@ptrCast(old));
+                    if (old != self.dnd_offer and old != self.incoming_offer) {
+                        c.wl_proxy_marshal(@ptrCast(old), P.core.OFFER_DESTROY);
+                        c.wl_proxy_destroy(@ptrCast(old));
+                    }
                 }
                 self.cur_offer = null;
                 self.offer_mime_len = 0;
+            } else {
+                if (self.cur_offer) |old| {
+                    if (old != id and old != self.dnd_offer and old != self.incoming_offer) {
+                        c.wl_proxy_marshal(@ptrCast(old), P.core.OFFER_DESTROY);
+                        c.wl_proxy_destroy(@ptrCast(old));
+                    }
+                }
+                self.cur_offer = id;
+                if (id == self.incoming_offer) {
+                    self.offer_mime = self.incoming_mime;
+                    self.offer_mime_len = self.incoming_mime_len;
+                    self.incoming_offer = null;
+                }
             }
         }
 
         fn appOnOfferMime(data: ?*anyopaque, offer: ?*P.DataOffer, mime: [*:0]const u8) callconv(.c) void {
-            _ = offer;
             const self: *Self = @ptrCast(@alignCast(data));
+            if (offer != self.incoming_offer) return;
             const m = std.mem.span(mime);
-            var best: u8 = 0;
-            if (self.offer_mime_len > 0 and self.offer_mime_len < self.offer_mime.len) {
-                best = mimeRank(self.offer_mime[0..self.offer_mime_len]);
+            if (std.mem.eql(u8, m, "text/uri-list")) {
+                self.incoming_has_uri_list = true;
             }
-            if (mimeRank(m) > best and m.len + 1 <= self.offer_mime.len) {
-                @memcpy(self.offer_mime[0..m.len], m);
-                self.offer_mime[m.len] = 0; // keep NUL-terminated for receive
-                self.offer_mime_len = m.len;
+            if (std.mem.startsWith(u8, m, "text/plain") or std.mem.eql(u8, m, "UTF8_STRING")) {
+                self.incoming_has_text = true;
+            }
+            var best: u8 = 0;
+            if (self.incoming_mime_len > 0 and self.incoming_mime_len < self.incoming_mime.len) {
+                best = mimeRank(self.incoming_mime[0..self.incoming_mime_len]);
+            }
+            if (mimeRank(m) > best and m.len + 1 <= self.incoming_mime.len) {
+                @memcpy(self.incoming_mime[0..m.len], m);
+                self.incoming_mime[m.len] = 0; // keep NUL-terminated for receive
+                self.incoming_mime_len = m.len;
             }
         }
 
@@ -4926,4 +5199,43 @@ test "shm buffer resize" {
     try b.resize(std.testing.allocator, 16, 16);
     defer b.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 256), b.pixels.len);
+}
+
+test "dnd uri-list formatting" {
+    const A = App(config_mod.full);
+    const gpa = std.testing.allocator;
+
+    // Single simple file
+    {
+        const formatted = try A.formatUriList(gpa, "file:///home/user/test.txt\r\n");
+        defer gpa.free(formatted);
+        try std.testing.expectEqualStrings("/home/user/test.txt", formatted);
+    }
+
+    // Encoded spaces requiring shell quotes
+    {
+        const formatted = try A.formatUriList(gpa, "file:///home/user/My%20Documents/test%20file.pdf\n");
+        defer gpa.free(formatted);
+        try std.testing.expectEqualStrings("'/home/user/My Documents/test file.pdf'", formatted);
+    }
+
+    // Multiple files with comments
+    {
+        const raw =
+            \\# Comment line
+            \\file:///home/user/first.txt
+            \\
+            \\file:///home/user/second.txt
+        ;
+        const formatted = try A.formatUriList(gpa, raw);
+        defer gpa.free(formatted);
+        try std.testing.expectEqualStrings("/home/user/first.txt /home/user/second.txt", formatted);
+    }
+
+    // Path with quotes and spaces
+    {
+        const formatted = try A.formatUriList(gpa, "file:///home/user/it's%20cool.txt");
+        defer gpa.free(formatted);
+        try std.testing.expectEqualStrings("'/home/user/it'\\''s cool.txt'", formatted);
+    }
 }

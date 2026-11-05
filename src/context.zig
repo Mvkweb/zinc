@@ -386,6 +386,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 if (bump > self.images.next_id) self.images.next_id = bump;
             }
             img.number = ctrl.request_num;
+            img.visible = true;
             const assigned = img.id;
             if (ctrl.action == .transmit_and_place and !ctrl.unicode_placeholder) {
                 if (!self.placeExisting(img, ctrl)) {
@@ -712,7 +713,8 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             const cell = self.grid.viewCell(col, row) orelse return null;
             if (cell_mod.isDefaultColor(cell.fg) or cell_mod.isIndexedColor(cell.fg)) return null;
             const id = (@as(u32, g.x) << 24) | (cell.fg & 0xFFFFFF);
-            if (self.images.findImage(id) == null) return null;
+            const img = self.images.findImage(id) orelse return null;
+            if (!img.visible) return null;
             return .{ .img_id = id, .row = g.r, .col = g.c };
         }
 
@@ -720,6 +722,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// sort, advance. False = placement store full (caller rolls back).
         fn placeExisting(self: *Self, img: *pool_mod.Image, ctrl: kitty_mod.Control) bool {
             const id = img.id;
+            img.visible = true;
             if (ctrl.placement_id != 0) {
                 var k: usize = 0;
                 while (k < self.images.placements.items.len) {
@@ -771,6 +774,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 return;
             };
             const id = found.id;
+            found.visible = true;
             if (!ctrl.unicode_placeholder) {
                 if (!self.placeExisting(found, ctrl)) {
                     self.replyKitty(id, ctrl.quiet, "placement store full");
@@ -803,10 +807,13 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             const q = ctrl.quiet;
             const upper = d >= 'A' and d <= 'Z';
             const kind: u8 = if (upper) d + 32 else d;
+            var any_deleted = false;
             switch (kind) {
                 0, 'a' => {
-                    _ = self.images.removePlacements(null, null);
+                    const n = self.images.removePlacements(null, null);
+                    self.images.markInvisible(null);
                     if (upper) self.images.clearAll();
+                    if (n > 0 or self.images.images.items.len > 0) any_deleted = true;
                     self.replyKitty(ctrl.image_id, q, null);
                 },
                 'i' => {
@@ -816,8 +823,12 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     }
                     const plc: ?u32 = if (ctrl.placement_id != 0) ctrl.placement_id else null;
                     const n = self.images.removePlacements(ctrl.image_id, plc);
+                    if (self.images.findImage(ctrl.image_id)) |im| {
+                        if (plc == null) im.visible = false;
+                        any_deleted = true;
+                    }
                     if (upper) self.images.freeUnplaced();
-                    if (n == 0) {
+                    if (n == 0 and !any_deleted) {
                         self.replyKitty(ctrl.image_id, q, "unknown image id");
                         return;
                     }
@@ -843,8 +854,16 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                         return;
                     };
                     const plc: ?u32 = if (ctrl.placement_id != 0) ctrl.placement_id else null;
-                    _ = self.images.removePlacements(tid, plc);
+                    const n = self.images.removePlacements(tid, plc);
+                    if (self.images.findImage(tid)) |im| {
+                        if (plc == null) im.visible = false;
+                        any_deleted = true;
+                    }
                     if (upper) self.images.freeUnplaced();
+                    if (n == 0 and !any_deleted) {
+                        self.replyKitty(0, q, "unknown image number");
+                        return;
+                    }
                     self.replyKitty(tid, q, null);
                 },
                 'c' => {
@@ -867,12 +886,16 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                         }
                         if (hit) {
                             _ = self.images.placements.swapRemove(k);
+                            any_deleted = true;
                         } else k += 1;
                     }
                     if (upper) self.images.freeUnplaced();
                     self.replyKitty(ctrl.image_id, q, null);
                 },
                 else => self.replyKitty(ctrl.image_id, q, "unsupported delete target"),
+            }
+            if (any_deleted) {
+                self.grid.markAllDirty();
             }
         }
 
