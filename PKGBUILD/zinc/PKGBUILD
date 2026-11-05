@@ -17,7 +17,6 @@ depends=(
 )
 # Requires Zig 0.17.x (see build.zig.zon minimum_zig_version).
 makedepends=(
-	'git'
 	'zig>=0.17'
 	'pkgconf'
 )
