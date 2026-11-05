@@ -1,0 +1,7 @@
+# Arch Linux packaging artifacts (makepkg)
+*.pkg.tar.*
+*.tar.gz
+*.log
+PKGBUILD/zinc-term-git/zinc-term-git
+
+.gitignore
