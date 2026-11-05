@@ -1,6 +1,6 @@
 pkgbase = zinc-term-git
 	pkgdesc = A terminal emulator written in Zig
-	pkgver = 0.2.0
+	pkgver = 0.2.0.r0.g5a20e87
 	pkgrel = 1
 	url = https://github.com/Mvkweb/zinc
 	arch = x86_64

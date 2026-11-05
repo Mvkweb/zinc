@@ -2,7 +2,7 @@
 # Maintainer: Dan Griffiths <me at evertiro dot com>
 
 pkgname=zinc-term-git
-pkgver=0.2.0
+pkgver=0.2.0.r0.g5a20e87
 pkgrel=1
 pkgdesc='A terminal emulator written in Zig'
 arch=('x86_64' 'aarch64')
@@ -24,6 +24,12 @@ makedepends=(
 conflicts=('zinc-term')
 source=("$pkgname::git+$url.git")
 sha256sums=('SKIP')
+
+pkgver() {
+	cd "$srcdir/$pkgname"
+
+	git describe --long --tags --abbrev=7 | sed 's/^v//;s/\([^-]*-g\)/r\1/;s/-/./g'
+}
 
 build() {
 	cd "$srcdir/$pkgname"
