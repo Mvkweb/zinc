@@ -1,7 +1,8 @@
 //! zinc: ultra-lightweight Wayland terminal (sfte-inspired, pure Zig).
-//! Juicy Main (Zig 0.16): io/gpa/arena flow through everything.
+//! Juicy Main (Zig 0.17): io/gpa/arena flow through everything.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const build_options = @import("build_options");
 const config_mod = @import("config.zig");
 const context_mod = @import("context.zig");
@@ -20,7 +21,7 @@ pub fn main(init: std.process.Init) !void {
     if (args.len > 1 and std.mem.eql(u8, args[1], "--version")) {
         var vb: [128]u8 = undefined;
         var w = std.Io.File.stdout().writer(io, &vb);
-        try w.interface.print("zinc {s} (zig 0.16.0)\n", .{build_options.version});
+        try w.interface.print("zinc {s} (zig {s})\n", .{ build_options.version, builtin.zig_version_string });
         try w.interface.flush();
         return;
     }
