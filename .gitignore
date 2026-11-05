@@ -23,3 +23,4 @@ scripts/
 *.pkg.tar.*
 *.tar.gz
 *.log
+PKGBUILD/zinc-git/zinc-git
