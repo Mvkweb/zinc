@@ -8,7 +8,7 @@ pub fn build(b: *std.Build) void {
     // images / eye-candy / alt-screen at compile time (sfte-macro equivalent).
     const minimal = b.option(bool, "minimal", "Minimal build: no images, eye-candy, or alt-screen") orelse false;
     const ascii_only = b.option(bool, "ascii-only", "Store cells as u8 (ASCII only, halves grid memory)") orelse false;
-    const version = b.option([]const u8, "version", "Package version string") orelse "0.1.0";
+    const version = b.option([]const u8, "version", "Package version string") orelse "0.2.0";
 
     const options = b.addOptions();
     options.addOption(bool, "minimal", minimal);

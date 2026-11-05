@@ -1,7 +1,7 @@
 # Maintainer: Mvkweb <https://github.com/Mvkweb>
 # Local build while AUR submissions are closed: makepkg -si
 pkgname=zinc
-pkgver=0.1.0
+pkgver=0.2.0
 pkgrel=1
 pkgdesc="A terminal written in Zig"
 arch=('x86_64' 'aarch64')
