@@ -56,6 +56,26 @@ zig build check
 
 ## Install
 
+### Arch Linux
+
+Available on the AUR as [`zinc-term`](https://aur.archlinux.org/packages/zinc-term) (release) or [`zinc-term-git`](https://aur.archlinux.org/packages/zinc-term-git) (git):
+
+```bash
+paru -S zinc-term
+# or
+yay -S zinc-term
+```
+
+For the latest git master:
+
+```bash
+paru -S zinc-term-git
+# or
+yay -S zinc-term-git
+```
+
+### From source
+
 To install for your user only (no root required):
 
 ```bash
@@ -75,8 +95,6 @@ For system-wide installation:
 sudo zig build -Doptimize=ReleaseSafe --prefix /usr/local
 sudo update-desktop-database /usr/local/share/applications
 ```
-
-On Arch Linux, you should install using the AUR packages.
 
 ## Uninstall
 
