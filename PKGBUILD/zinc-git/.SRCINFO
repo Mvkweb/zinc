@@ -1,0 +1,21 @@
+pkgbase = zinc-git
+	pkgdesc = A terminal emulator written in Zig
+	pkgver = 0.2.0
+	pkgrel = 1
+	url = https://github.com/Mvkweb/zinc
+	arch = x86_64
+	arch = aarch64
+	license = MIT
+	makedepends = git
+	makedepends = zig>=0.17
+	makedepends = pkgconf
+	depends = wayland
+	depends = libxkbcommon
+	depends = freetype2
+	depends = fontconfig
+	depends = hicolor-icon-theme
+	conflicts = zinc
+	source = zinc-git::git+https://github.com/Mvkweb/zinc.git
+	sha256sums = SKIP
+
+pkgname = zinc-git
