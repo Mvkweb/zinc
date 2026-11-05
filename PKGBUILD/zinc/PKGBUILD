@@ -20,6 +20,7 @@ makedepends=(
 	'zig>=0.17'
 	'pkgconf'
 )
+conflicts=('zinc-git')
 source=("https://github.com/Mvkweb/zinc/releases/download/v$pkgver/zinc-v$pkgver.tar.gz")
 sha256sums=('61da16714982cf263f42afadb9ce4be772abdbd8a5edb21cf2931c5ab6bbb204')
 
