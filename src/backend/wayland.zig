@@ -1848,7 +1848,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // so the fast path cannot stale a pixel it doesn't understand.
             const full =
                 self.ctx.grid.dirty_all or
-                self.flow.scroll_moving or
+                !self.flow.settled() or
                 self.pending_resize != null or
                 self.resize_settle_ms > 0 or
                 voff != 0 or
@@ -2462,12 +2462,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const cur_blink = self.ctx.decscusr_blink orelse self.cursor_blink;
             if (cur_blink) ob |= 0x1000;
             if (self.ctx.decscusr_blink != null) ob |= 0x2000;
-            // Preedit overlay and smooth-scroll transitions: ending preedit
-            // or landing a scroll glide must force a full frame so all
-            // intermediate pixels are wiped clean. Cursor glides track
-            // their own rect (last_cur_rect) and stay dirty-row frames.
+            // Preedit overlay and flow animation transitions: ending preedit
+            // or landing a cursor glide / smooth scroll forces a full frame
+            // on transition so all intermediate pixels and paddings are wiped clean.
             if (cfg.ime and self.ime.focused and self.ime.preedit_len > 0) ob |= 0x4000;
-            if (self.flow.scroll_moving) ob |= 0x8000;
+            if (!self.flow.settled()) ob |= 0x8000;
             if (ob != self.last_overlay) {
                 self.ctx.grid.markAllDirty();
                 self.last_overlay = ob;
