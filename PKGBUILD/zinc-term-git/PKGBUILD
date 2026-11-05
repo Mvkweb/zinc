@@ -1,7 +1,7 @@
 # Maintainer: Mvkweb <https://github.com/Mvkweb>
 # Maintainer: Dan Griffiths <me at evertiro dot com>
 
-pkgname=zinc-git
+pkgname=zinc-term-git
 pkgver=0.2.0
 pkgrel=1
 pkgdesc='A terminal emulator written in Zig'
@@ -21,7 +21,7 @@ makedepends=(
 	'zig>=0.17'
 	'pkgconf'
 )
-conflicts=('zinc')
+conflicts=('zinc-term')
 source=("$pkgname::git+$url.git")
 sha256sums=('SKIP')
 

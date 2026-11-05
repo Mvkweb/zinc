@@ -1,4 +1,4 @@
-pkgbase = zinc-git
+pkgbase = zinc-term-git
 	pkgdesc = A terminal emulator written in Zig
 	pkgver = 0.2.0
 	pkgrel = 1
@@ -14,8 +14,8 @@ pkgbase = zinc-git
 	depends = freetype2
 	depends = fontconfig
 	depends = hicolor-icon-theme
-	conflicts = zinc
-	source = zinc-git::git+https://github.com/Mvkweb/zinc.git
+	conflicts = zinc-term
+	source = zinc-term-git::git+https://github.com/Mvkweb/zinc.git
 	sha256sums = SKIP
 
-pkgname = zinc-git
+pkgname = zinc-term-git
