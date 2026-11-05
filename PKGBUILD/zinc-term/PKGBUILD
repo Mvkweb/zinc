@@ -1,7 +1,8 @@
 # Maintainer: Mvkweb <https://github.com/Mvkweb>
 # Maintainer: Dan Griffiths <me at evertiro dot com>
 
-pkgname=zinc
+_pkgname=zinc
+pkgname=zinc-term
 pkgver=0.2.0
 pkgrel=1
 pkgdesc='A terminal emulator written in Zig'
@@ -20,12 +21,12 @@ makedepends=(
 	'zig>=0.17'
 	'pkgconf'
 )
-conflicts=('zinc-git')
+conflicts=('zinc-term-git')
 source=("https://github.com/Mvkweb/zinc/releases/download/v$pkgver/zinc-v$pkgver.tar.gz")
 sha256sums=('61da16714982cf263f42afadb9ce4be772abdbd8a5edb21cf2931c5ab6bbb204')
 
 build() {
-	cd "$srcdir/$pkgname-v$pkgver"
+	cd "$srcdir/$_pkgname-v$pkgver"
 
     # Baseline CPU so the package runs anywhere, not just the build host.
     # Staging prefix: package() copies the tree into $pkgdir.
@@ -37,7 +38,7 @@ build() {
 }
 
 package() {
-	cd "$srcdir/$pkgname-v$pkgver"
+	cd "$srcdir/$_pkgname-v$pkgver"
 
 	cp -a "$srcdir/stage/." "$pkgdir/usr/"
 	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
