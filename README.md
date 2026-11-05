@@ -24,11 +24,12 @@ If you want to see the full breakdown of everything zinc does, check [features.m
 - libxkbcommon
 - freetype2
 - fontconfig
+- hicolor-icon-theme
 
 On Arch:
 
 ```bash
-sudo pacman -S zig wayland libxkbcommon freetype2 fontconfig
+sudo pacman -S zig wayland libxkbcommon freetype2 fontconfig hicolor-icon-theme
 ```
 
 Note: built with Zig 0.17.0.
@@ -75,11 +76,7 @@ sudo zig build -Doptimize=ReleaseSafe --prefix /usr/local
 sudo update-desktop-database /usr/local/share/applications
 ```
 
-On Arch Linux, you can also build and install directly using the included `PKGBUILD`:
-
-```bash
-makepkg -si
-```
+On Arch Linux, you should install using the AUR packages.
 
 ## Uninstall
 
