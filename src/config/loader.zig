@@ -83,6 +83,8 @@ pub const DEFAULT_CONFIG_TEMPLATE =
     \\# afterimage lifetime, 0 = off. smooth-scroll glides scrollback jumps.
     \\cursor-glide = true
     \\cursor-glide-ms = 60
+    \\# cursor-overshoot: bounce/spring past target cell (1.0 = default bounce, 0.0 = zero bounce/pure smooth glide, 0.5 = subtle bounce).
+    \\cursor-overshoot = 1.0
     \\cursor-trail-ms = 0
     \\smooth-scroll = true
     \\smooth-scroll-ms = 110
@@ -255,6 +257,7 @@ test "default template parses valid config" {
     try std.testing.expectEqual(@as(?bool, false), cfg.selection_single_cell);
     try std.testing.expectEqual(@as(?bool, true), cfg.cursor_glide);
     try std.testing.expectEqual(@as(?u16, 60), cfg.cursor_glide_ms);
+    try std.testing.expectEqual(@as(?f32, 1.0), cfg.cursor_overshoot);
     try std.testing.expectEqual(@as(?u16, 0), cfg.cursor_trail_ms);
     try std.testing.expectEqual(@as(?bool, true), cfg.smooth_scroll);
     try std.testing.expectEqual(@as(?u16, 110), cfg.smooth_scroll_ms);
@@ -357,17 +360,17 @@ test "template stamp matches CURRENT_CONFIG_VERSION" {
 
 test "template documents every supported key" {
     const keys = [_][]const u8{
-        "font-size",               "font-family",          "padding-x",
-        "padding-y",               "alt-padding-x",        "alt-padding-y",
-        "decorations",             "background",           "foreground",
-        "selection-background",    "selection-foreground", "cursor-color",
-        "link-color",              "background-opacity",   "cursor-style",
-        "cursor-blink",            "cursor-thickness",     "cursor-glide",
-        "cursor-glide-ms",         "cursor-trail-ms",      "smooth-scroll",
-        "smooth-scroll-ms",        "scroll-step",          "selection-single-cell",
-        "find-match-numbers",      "find-number-scale",    "editor-command",
-        "editor-command-terminal", "dir-cd-mod",           "dir-open-mod",
-        "dir-cd-ls",               "config-version",
+        "font-size",             "font-family",             "padding-x",
+        "padding-y",             "alt-padding-x",           "alt-padding-y",
+        "decorations",           "background",              "foreground",
+        "selection-background",  "selection-foreground",    "cursor-color",
+        "link-color",            "background-opacity",      "cursor-style",
+        "cursor-blink",          "cursor-thickness",        "cursor-glide",
+        "cursor-glide-ms",       "cursor-overshoot",        "cursor-trail-ms",
+        "smooth-scroll",         "smooth-scroll-ms",        "scroll-step",
+        "selection-single-cell", "find-match-numbers",      "find-number-scale",
+        "editor-command",        "editor-command-terminal", "dir-cd-mod",
+        "dir-open-mod",          "dir-cd-ls",               "config-version",
     };
     for (keys) |k| {
         try std.testing.expect(std.mem.indexOf(u8, DEFAULT_CONFIG_TEMPLATE, k) != null);

@@ -150,7 +150,7 @@ fn replay(evs: []const Ev, period_ms: i64, end_ms: i64, fixed: bool) Replay {
         }
         if (!needs or t < next_ok) continue;
         const hard = fixed and !shown;
-        f.step(t, col, row, 0, shown, hard, 9, 18, true, 60, 0, true, 110);
+        f.step(t, col, row, 0, shown, hard, 9, 18, true, 60, 1.0, 0, true, 110);
         r.frames += 1;
         const full = if (fixed) f.scroll_moving else !f.settled();
         if (full) r.full += 1 else r.rows_only += 1;

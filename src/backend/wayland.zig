@@ -312,6 +312,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// Flow animation knobs (file config overrides comptime defaults).
         glide: bool = cfg.cursor_glide,
         glide_ms: u16 = cfg.cursor_glide_ms,
+        cursor_overshoot: f32 = cfg.cursor_overshoot,
         trail_ms: u16 = cfg.cursor_trail_ms,
         smooth_scroll: bool = cfg.smooth_scroll,
         smooth_scroll_ms: u16 = cfg.smooth_scroll_ms,
@@ -580,6 +581,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .find_num_scale = runtime_cfg.find_number_scale orelse cfg.find_number_scale,
                 .glide = runtime_cfg.cursor_glide orelse cfg.cursor_glide,
                 .glide_ms = runtime_cfg.cursor_glide_ms orelse cfg.cursor_glide_ms,
+                .cursor_overshoot = runtime_cfg.cursor_overshoot orelse cfg.cursor_overshoot,
                 .trail_ms = runtime_cfg.cursor_trail_ms orelse cfg.cursor_trail_ms,
                 .smooth_scroll = runtime_cfg.smooth_scroll orelse cfg.smooth_scroll,
                 .smooth_scroll_ms = runtime_cfg.smooth_scroll_ms orelse cfg.smooth_scroll_ms,
@@ -2426,7 +2428,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // cursor across the screen every redraw, and gliding it would
             // spend frames animating nothing anyone can see.
             const flow_snap = !view_live or !self.ctx.show_cursor;
-            self.flow.step(flow_now, self.ctx.cursor_col, self.ctx.cursor_row, voff, flow_visible, flow_snap, self.cell_w, self.cell_h, self.glide, self.glide_ms, self.trail_ms, self.smooth_scroll, self.smooth_scroll_ms);
+            self.flow.step(flow_now, self.ctx.cursor_col, self.ctx.cursor_row, voff, flow_visible, flow_snap, self.cell_w, self.cell_h, self.glide, self.glide_ms, self.cursor_overshoot, self.trail_ms, self.smooth_scroll, self.smooth_scroll_ms);
             // Drag-extend rides the INTERPOLATED viewport: extending on
             // the scroll event jumped the highlight ahead of the glide.
             // Whole travelled rows are consumed per frame (the fraction

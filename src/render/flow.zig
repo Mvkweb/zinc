@@ -82,6 +82,7 @@ pub const Flow = struct {
         ch: i32,
         glide: bool,
         glide_ms: u16,
+        overshoot: f32,
         trail_ms: u16,
         smooth: bool,
         scroll_ms: u16,
@@ -164,12 +165,12 @@ pub const Flow = struct {
             // Chase the velocity-led point: at rest vel ~ 0 and this is
             // the plain lerp; in continuous motion the lead cancels the
             // steady-state lag so text and cursor stay glued.
-            const chx = tx + self.lvx * dur;
-            const chy = ty + self.lvy * dur;
+            const chx = tx + self.lvx * dur * overshoot;
+            const chy = ty + self.lvy * dur * overshoot;
             const f: f32 = @min(dt_ms / dur, 1.0);
             self.gx += (chx - self.gx) * f;
             self.gy += (chy - self.gy) * f;
-            const lead: f32 = @abs(self.lvx) * dur + @abs(self.lvy) * dur;
+            const lead: f32 = (@abs(self.lvx) + @abs(self.lvy)) * dur * overshoot;
             if (@abs(tx - self.gx) < 0.5 and @abs(ty - self.gy) < 0.5 and lead < 0.5) {
                 self.gx = tx;
                 self.gy = ty;
@@ -347,18 +348,18 @@ pub const Flow = struct {
 
 test "glide converges then settles" {
     var f = Flow{};
-    f.step(1000, 0, 0, 0, true, false, 8, 16, true, 120, 0, false, 150);
+    f.step(1000, 0, 0, 0, true, false, 8, 16, true, 120, 1.0, 0, false, 150);
     try std.testing.expect(f.settled()); // first step places
     // Idle gap, then a move: must glide in, never snap (a seconds-long
     // dt used to clamp the factor to 1.0 and skip the animation).
-    f.step(2000, 5, 0, 0, true, false, 8, 16, true, 120, 0, false, 150);
+    f.step(2000, 5, 0, 0, true, false, 8, 16, true, 120, 1.0, 0, false, 150);
     try std.testing.expect(!f.settled());
     try std.testing.expect(f.cursorPx().x < 40);
     var t: i64 = 2000;
     var n: usize = 0;
     while (!f.settled() and n < 200) : (n += 1) {
         t += 7; // ~144Hz frames
-        f.step(t, 5, 0, 0, true, false, 8, 16, true, 120, 0, false, 150);
+        f.step(t, 5, 0, 0, true, false, 8, 16, true, 120, 1.0, 0, false, 150);
     }
     try std.testing.expect(f.settled());
     const p = f.cursorPx();
@@ -368,26 +369,26 @@ test "glide converges then settles" {
 
 test "near moves latch instantly" {
     var f = Flow{};
-    f.step(1000, 0, 0, 0, true, false, 8, 16, true, 120, 0, false, 150);
+    f.step(1000, 0, 0, 0, true, false, 8, 16, true, 120, 1.0, 0, false, 150);
     // 10ms later (inside the antijitter window): a 1-cell step still
     // latches, so held keys never staircase into multi-cell hops.
-    f.step(1010, 1, 0, 0, true, false, 8, 16, true, 120, 0, false, 150);
+    f.step(1010, 1, 0, 0, true, false, 8, 16, true, 120, 1.0, 0, false, 150);
     try std.testing.expectEqual(@as(u16, 1), f.tgt_col);
 }
 
 test "velocity lead keeps held-key cursor glued" {
     var f = Flow{};
     var t: i64 = 1000;
-    f.step(t, 0, 0, 0, true, false, 8, 16, true, 60, 0, false, 150);
+    f.step(t, 0, 0, 0, true, false, 8, 16, true, 60, 1.0, 0, false, 150);
     // Held key: 1 cell per 33ms, ~7ms frames between (glide 60 = live default).
     var k: u16 = 1;
     while (k <= 20) : (k += 1) {
         t += 33;
-        f.step(t, k, 0, 0, true, false, 8, 16, true, 60, 0, false, 150);
+        f.step(t, k, 0, 0, true, false, 8, 16, true, 60, 1.0, 0, false, 150);
         var j: usize = 0;
         while (j < 4) : (j += 1) {
             t += 7;
-            f.step(t, k, 0, 0, true, false, 8, 16, true, 60, 0, false, 150);
+            f.step(t, k, 0, 0, true, false, 8, 16, true, 60, 1.0, 0, false, 150);
         }
     }
     // Rides within 2 cells of live, never overshooting wildly.
@@ -398,14 +399,14 @@ test "velocity lead keeps held-key cursor glued" {
 
 test "blink off-phase keeps physics, history snaps" {
     var f = Flow{};
-    f.step(1000, 0, 0, 0, false, false, 8, 16, true, 120, 300, false, 150);
+    f.step(1000, 0, 0, 0, false, false, 8, 16, true, 120, 1.0, 300, false, 150);
     try std.testing.expect(f.settled()); // placement
     // Visible move starts a glide with a trail entry.
-    f.step(1100, 5, 0, 0, true, false, 8, 16, true, 120, 300, false, 150);
+    f.step(1100, 5, 0, 0, true, false, 8, 16, true, 120, 1.0, 300, false, 150);
     try std.testing.expect(!f.settled());
     try std.testing.expectEqual(@as(usize, 1), f.trail_n);
     // Blink off-phase: physics continues underneath — no snap, trail kept.
-    f.step(1107, 5, 0, 0, false, false, 8, 16, true, 120, 300, false, 150);
+    f.step(1107, 5, 0, 0, false, false, 8, 16, true, 120, 1.0, 300, false, 150);
     try std.testing.expect(!f.settled());
     try std.testing.expectEqual(@as(usize, 1), f.trail_n);
     try std.testing.expect(f.cursorPx().x < 40);
@@ -414,12 +415,12 @@ test "blink off-phase keeps physics, history snaps" {
     var n: usize = 0;
     while (!f.settled() and n < 300) : (n += 1) {
         t += 7;
-        f.step(t, 5, 0, 0, true, false, 8, 16, true, 120, 300, false, 150);
+        f.step(t, 5, 0, 0, true, false, 8, 16, true, 120, 1.0, 300, false, 150);
     }
     try std.testing.expect(f.settled());
     try std.testing.expectEqual(@as(i32, 40), f.cursorPx().x);
     // History hiding snaps instead: no replay glide on return.
-    f.step(t + 100, 9, 0, 2, false, true, 8, 16, true, 120, 300, false, 150);
+    f.step(t + 100, 9, 0, 2, false, true, 8, 16, true, 120, 1.0, 300, false, 150);
     try std.testing.expect(f.settled());
     try std.testing.expectEqual(@as(usize, 0), f.trail_n);
     try std.testing.expectEqual(@as(i32, 72), f.cursorPx().x);
@@ -427,32 +428,32 @@ test "blink off-phase keeps physics, history snaps" {
 
 test "target latch antijitters rapid moves" {
     var f = Flow{};
-    f.step(1000, 0, 0, 0, true, false, 8, 16, true, 120, 300, false, 150);
+    f.step(1000, 0, 0, 0, true, false, 8, 16, true, 120, 1.0, 300, false, 150);
     // Accepted far move opens the window...
-    f.step(1100, 6, 0, 0, true, false, 8, 16, true, 120, 300, false, 150);
+    f.step(1100, 6, 0, 0, true, false, 8, 16, true, 120, 1.0, 300, false, 150);
     try std.testing.expectEqual(@as(u16, 6), f.tgt_col);
     // 10ms later: too soon, remembered not latched (TUI flicker guard).
-    f.step(1110, 9, 0, 0, true, false, 8, 16, true, 120, 300, false, 150);
+    f.step(1110, 9, 0, 0, true, false, 8, 16, true, 120, 1.0, 300, false, 150);
     try std.testing.expectEqual(@as(u16, 6), f.tgt_col);
     try std.testing.expect(f.has_pend);
     // Past the window: latched, departure cell trailed.
-    f.step(1160, 9, 0, 0, true, false, 8, 16, true, 120, 300, false, 150);
+    f.step(1160, 9, 0, 0, true, false, 8, 16, true, 120, 1.0, 300, false, 150);
     try std.testing.expectEqual(@as(u16, 9), f.tgt_col);
     try std.testing.expectEqual(@as(usize, 2), f.trail_n);
     try std.testing.expect(f.trailAlpha(0, 300) > 0);
     // Trail fades out with time.
-    f.step(1160 + 300, 9, 0, 0, true, false, 8, 16, true, 120, 300, false, 150);
+    f.step(1160 + 300, 9, 0, 0, true, false, 8, 16, true, 120, 1.0, 300, false, 150);
     try std.testing.expectEqual(@as(usize, 0), f.trail_n);
 }
 
 test "scroll chases view offset" {
     var f = Flow{};
-    f.step(1000, 0, 0, 0, true, false, 8, 16, false, 120, 0, true, 150);
+    f.step(1000, 0, 0, 0, true, false, 8, 16, false, 120, 1.0, 0, true, 150);
     try std.testing.expect(f.settled());
     // Wheel up 3 rows: the painted viewport streams 0→1→2→3 while a
     // sub-row shift carries the in-between — continuous motion, never
     // strobing line-blocks, shift always in [0, ch).
-    f.step(1007, 0, 0, 3, true, false, 8, 16, false, 120, 0, true, 150);
+    f.step(1007, 0, 0, 3, true, false, 8, 16, false, 120, 1.0, 0, true, 150);
     try std.testing.expect(!f.settled());
     try std.testing.expectEqual(@as(usize, 0), f.viewEff(100));
     const s0 = f.scrollShiftPx(16);
@@ -462,7 +463,7 @@ test "scroll chases view offset" {
     var saw_mid = false;
     while (!f.settled() and n < 200) : (n += 1) {
         t += 7;
-        f.step(t, 0, 0, 3, true, false, 8, 16, false, 120, 0, true, 150);
+        f.step(t, 0, 0, 3, true, false, 8, 16, false, 120, 1.0, 0, true, 150);
         const e = f.viewEff(100);
         try std.testing.expect(e <= 3);
         if (e == 1 or e == 2) saw_mid = true;
@@ -477,7 +478,7 @@ test "scroll chases view offset" {
 
 test "snapView lands instantly" {
     var f = Flow{};
-    f.step(1000, 0, 0, 5, true, false, 8, 16, false, 120, 0, true, 150);
+    f.step(1000, 0, 0, 5, true, false, 8, 16, false, 120, 1.0, 0, true, 150);
     f.snapView(0);
     try std.testing.expect(f.settled());
     try std.testing.expectEqual(@as(usize, 0), f.viewEff(100));
@@ -486,7 +487,7 @@ test "snapView lands instantly" {
 
 test "tail streams one pixel per frame then lands" {
     var f = Flow{};
-    f.step(1000, 0, 0, 0, true, false, 8, 16, false, 120, 0, true, 150);
+    f.step(1000, 0, 0, 0, true, false, 8, 16, false, 120, 1.0, 0, true, 150);
     // Park the glide ~1.6px short: every frame must advance rendered
     // position (no stalls), steps stay tiny, landing is exact.
     f.view_off_f = 3;
@@ -496,7 +497,7 @@ test "tail streams one pixel per frame then lands" {
     var t: i64 = 1016;
     var n: usize = 0;
     while (!f.settled() and n < 50) : (n += 1) {
-        f.step(t, 0, 0, 3, true, false, 8, 16, false, 120, 0, true, 150);
+        f.step(t, 0, 0, 3, true, false, 8, 16, false, 120, 1.0, 0, true, 150);
         t += 7;
         const pos: i32 = @as(i32, @intCast(f.viewEff(100))) * 16 + f.scrollShiftPx(16);
         // Monotonic, at least a pixel while moving, never a leap.
@@ -511,7 +512,7 @@ test "tail streams one pixel per frame then lands" {
 
 test "viewEff clamps to history" {
     var f = Flow{};
-    f.step(1000, 0, 0, 0, true, false, 8, 16, false, 120, 0, true, 150);
+    f.step(1000, 0, 0, 0, true, false, 8, 16, false, 120, 1.0, 0, true, 150);
     f.snapView(0);
     try std.testing.expectEqual(@as(usize, 0), f.viewEff(0));
     try std.testing.expectEqual(@as(usize, 0), f.viewEff(100));
@@ -519,12 +520,12 @@ test "viewEff clamps to history" {
 
 test "overshoot rubber-bands then settles" {
     var f = Flow{};
-    f.step(1000, 0, 0, 5, true, false, 8, 16, false, 120, 0, true, 150);
+    f.step(1000, 0, 0, 5, true, false, 8, 16, false, 120, 1.0, 0, true, 150);
     var t: i64 = 1000;
     var n: usize = 0;
     while (!f.settled() and n < 300) : (n += 1) {
         t += 7;
-        f.step(t, 0, 0, 5, true, false, 8, 16, false, 120, 0, true, 150);
+        f.step(t, 0, 0, 5, true, false, 8, 16, false, 120, 1.0, 0, true, 150);
     }
     try std.testing.expect(f.settled());
     // Bump at the limit: half-row overshoot, frames alive, then rest.
@@ -537,7 +538,7 @@ test "overshoot rubber-bands then settles" {
     n = 0;
     while (!f.settled() and n < 300) : (n += 1) {
         t += 7;
-        f.step(t, 0, 0, 5, true, false, 8, 16, false, 120, 0, true, 150);
+        f.step(t, 0, 0, 5, true, false, 8, 16, false, 120, 1.0, 0, true, 150);
     }
     try std.testing.expect(f.settled());
     try std.testing.expectEqual(@as(i32, 0), f.scrollShiftPx(16));
@@ -545,9 +546,9 @@ test "overshoot rubber-bands then settles" {
 
 test "overshoot off snaps with smooth" {
     var f = Flow{};
-    f.step(1000, 0, 0, 5, true, false, 8, 16, false, 120, 0, false, 150);
+    f.step(1000, 0, 0, 5, true, false, 8, 16, false, 120, 1.0, 0, false, 150);
     f.bumpOver(-1);
-    f.step(1016, 0, 0, 5, true, false, 8, 16, false, 120, 0, false, 150);
+    f.step(1016, 0, 0, 5, true, false, 8, 16, false, 120, 1.0, 0, false, 150);
     try std.testing.expect(f.settled());
     try std.testing.expectEqual(@as(i32, 0), f.scrollShiftPx(16));
 }
@@ -556,7 +557,7 @@ test "all off snaps settled" {
     var f = Flow{};
     f.gx = 999;
     f.shown_off = 42;
-    f.step(1000, 5, 2, 7, true, false, 8, 16, false, 120, 0, false, 150);
+    f.step(1000, 5, 2, 7, true, false, 8, 16, false, 120, 1.0, 0, false, 150);
     try std.testing.expect(f.settled());
     const p = f.cursorPx();
     try std.testing.expectEqual(@as(i32, 40), p.x);
@@ -566,10 +567,10 @@ test "all off snaps settled" {
 
 test "hitch resumes as catch-up, never snaps" {
     var f = Flow{};
-    f.step(1000, 0, 0, 0, true, false, 8, 16, true, 60, 0, false, 150);
+    f.step(1000, 0, 0, 0, true, false, 8, 16, true, 60, 1.0, 0, false, 150);
     // 70ms stall (slow-typing pause, bake hitch): dt clamps to 32, so a
     // 5-cell move starts mid-flight instead of teleporting (f = 1 at 70).
-    f.step(1070, 5, 0, 0, true, false, 8, 16, true, 60, 0, false, 150);
+    f.step(1070, 5, 0, 0, true, false, 8, 16, true, 60, 1.0, 0, false, 150);
     try std.testing.expect(!f.settled());
     const p = f.cursorPx();
     try std.testing.expect(p.x > 0 and p.x < 40);
@@ -577,11 +578,11 @@ test "hitch resumes as catch-up, never snaps" {
 
 test "rejected tail never sticks" {
     var f = Flow{};
-    f.step(1000, 0, 0, 0, true, false, 8, 16, true, 120, 0, false, 150);
-    f.step(1100, 6, 0, 0, true, false, 8, 16, true, 120, 0, false, 150);
+    f.step(1000, 0, 0, 0, true, false, 8, 16, true, 120, 1.0, 0, false, 150);
+    f.step(1100, 6, 0, 0, true, false, 8, 16, true, 120, 1.0, 0, false, 150);
     try std.testing.expectEqual(@as(u16, 6), f.tgt_col);
     // Next far jump lands inside the window: remembered, latch holds.
-    f.step(1110, 12, 0, 0, true, false, 8, 16, true, 120, 0, false, 150);
+    f.step(1110, 12, 0, 0, true, false, 8, 16, true, 120, 1.0, 0, false, 150);
     try std.testing.expectEqual(@as(u16, 6), f.tgt_col);
     try std.testing.expect(f.has_pend);
     // Displayed rests exactly on the stale latch: must NOT settle, or
@@ -596,9 +597,55 @@ test "rejected tail never sticks" {
     var n: usize = 0;
     while (!f.settled() and n < 300) : (n += 1) {
         t += 7;
-        f.step(t, 12, 0, 0, true, false, 8, 16, true, 120, 0, false, 150);
+        f.step(t, 12, 0, 0, true, false, 8, 16, true, 120, 1.0, 0, false, 150);
     }
     try std.testing.expect(f.settled());
     try std.testing.expectEqual(@as(u16, 12), f.tgt_col);
     try std.testing.expectEqual(@as(i32, 96), f.cursorPx().x);
+}
+
+test "overshoot controls bounce / spring amount" {
+    // 1. With overshoot = 0.0: monotonic approach, NEVER exceeds target.
+    {
+        var f = Flow{};
+        var t: i64 = 1000;
+        f.step(t, 0, 0, 0, true, false, 8, 16, true, 60, 0.0, 0, false, 150);
+        t += 33;
+        f.step(t, 5, 0, 0, true, false, 8, 16, true, 60, 0.0, 0, false, 150);
+        t += 33;
+        f.step(t, 10, 0, 0, true, false, 8, 16, true, 60, 0.0, 0, false, 150);
+        const target_x: i32 = 10 * 8;
+        var max_x: i32 = 0;
+        var n: usize = 0;
+        while (!f.settled() and n < 100) : (n += 1) {
+            t += 7;
+            f.step(t, 10, 0, 0, true, false, 8, 16, true, 60, 0.0, 0, false, 150);
+            max_x = @max(max_x, f.cursorPx().x);
+        }
+        try std.testing.expect(f.settled());
+        try std.testing.expectEqual(target_x, f.cursorPx().x);
+        try std.testing.expect(max_x <= target_x);
+    }
+
+    // 2. With overshoot = 1.0 (default): bounces past target during rapid move.
+    {
+        var f = Flow{};
+        var t: i64 = 1000;
+        f.step(t, 0, 0, 0, true, false, 8, 16, true, 60, 1.0, 0, false, 150);
+        t += 33;
+        f.step(t, 5, 0, 0, true, false, 8, 16, true, 60, 1.0, 0, false, 150);
+        t += 33;
+        f.step(t, 10, 0, 0, true, false, 8, 16, true, 60, 1.0, 0, false, 150);
+        const target_x: i32 = 10 * 8;
+        var max_x: i32 = 0;
+        var n: usize = 0;
+        while (!f.settled() and n < 100) : (n += 1) {
+            t += 7;
+            f.step(t, 10, 0, 0, true, false, 8, 16, true, 60, 1.0, 0, false, 150);
+            max_x = @max(max_x, f.cursorPx().x);
+        }
+        try std.testing.expect(f.settled());
+        try std.testing.expectEqual(target_x, f.cursorPx().x);
+        try std.testing.expect(max_x > target_x);
+    }
 }

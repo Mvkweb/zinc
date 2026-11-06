@@ -73,6 +73,7 @@ pub const Config = struct {
     /// teleporting (exponential ease-out, ~glide_ms to settle).
     cursor_glide: bool = true,
     cursor_glide_ms: u16 = 60,
+    cursor_overshoot: f32 = 1.0,
 
     // Font. Size is points at font_dpi (foot parity: size=12 with
     // dpi-aware=no renders 12pt @ 96dpi = 16px, never 12px).

@@ -28,6 +28,7 @@ pub const RuntimeConfig = struct {
     selection_single_cell: ?bool = null,
     cursor_glide: ?bool = null,
     cursor_glide_ms: ?u16 = null,
+    cursor_overshoot: ?f32 = null,
     cursor_trail_ms: ?u16 = null,
     smooth_scroll: ?bool = null,
     smooth_scroll_ms: ?u16 = null,
@@ -200,6 +201,10 @@ pub fn parse(content: []const u8, cfg: *RuntimeConfig, gpa: std.mem.Allocator) v
             if (std.fmt.parseInt(u16, trimQuotes(val), 10)) |m| {
                 if (m <= 1000) cfg.cursor_glide_ms = m;
             } else |_| {}
+        } else if (std.ascii.eqlIgnoreCase(key, "cursor-overshoot") or std.ascii.eqlIgnoreCase(key, "cursor_overshoot")) {
+            if (std.fmt.parseFloat(f32, trimQuotes(val))) |f| {
+                cfg.cursor_overshoot = @max(0.0, @min(2.0, f));
+            } else |_| {}
         } else if (std.ascii.eqlIgnoreCase(key, "cursor-trail-ms") or std.ascii.eqlIgnoreCase(key, "cursor_trail_ms")) {
             if (std.fmt.parseInt(u16, trimQuotes(val), 10)) |m| {
                 if (m <= 2000) cfg.cursor_trail_ms = m;
@@ -333,6 +338,7 @@ test "parse complete config content" {
         \\find-number-scale = 3
         \\cursor-glide = false
         \\cursor-glide-ms = 90
+        \\cursor-overshoot = 0.5
         \\cursor-trail-ms = 250
         \\smooth-scroll = false
         \\smooth-scroll-ms = 200
@@ -367,6 +373,7 @@ test "parse complete config content" {
     try std.testing.expectEqual(@as(?u8, 3), cfg.find_number_scale);
     try std.testing.expectEqual(@as(?bool, false), cfg.cursor_glide);
     try std.testing.expectEqual(@as(?u16, 90), cfg.cursor_glide_ms);
+    try std.testing.expectEqual(@as(?f32, 0.5), cfg.cursor_overshoot);
     try std.testing.expectEqual(@as(?u16, 250), cfg.cursor_trail_ms);
     try std.testing.expectEqual(@as(?bool, false), cfg.smooth_scroll);
     try std.testing.expectEqual(@as(?u16, 200), cfg.smooth_scroll_ms);
