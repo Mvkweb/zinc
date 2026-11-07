@@ -10,11 +10,13 @@ Keep in mind this is still experimental and you will surely find issues. If you 
 
 ## Highlights
 
-The cursor glides to its cell over 60ms instead of teleporting. Scrolling pours instead of jumping, with a scrollbar that fades when idle. Ctrl+click a file to open it in your editor, Ctrl+click a folder to cd into it, Shift+click to open the file manager. Images render inline through the Kitty graphics protocol, so tools like yazi show real previews. Fonts auto-discover with CJK and emoji fallback, and Ctrl+plus/minus zooms.
+- **Smooth motion**: configurable cursor glide and scrolling.
+- **Kitty graphics**: inline image previews for `yazi`, `chafa`, etc.
+- **Adaptive TUI padding**: pads your shell, but drops to 0px edge-to-edge in full-screen apps (`nvim`, `btop`, `yazi`).
+- **Smart click**: `Ctrl+click` files to open in your editor, `Ctrl+click` folders to `cd`.
+- **Lightweight**: memory footprint stays around ~23MB in a maximized window.
 
-Everything lives in `~/.config/zinc/config`, created on first launch and never rewritten. Tune `cursor-glide-ms`, `smooth-scroll-ms`, or `scroll-step` and restart.
-
-If you want to see the full breakdown of everything zinc does, check [features.md](features.md).
+Full breakdown in [features.md](features.md).
 
 
 ## Dependencies
