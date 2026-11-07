@@ -2230,6 +2230,15 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             // reflow track the settled last-column cell instead.
             self.pending_wrap = false;
 
+            const was_in_prompt = self.in_prompt and !self.alt_active;
+            const old_crow = self.cursor_row;
+            const prompt_span: u16 = if (was_in_prompt) blk: {
+                if (self.prompt_start_row) |psr| {
+                    break :blk old_crow -| psr;
+                }
+                break :blk 0;
+            } else 0;
+
             self.grid.resizeWithReflow(
                 cols,
                 rows,
@@ -2244,6 +2253,24 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             self.scroll_bot = rows - 1;
             self.cursor_col = @min(self.cursor_col, cols -| 1);
             self.cursor_row = @min(self.cursor_row, rows -| 1);
+
+            if (was_in_prompt) {
+                // Ghostty parity (Screen.zig clearPromptForRedraw):
+                // If cursor was sitting at an active prompt (OSC 133), clear the
+                // prompt rows to default blank cells so stale right-aligned prompt
+                // text doesn't linger or wrap into orphan fragments before
+                // the shell repaints on SIGWINCH.
+                // Do NOT erase or scroll rows — rows remain intact.
+                const new_crow = self.cursor_row;
+                const start_r = new_crow -| prompt_span;
+                var r = start_r;
+                while (r <= new_crow and r < self.grid.rows) : (r += 1) {
+                    const rslice = self.grid.rowSlice(r);
+                    @memset(rslice, .{ .bg = cell_mod.COLOR_DEFAULT });
+                }
+                self.prompt_start_row = start_r;
+                self.grid.markRowsDirty(start_r, new_crow);
+            }
         }
     };
 }
@@ -3542,4 +3569,23 @@ test "ascii fast path preconditions hold" {
         try std.testing.expect(!placeholder_mod.isDiacritic(cp));
         try std.testing.expect(cp != 0xFE0F and cp != 0x200D);
     }
+}
+
+test "resize clears active prompt rows when in_prompt" {
+    var ctx = try Context(.{ .cols = 20, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+
+    // Shell signals prompt start via OSC 133;A
+    ctx.parse("\x1b]133;A\x07");
+    try std.testing.expect(ctx.in_prompt);
+
+    // Prompt written with text
+    ctx.parse("prompt> ");
+    try std.testing.expect(ctx.grid.at(0, 0).rune == 'p');
+
+    // Resize terminal
+    ctx.resize(10, 4);
+
+    // Active prompt row should be cleared to blank default cells
+    try std.testing.expect(ctx.grid.at(0, ctx.cursor_row).rune == 0 or ctx.grid.at(0, ctx.cursor_row).rune == ' ');
 }
