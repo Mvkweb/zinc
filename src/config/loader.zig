@@ -12,7 +12,7 @@ pub const RuntimeConfig = parser.RuntimeConfig;
 /// Checklist for a new key: parser arm + RuntimeConfig field + template
 /// entry + template test asserts + bump here. Guard tests below enforce
 /// everything except the bump itself.
-pub const CURRENT_CONFIG_VERSION: u32 = 4;
+pub const CURRENT_CONFIG_VERSION: u32 = 5;
 
 /// True when content predates CURRENT_CONFIG_VERSION (a missing or
 /// unparseable stamp counts as v0). Pure helper for headless tests.
@@ -33,34 +33,38 @@ pub fn needsMigration(content: []const u8) bool {
 }
 
 pub const DEFAULT_CONFIG_TEMPLATE =
-    \\# Zinc Terminal Configuration
-    \\# Generated automatically on first launch.
-    \\# Changes take effect when starting a new terminal window.
-    \\# When new settings ship, a fresh-template reference is written to
-    \\# config.new next to this file (yours is never modified).
-    \\config-version = 4
+    \\# Zinc configuration
+    \\# Changes take effect when you open a new window.
+    \\# When new settings ship, Zinc writes an updated reference file to
+    \\# config.new next to this file without changing your config.
+    \\config-version = 5
     \\
-    \\# --- Font Settings ---
-    \\# font-family: Empty by default for auto-discovery of system Nerd Fonts.
-    \\# You can set an explicit font name (e.g. "JetBrainsMono Nerd Font") or TTF path.
+    \\# Shell
+    \\# Command or binary to run, such as "fish" or "/bin/zsh".
+    \\# Leave empty to read your login shell from /etc/passwd.
+    \\shell = ""
+    \\# Run the shell as a login shell by prepending "-" to argv[0].
+    \\login-shell = false
+    \\
+    \\# Fonts
+    \\# Font family name or TTF path. Leave empty to use system Nerd Fonts.
     \\font-family = ""
     \\font-size = 12.0
     \\
-    \\# --- Window Padding (in pixels) ---
-    \\# Normal padding matches Foot defaults (25px).
+    \\# Padding in pixels
+    \\# Normal window padding.
     \\padding-x = 25
     \\padding-y = 25
-    \\# Alt-screen padding is edge-to-edge (0px) for TUI apps like OpenCode, Neovim, and btop.
+    \\# Fullscreen and alt-screen padding for terminal apps like Neovim and btop.
     \\alt-padding-x = 0
     \\alt-padding-y = 0
     \\
-    \\# --- Window Decorations ---
-    \\# decorations: auto (SSD on KDE/Sway, CSD on GNOME), none (borderless everywhere),
-    \\# csd (always draw built-in header bar), or server (always request SSD).
+    \\# Window decorations
+    \\# Options: auto, none, csd, server.
+    \\# auto uses server decorations on KDE and Sway, and client decorations on GNOME.
     \\decorations = auto
     \\
-    \\# --- Theme Colors (hex format: #RRGGBB) ---
-    \\# Dark background and soft white text (matches Foot defaults).
+    \\# Colors (hex format: #RRGGBB)
     \\background = #0b0f11
     \\foreground = #dcdccc
     \\selection-background = #dcdccc
@@ -68,60 +72,58 @@ pub const DEFAULT_CONFIG_TEMPLATE =
     \\cursor-color = #dcdccc
     \\link-color = #8cd0d3
     \\
-    \\# Background opacity: 0.0 (fully transparent) to 1.0 (fully opaque).
+    \\# Background opacity from 0.0 (transparent) to 1.0 (opaque).
     \\background-opacity = 0.78
     \\
-    \\# --- Cursor Settings ---
-    \\# cursor-style: bar (beam), block, or underline
+    \\# Cursor
+    \\# Shape options: bar, block, underline.
     \\cursor-style = bar
     \\cursor-blink = true
     \\cursor-thickness = 1.5
     \\
-    \\# --- Flow Animations (cursor glide + trail + smooth scroll) ---
-    \\# glide: the visible cursor flows to its cell instead of teleporting.
-    \\# glide-ms: settle time per move (lower = snappier). trail-ms: fading
-    \\# afterimage lifetime, 0 = off. smooth-scroll glides scrollback jumps.
+    \\# Animation
+    \\# Glide the cursor smoothly to new positions instead of jumping.
     \\cursor-glide = true
     \\cursor-glide-ms = 60
-    \\# cursor-overshoot: bounce/spring past target cell (1.0 = default bounce, 0.0 = zero bounce/pure smooth glide, 0.5 = subtle bounce).
+    \\# Overshoot bounce past target cell: 0.0 is smooth glide with no bounce, 1.0 is full bounce.
     \\cursor-overshoot = 1.0
+    \\# Afterimage trail duration in milliseconds. 0 disables the trail.
     \\cursor-trail-ms = 0
+    \\# Smooth scroll animation for scrollback jumps.
     \\smooth-scroll = true
     \\smooth-scroll-ms = 110
-    \\# scroll-step: scrollback rows per wheel notch (touchpads scale
-    \\# proportionally off the same step; 1-100).
+    \\# Rows scrolled per mouse wheel tick (1 to 100).
     \\scroll-step = 5
     \\
-    \\# --- Selection Settings ---
-    \\# If false, single click does not display a 1-cell highlight until dragged.
+    \\# Selection
+    \\# Set to true to show a 1-cell highlight on a single click before dragging.
     \\selection-single-cell = false
     \\
-    \\# --- Find Settings (Ctrl+Shift+F bottom bar) ---
-    \\# Show index badges on visible matches (labels only, off by default).
+    \\# Search bar (Ctrl+Shift+F)
+    \\# Show match index numbers on screen.
     \\find-match-numbers = false
-    \\# Badge digit pixel scale: 1 = tiny, 2 = superscript, 3 = large.
+    \\# Badge digit scale: 1 is small, 2 is medium, 3 is large.
     \\find-number-scale = 2
     \\
-    \\# --- Editor Settings (Ctrl+click file paths) ---
-    \\# Empty = automatic: $EDITOR first, then xdg-open desktop default.
-    \\# Template honors {file} (else appended), {line}, {col}. Examples:
-    \\# editor-command = "zed {file}:{line}:{col}"
+    \\# File and directory clicks
+    \\# Command for opening file paths on Ctrl+click.
+    \\# Leave empty to use $EDITOR, then xdg-open.
+    \\# Supports {file}, {line}, and {col} substitutions.
+    \\# Examples:
     \\# editor-command = "code --goto {file}:{line}:{col}"
-    \\# editor-command = "nano +{line} {file}"
+    \\# editor-command = "zed {file}:{line}:{col}"
     \\editor-command = ""
-    \\# Terminal editors open in place (typed into the shell, so they take
-    \\# over the current window). GUI editors go above. Examples:
-    \\# editor-command-terminal = "nano +{line} {file}"
+    \\# In-terminal editor command executed directly inside the current shell session.
+    \\# Examples:
     \\# editor-command-terminal = "nvim +{line} {file}"
+    \\# editor-command-terminal = "nano +{line} {file}"
     \\editor-command-terminal = ""
-    \\# Directory clicks (resolved paths that stat as directories):
-    \\# dir-cd-mod types `cd '<dir>'` into the shell (primary screen only),
-    \\# dir-open-mod opens the file manager. Values: ctrl, shift,
-    \\# ctrl+shift, off. Empty set disables the gesture.
+    \\# Modifiers for clicking directories: ctrl, shift, ctrl+shift, or off.
+    \\# dir-cd-mod changes directory in the current shell.
     \\dir-cd-mod = ctrl
+    \\# dir-open-mod opens the directory in your graphical file manager.
     \\dir-open-mod = shift
-    \\# After a gesture cd, list the directory too (`cd '<dir>' && ls).
-    \\# The typed line echoes; set false for a bare cd.
+    \\# Run ls automatically after changing directory with a gesture.
     \\dir-cd-ls = true
     \\
 ;
@@ -264,6 +266,8 @@ test "default template parses valid config" {
     try std.testing.expectEqual(@as(?u32, 5), cfg.scroll_step);
     try std.testing.expectEqual(@as(?bool, false), cfg.find_match_numbers);
     try std.testing.expectEqual(@as(?u8, 2), cfg.find_number_scale);
+    try std.testing.expectEqual(@as(?[]const u8, null), cfg.shell);
+    try std.testing.expectEqual(@as(?bool, false), cfg.login_shell);
 }
 
 test "needsMigration stamps" {
@@ -272,8 +276,9 @@ test "needsMigration stamps" {
     try std.testing.expect(needsMigration("config-version = 1\n"));
     try std.testing.expect(needsMigration("config-version = 2\n"));
     try std.testing.expect(needsMigration("config-version = 3\n"));
+    try std.testing.expect(needsMigration("config-version = 4\n"));
     try std.testing.expect(needsMigration("config-version = banana\n"));
-    try std.testing.expect(!needsMigration("config-version = 4\n"));
+    try std.testing.expect(!needsMigration("config-version = 5\n"));
     try std.testing.expect(!needsMigration("# c\nconfig_version = 99\n"));
     try std.testing.expect(!needsMigration(DEFAULT_CONFIG_TEMPLATE));
 }
@@ -326,7 +331,7 @@ test "outdated config writes config.new once, leaves config alone" {
     var nbuf: [8192]u8 = undefined;
     const nlen = H.readAll(tnew.ptr, &nbuf);
     try std.testing.expect(nlen > 0);
-    try std.testing.expect(std.mem.indexOf(u8, nbuf[0..nlen], "config-version = 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nbuf[0..nlen], "config-version = 5") != null);
     try std.testing.expect(std.mem.indexOf(u8, nbuf[0..nlen], "find-match-numbers") != null);
     try std.testing.expect(std.mem.indexOf(u8, nbuf[0..nlen], "cursor-glide") != null);
     var cbuf: [256]u8 = undefined;
@@ -370,7 +375,8 @@ test "template documents every supported key" {
         "smooth-scroll",         "smooth-scroll-ms",        "scroll-step",
         "selection-single-cell", "find-match-numbers",      "find-number-scale",
         "editor-command",        "editor-command-terminal", "dir-cd-mod",
-        "dir-open-mod",          "dir-cd-ls",               "config-version",
+        "dir-open-mod",          "dir-cd-ls",               "shell",
+        "login-shell",           "config-version",
     };
     for (keys) |k| {
         try std.testing.expect(std.mem.indexOf(u8, DEFAULT_CONFIG_TEMPLATE, k) != null);

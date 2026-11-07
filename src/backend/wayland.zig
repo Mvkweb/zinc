@@ -899,7 +899,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const term = try gpa.dupeSentinel(u8, cfg.term_env, 0);
             defer gpa.free(term);
             const pty_px = self.ptyPixels(self.ctx.grid.cols, self.ctx.grid.rows);
-            const child = pty_mod.spawnShell(self.ctx.grid.cols, self.ctx.grid.rows, pty_px.w, pty_px.h, term) catch return error.PtyFailed;
+            const shell_override: ?[]const u8 = self.runtime_cfg.shell orelse (if (cfg.shell.len > 0) cfg.shell else null);
+            const login_sh = self.runtime_cfg.login_shell orelse cfg.login_shell;
+            const child = pty_mod.spawnShell(
+                self.ctx.grid.cols,
+                self.ctx.grid.rows,
+                pty_px.w,
+                pty_px.h,
+                term,
+                shell_override,
+                login_sh,
+            ) catch return error.PtyFailed;
             self.pty_pid = child.pid;
             self.pty_fd = child.fd;
             // Shell query replies (DA/DSR/...) go straight back to the PTY.

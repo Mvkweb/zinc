@@ -17,6 +17,10 @@ pub const Config = struct {
     tab_width: u16 = 8,
     pty_buf_size: u16 = 4096,
     term_env: []const u8 = "xterm-256color",
+    /// Shell command or path. Empty = auto-detect user's login shell from /etc/passwd.
+    shell: []const u8 = "",
+    /// Start shell as a login shell (argv0 prepended with '-').
+    login_shell: bool = false,
     // Memory / grid tradeoffs.
     /// ASCII-only stores runes as u8 instead of u21/u32. Halves grid memory.
     ascii_only: bool = false,

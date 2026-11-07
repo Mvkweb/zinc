@@ -10,6 +10,8 @@ pub const DecorationMode = config_mod.DecorationMode;
 pub const RuntimeConfig = struct {
     font_size: ?f32 = null,
     font_family: ?[]const u8 = null,
+    shell: ?[]const u8 = null,
+    login_shell: ?bool = null,
     decorations: ?DecorationMode = null,
     pad_x: ?u32 = null,
     pad_y: ?u32 = null,
@@ -42,6 +44,10 @@ pub const RuntimeConfig = struct {
     dir_cd_ls: ?bool = null,
 
     pub fn deinit(self: *RuntimeConfig, gpa: std.mem.Allocator) void {
+        if (self.shell) |s| {
+            gpa.free(s);
+            self.shell = null;
+        }
         if (self.font_family) |f| {
             gpa.free(f);
             self.font_family = null;
@@ -250,6 +256,12 @@ pub fn parse(content: []const u8, cfg: *RuntimeConfig, gpa: std.mem.Allocator) v
             if (parseDirMods(val)) |m| cfg.dir_open_mod = m;
         } else if (std.ascii.eqlIgnoreCase(key, "dir-cd-ls") or std.ascii.eqlIgnoreCase(key, "dir_cd_ls")) {
             if (parseBool(val)) |b| cfg.dir_cd_ls = b;
+        } else if (std.ascii.eqlIgnoreCase(key, "shell") or std.ascii.eqlIgnoreCase(key, "command")) {
+            const sh = trimQuotes(val);
+            if (cfg.shell) |old| gpa.free(old);
+            cfg.shell = if (sh.len > 0) (gpa.dupe(u8, sh) catch null) else null;
+        } else if (std.ascii.eqlIgnoreCase(key, "login-shell") or std.ascii.eqlIgnoreCase(key, "login_shell")) {
+            if (parseBool(val)) |b| cfg.login_shell = b;
         }
     }
 }
@@ -428,4 +440,16 @@ test "inline comments" {
     try std.testing.expectEqualStrings("nano +{line} {file}", cfg.editor_command_terminal.?);
     try std.testing.expectEqual(@as(?u32, 0x0B0F11), cfg.bg);
     try std.testing.expectEqualStrings("a # b", cfg.font_family.?);
+}
+
+test "parse shell and login-shell" {
+    var cfg = RuntimeConfig{};
+    defer cfg.deinit(std.testing.allocator);
+    parse("shell = \"fish\"\nlogin-shell = yes\n", &cfg, std.testing.allocator);
+    try std.testing.expectEqualStrings("fish", cfg.shell.?);
+    try std.testing.expectEqual(@as(?bool, true), cfg.login_shell);
+
+    parse("shell = \"\"\nlogin-shell = false\n", &cfg, std.testing.allocator);
+    try std.testing.expect(cfg.shell == null);
+    try std.testing.expectEqual(@as(?bool, false), cfg.login_shell);
 }
