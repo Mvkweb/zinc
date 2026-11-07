@@ -592,6 +592,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .dir_open_mod = runtime_cfg.dir_open_mod orelse cfg.dir_open_mod,
             };
             self.ctx.blink_enabled = self.cursor_blink;
+            const init_cols: u16 = @intCast(@max(15, self.runtime_cfg.window_width orelse (cfg.window_width orelse cfg.cols)));
+            const init_rows: u16 = @intCast(@max(3, self.runtime_cfg.window_height orelse (cfg.window_height orelse cfg.rows)));
+            if (init_cols != self.ctx.grid.cols or init_rows != self.ctx.grid.rows) {
+                self.ctx.resize(init_cols, init_rows);
+            }
             errdefer {
                 self.deinit();
                 gpa.destroy(self);
@@ -887,8 +892,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Default pixel size from font metrics until configure says otherwise.
             if (self.width == 0) {
                 const pad: i32 = @intCast(self.currentPadX());
-                self.width = @as(i32, cfg.cols) * self.cell_w + 2 * pad;
-                self.height = @as(i32, cfg.rows) * self.cell_h + 2 * @as(i32, @intCast(self.currentPadY())) + hh;
+                self.width = @as(i32, self.ctx.grid.cols) * self.cell_w + 2 * pad;
+                self.height = @as(i32, self.ctx.grid.rows) * self.cell_h + 2 * @as(i32, @intCast(self.currentPadY())) + hh;
             }
             try self.recreatePool();
 

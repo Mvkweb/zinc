@@ -12,6 +12,8 @@ pub const RuntimeConfig = struct {
     font_family: ?[]const u8 = null,
     shell: ?[]const u8 = null,
     login_shell: ?bool = null,
+    window_width: ?u16 = null,
+    window_height: ?u16 = null,
     decorations: ?DecorationMode = null,
     pad_x: ?u32 = null,
     pad_y: ?u32 = null,
@@ -262,6 +264,24 @@ pub fn parse(content: []const u8, cfg: *RuntimeConfig, gpa: std.mem.Allocator) v
             cfg.shell = if (sh.len > 0) (gpa.dupe(u8, sh) catch null) else null;
         } else if (std.ascii.eqlIgnoreCase(key, "login-shell") or std.ascii.eqlIgnoreCase(key, "login_shell")) {
             if (parseBool(val)) |b| cfg.login_shell = b;
+        } else if (std.ascii.eqlIgnoreCase(key, "window-width") or std.ascii.eqlIgnoreCase(key, "window_width")) {
+            if (std.fmt.parseInt(u16, trimQuotes(val), 10)) |w| {
+                if (w >= 15 and w <= 1000) cfg.window_width = w;
+            } else |_| {}
+        } else if (std.ascii.eqlIgnoreCase(key, "window-height") or std.ascii.eqlIgnoreCase(key, "window_height")) {
+            if (std.fmt.parseInt(u16, trimQuotes(val), 10)) |h| {
+                if (h >= 3 and h <= 500) cfg.window_height = h;
+            } else |_| {}
+        } else if (std.ascii.eqlIgnoreCase(key, "window-size") or std.ascii.eqlIgnoreCase(key, "window_size") or std.ascii.eqlIgnoreCase(key, "initial-window-size") or std.ascii.eqlIgnoreCase(key, "initial_window_size")) {
+            const s = trimQuotes(val);
+            if (std.mem.indexOfScalar(u8, s, 'x') orelse std.mem.indexOfScalar(u8, s, 'X')) |x_idx| {
+                const w_str = std.mem.trim(u8, s[0..x_idx], " \t");
+                const h_str = std.mem.trim(u8, s[x_idx + 1 ..], " \t");
+                const w = std.fmt.parseInt(u16, w_str, 10) catch 0;
+                const h = std.fmt.parseInt(u16, h_str, 10) catch 0;
+                if (w >= 15 and w <= 1000) cfg.window_width = w;
+                if (h >= 3 and h <= 500) cfg.window_height = h;
+            }
         }
     }
 }
@@ -452,4 +472,26 @@ test "parse shell and login-shell" {
     parse("shell = \"\"\nlogin-shell = false\n", &cfg, std.testing.allocator);
     try std.testing.expect(cfg.shell == null);
     try std.testing.expectEqual(@as(?bool, false), cfg.login_shell);
+}
+
+test "parse window-width, window-height, and window-size" {
+    var cfg = RuntimeConfig{};
+    defer cfg.deinit(std.testing.allocator);
+
+    parse("window-width = 120\nwindow-height = 35\n", &cfg, std.testing.allocator);
+    try std.testing.expectEqual(@as(?u16, 120), cfg.window_width);
+    try std.testing.expectEqual(@as(?u16, 35), cfg.window_height);
+
+    parse("window-size = 100x30\n", &cfg, std.testing.allocator);
+    try std.testing.expectEqual(@as(?u16, 100), cfg.window_width);
+    try std.testing.expectEqual(@as(?u16, 30), cfg.window_height);
+
+    parse("initial-window-size = \"140 x 40\"\n", &cfg, std.testing.allocator);
+    try std.testing.expectEqual(@as(?u16, 140), cfg.window_width);
+    try std.testing.expectEqual(@as(?u16, 40), cfg.window_height);
+
+    // Out of bounds / invalid inputs should not override valid settings
+    parse("window-width = 5\nwindow-height = 1000\n", &cfg, std.testing.allocator);
+    try std.testing.expectEqual(@as(?u16, 140), cfg.window_width);
+    try std.testing.expectEqual(@as(?u16, 40), cfg.window_height);
 }

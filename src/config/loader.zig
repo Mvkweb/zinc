@@ -12,7 +12,7 @@ pub const RuntimeConfig = parser.RuntimeConfig;
 /// Checklist for a new key: parser arm + RuntimeConfig field + template
 /// entry + template test asserts + bump here. Guard tests below enforce
 /// everything except the bump itself.
-pub const CURRENT_CONFIG_VERSION: u32 = 5;
+pub const CURRENT_CONFIG_VERSION: u32 = 6;
 
 /// True when content predates CURRENT_CONFIG_VERSION (a missing or
 /// unparseable stamp counts as v0). Pure helper for headless tests.
@@ -37,7 +37,7 @@ pub const DEFAULT_CONFIG_TEMPLATE =
     \\# Changes take effect when you open a new window.
     \\# When new settings ship, Zinc writes an updated reference file to
     \\# config.new next to this file without changing your config.
-    \\config-version = 5
+    \\config-version = 6
     \\
     \\# Shell
     \\# Command or binary to run, such as "fish" or "/bin/zsh".
@@ -45,6 +45,13 @@ pub const DEFAULT_CONFIG_TEMPLATE =
     \\shell = ""
     \\# Run the shell as a login shell by prepending "-" to argv[0].
     \\login-shell = false
+    \\
+    \\# Window size in character cells (for floating windows; tiling compositors override this)
+    \\# Both Ghostty-style and Foot-style formats are supported:
+    \\# window-width = 80
+    \\# window-height = 24
+    \\# Or combined (columns x rows):
+    \\# window-size = 80x24
     \\
     \\# Fonts
     \\# Font family name or TTF path. Leave empty to use system Nerd Fonts.
@@ -268,6 +275,8 @@ test "default template parses valid config" {
     try std.testing.expectEqual(@as(?u8, 2), cfg.find_number_scale);
     try std.testing.expectEqual(@as(?[]const u8, null), cfg.shell);
     try std.testing.expectEqual(@as(?bool, false), cfg.login_shell);
+    try std.testing.expectEqual(@as(?u16, null), cfg.window_width);
+    try std.testing.expectEqual(@as(?u16, null), cfg.window_height);
 }
 
 test "needsMigration stamps" {
@@ -277,8 +286,9 @@ test "needsMigration stamps" {
     try std.testing.expect(needsMigration("config-version = 2\n"));
     try std.testing.expect(needsMigration("config-version = 3\n"));
     try std.testing.expect(needsMigration("config-version = 4\n"));
+    try std.testing.expect(needsMigration("config-version = 5\n"));
     try std.testing.expect(needsMigration("config-version = banana\n"));
-    try std.testing.expect(!needsMigration("config-version = 5\n"));
+    try std.testing.expect(!needsMigration("config-version = 6\n"));
     try std.testing.expect(!needsMigration("# c\nconfig_version = 99\n"));
     try std.testing.expect(!needsMigration(DEFAULT_CONFIG_TEMPLATE));
 }
@@ -331,9 +341,11 @@ test "outdated config writes config.new once, leaves config alone" {
     var nbuf: [8192]u8 = undefined;
     const nlen = H.readAll(tnew.ptr, &nbuf);
     try std.testing.expect(nlen > 0);
-    try std.testing.expect(std.mem.indexOf(u8, nbuf[0..nlen], "config-version = 5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nbuf[0..nlen], "config-version = 6") != null);
     try std.testing.expect(std.mem.indexOf(u8, nbuf[0..nlen], "find-match-numbers") != null);
     try std.testing.expect(std.mem.indexOf(u8, nbuf[0..nlen], "cursor-glide") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nbuf[0..nlen], "window-width") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nbuf[0..nlen], "window-size") != null);
     var cbuf: [256]u8 = undefined;
     const clen = H.readAll(tcfg.ptr, &cbuf);
     try std.testing.expectEqualStrings("background = #0b0f11\n", cbuf[0..clen]);
@@ -376,7 +388,8 @@ test "template documents every supported key" {
         "selection-single-cell", "find-match-numbers",      "find-number-scale",
         "editor-command",        "editor-command-terminal", "dir-cd-mod",
         "dir-open-mod",          "dir-cd-ls",               "shell",
-        "login-shell",           "config-version",
+        "login-shell",           "window-width",            "window-height",
+        "window-size",           "config-version",
     };
     for (keys) |k| {
         try std.testing.expect(std.mem.indexOf(u8, DEFAULT_CONFIG_TEMPLATE, k) != null);

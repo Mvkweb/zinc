@@ -21,6 +21,10 @@ pub const Config = struct {
     shell: []const u8 = "",
     /// Start shell as a login shell (argv0 prepended with '-').
     login_shell: bool = false,
+    /// Default initial window columns (overrideable via runtime config window-width or window-size).
+    window_width: ?u16 = null,
+    /// Default initial window rows (overrideable via runtime config window-height or window-size).
+    window_height: ?u16 = null,
     // Memory / grid tradeoffs.
     /// ASCII-only stores runes as u8 instead of u21/u32. Halves grid memory.
     ascii_only: bool = false,
