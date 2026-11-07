@@ -17,6 +17,14 @@ pub const Config = struct {
     tab_width: u16 = 8,
     pty_buf_size: u16 = 4096,
     term_env: []const u8 = "xterm-256color",
+    /// Shell command or path. Empty = auto-detect user's login shell from /etc/passwd.
+    shell: []const u8 = "",
+    /// Start shell as a login shell (argv0 prepended with '-').
+    login_shell: bool = false,
+    /// Default initial window columns (overrideable via runtime config window-width or window-size).
+    window_width: ?u16 = null,
+    /// Default initial window rows (overrideable via runtime config window-height or window-size).
+    window_height: ?u16 = null,
     // Memory / grid tradeoffs.
     /// ASCII-only stores runes as u8 instead of u21/u32. Halves grid memory.
     ascii_only: bool = false,
@@ -73,6 +81,7 @@ pub const Config = struct {
     /// teleporting (exponential ease-out, ~glide_ms to settle).
     cursor_glide: bool = true,
     cursor_glide_ms: u16 = 60,
+    cursor_overshoot: f32 = 1.0,
 
     // Font. Size is points at font_dpi (foot parity: size=12 with
     // dpi-aware=no renders 12pt @ 96dpi = 16px, never 12px).

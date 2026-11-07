@@ -178,6 +178,7 @@ extern fn xkb_state_new(map: ?*XkbKeymap) ?*XkbState;
 extern fn xkb_state_unref(state: ?*XkbState) void;
 extern fn xkb_state_update_mask(state: ?*XkbState, dep: u32, lat: u32, lock: u32, dep_lo: u32, lat_lo: u32, lock_lo: u32) c_int;
 extern fn xkb_state_mod_name_is_active(state: ?*XkbState, name: [*:0]const u8, tp: c_int) c_int;
+extern fn tcgetpgrp(fd: c_int) c_int;
 extern fn xkb_state_key_get_one_sym(state: ?*XkbState, keycode: u32) u32;
 extern fn xkb_state_key_get_utf8(state: ?*XkbState, keycode: u32, buf: [*]u8, size: usize) c_int;
 
@@ -312,6 +313,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// Flow animation knobs (file config overrides comptime defaults).
         glide: bool = cfg.cursor_glide,
         glide_ms: u16 = cfg.cursor_glide_ms,
+        cursor_overshoot: f32 = cfg.cursor_overshoot,
         trail_ms: u16 = cfg.cursor_trail_ms,
         smooth_scroll: bool = cfg.smooth_scroll,
         smooth_scroll_ms: u16 = cfg.smooth_scroll_ms,
@@ -367,6 +369,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
         hover_uri: ?[]u8 = null,
         /// True when the hover span is a file path (no URI string).
         hover_is_file: bool = false,
+        proc_cwd_buf: [4096]u8 = undefined,
         /// Server-side cursor shapes (wp_cursor_shape_manager_v1).
         cursor_shape_mgr: ?*P.CursorShapeManager = null,
         cursor_shape_dev: ?*P.CursorShapeDevice = null,
@@ -580,6 +583,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .find_num_scale = runtime_cfg.find_number_scale orelse cfg.find_number_scale,
                 .glide = runtime_cfg.cursor_glide orelse cfg.cursor_glide,
                 .glide_ms = runtime_cfg.cursor_glide_ms orelse cfg.cursor_glide_ms,
+                .cursor_overshoot = runtime_cfg.cursor_overshoot orelse cfg.cursor_overshoot,
                 .trail_ms = runtime_cfg.cursor_trail_ms orelse cfg.cursor_trail_ms,
                 .smooth_scroll = runtime_cfg.smooth_scroll orelse cfg.smooth_scroll,
                 .smooth_scroll_ms = runtime_cfg.smooth_scroll_ms orelse cfg.smooth_scroll_ms,
@@ -588,6 +592,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .dir_open_mod = runtime_cfg.dir_open_mod orelse cfg.dir_open_mod,
             };
             self.ctx.blink_enabled = self.cursor_blink;
+            const init_cols: u16 = @intCast(@max(15, self.runtime_cfg.window_width orelse (cfg.window_width orelse cfg.cols)));
+            const init_rows: u16 = @intCast(@max(3, self.runtime_cfg.window_height orelse (cfg.window_height orelse cfg.rows)));
+            if (init_cols != self.ctx.grid.cols or init_rows != self.ctx.grid.rows) {
+                self.ctx.resize(init_cols, init_rows);
+            }
             errdefer {
                 self.deinit();
                 gpa.destroy(self);
@@ -883,8 +892,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Default pixel size from font metrics until configure says otherwise.
             if (self.width == 0) {
                 const pad: i32 = @intCast(self.currentPadX());
-                self.width = @as(i32, cfg.cols) * self.cell_w + 2 * pad;
-                self.height = @as(i32, cfg.rows) * self.cell_h + 2 * @as(i32, @intCast(self.currentPadY())) + hh;
+                self.width = @as(i32, self.ctx.grid.cols) * self.cell_w + 2 * pad;
+                self.height = @as(i32, self.ctx.grid.rows) * self.cell_h + 2 * @as(i32, @intCast(self.currentPadY())) + hh;
             }
             try self.recreatePool();
 
@@ -897,7 +906,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const term = try gpa.dupeSentinel(u8, cfg.term_env, 0);
             defer gpa.free(term);
             const pty_px = self.ptyPixels(self.ctx.grid.cols, self.ctx.grid.rows);
-            const child = pty_mod.spawnShell(self.ctx.grid.cols, self.ctx.grid.rows, pty_px.w, pty_px.h, term) catch return error.PtyFailed;
+            const shell_override: ?[]const u8 = self.runtime_cfg.shell orelse (if (cfg.shell.len > 0) cfg.shell else null);
+            const login_sh = self.runtime_cfg.login_shell orelse cfg.login_shell;
+            const child = pty_mod.spawnShell(
+                self.ctx.grid.cols,
+                self.ctx.grid.rows,
+                pty_px.w,
+                pty_px.h,
+                term,
+                shell_override,
+                login_sh,
+            ) catch return error.PtyFailed;
             self.pty_pid = child.pid;
             self.pty_fd = child.fd;
             // Shell query replies (DA/DSR/...) go straight back to the PTY.
@@ -2426,7 +2445,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // cursor across the screen every redraw, and gliding it would
             // spend frames animating nothing anyone can see.
             const flow_snap = !view_live or !self.ctx.show_cursor;
-            self.flow.step(flow_now, self.ctx.cursor_col, self.ctx.cursor_row, voff, flow_visible, flow_snap, self.cell_w, self.cell_h, self.glide, self.glide_ms, self.trail_ms, self.smooth_scroll, self.smooth_scroll_ms);
+            self.flow.step(flow_now, self.ctx.cursor_col, self.ctx.cursor_row, voff, flow_visible, flow_snap, self.cell_w, self.cell_h, self.glide, self.glide_ms, self.cursor_overshoot, self.trail_ms, self.smooth_scroll, self.smooth_scroll_ms);
             // Drag-extend rides the INTERPOLATED viewport: extending on
             // the scroll event jumped the highlight ahead of the glide.
             // Whole travelled rows are consumed per frame (the fraction
@@ -4025,9 +4044,20 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.clearHover();
         }
 
-        /// Live cwd for resolution (OSC 7 buffer, else launch PWD).
+        /// Live cwd for resolution (OSC 7 buffer, else /proc/<pid>/cwd fallback, else launch PWD).
         fn curCwd(self: *Self) []const u8 {
             if (self.ctx.cwd_len > 0) return self.ctx.cwd_buf[0..self.ctx.cwd_len];
+            if (self.pty_pid > 0) {
+                const fg = if (self.pty_fd >= 0) tcgetpgrp(self.pty_fd) else -1;
+                const target_pid: i32 = if (fg > 0) fg else self.pty_pid;
+                var proc_path: [64:0]u8 = undefined;
+                if (std.mem.printSentinel(&proc_path, "/proc/{d}/cwd", .{target_pid}, 0) catch null) |p| {
+                    const rc = linux.readlink(p.ptr, &self.proc_cwd_buf, self.proc_cwd_buf.len);
+                    if (linux.errno(rc) == .SUCCESS and rc > 0 and rc < self.proc_cwd_buf.len) {
+                        return self.proc_cwd_buf[0..rc];
+                    }
+                }
+            }
             if (std.c.getenv("PWD")) |p| {
                 const s = std.mem.span(p);
                 if (s.len > 0) return s;

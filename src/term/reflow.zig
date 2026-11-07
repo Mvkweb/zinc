@@ -116,8 +116,27 @@ pub fn reflowGrid(
 
     // 1. Gather all input rows in chronological order:
     // First, all history rows in the scrollback ring (oldest -> newest).
-    // Second, all active screen rows up to cursor_row.* + 1.
-    const active_screen_rows = @min(@as(usize, cursor_row.*) + 1, @as(usize, old_rows));
+    // Second, all active screen rows up to cursor_row.* + 1, plus any subsequent
+    // rows on screen that contain non-blank content (Ghostty / Foot parity: content
+    // below the cursor is never discarded, while trailing blank rows at the screen
+    // bottom are omitted).
+    var active_screen_rows = @min(@as(usize, cursor_row.*) + 1, @as(usize, old_rows));
+    var r_scan: usize = old_rows;
+    while (r_scan > active_screen_rows) {
+        r_scan -= 1;
+        const rslice = grid.rowSlice(@intCast(r_scan));
+        var has_content = false;
+        for (rslice) |cell| {
+            if (!isCellBlank(cfg, cell, def_bg)) {
+                has_content = true;
+                break;
+            }
+        }
+        if (has_content) {
+            active_screen_rows = r_scan + 1;
+            break;
+        }
+    }
     const sb_count: usize = if (comptime cfg.scrollback_cap > 0) grid.sb_len else 0;
     const total_input = sb_count + active_screen_rows;
 
@@ -1027,4 +1046,27 @@ test "reflow carries cwd stamps with content" {
         }
     }
     try std.testing.expect(found_a and found_b);
+}
+
+test "reflow preserves content below cursor" {
+    // If cursor was moved up (e.g. at row 1 of a 4-row grid), non-blank content
+    // on row 2 and row 3 must not be discarded.
+    const grid_mod = @import("grid.zig");
+    const cfg = config_mod.Config{ .scrollback_cap = 8, .alt_screen = false };
+    const G = grid_mod.Grid(cfg);
+    var g = try G.init(std.testing.allocator, 10, 4);
+    defer g.deinit();
+
+    g.at(0, 0).setRune('A');
+    g.at(0, 1).setRune('B');
+    g.at(0, 2).setRune('C');
+    g.at(0, 3).setRune('D');
+    var cur_col: u16 = 0;
+    var cur_row: u16 = 1; // cursor on row 1 ('B')
+
+    try reflowGrid(cfg, std.testing.allocator, &g, 10, 4, &cur_col, &cur_row, cfg.bg);
+    try std.testing.expectEqual(@as(u32, 'A'), g.at(0, 0).rune);
+    try std.testing.expectEqual(@as(u32, 'B'), g.at(0, 1).rune);
+    try std.testing.expectEqual(@as(u32, 'C'), g.at(0, 2).rune);
+    try std.testing.expectEqual(@as(u32, 'D'), g.at(0, 3).rune);
 }

@@ -10,11 +10,120 @@ Keep in mind this is still experimental and you will surely find issues. If you 
 
 ## Highlights
 
-The cursor glides to its cell over 60ms instead of teleporting. Scrolling pours instead of jumping, with a scrollbar that fades when idle. Ctrl+click a file to open it in your editor, Ctrl+click a folder to cd into it, Shift+click to open the file manager. Images render inline through the Kitty graphics protocol, so tools like yazi show real previews. Fonts auto-discover with CJK and emoji fallback, and Ctrl+plus/minus zooms.
+- **Smooth motion**: configurable cursor glide and scrolling.
+- **Kitty graphics**: inline image previews for `yazi`, `chafa`, etc.
+- **Adaptive TUI padding**: pads your shell, but drops to 0px edge-to-edge in full-screen apps (`nvim`, `btop`, `yazi`).
+- **Smart click**: `Ctrl+click` files to open in your editor, `Ctrl+click` folders to `cd`.
+- **Lightweight**: memory footprint stays around ~23MB in a maximized window.
 
-Everything lives in `~/.config/zinc/config`, created on first launch and never rewritten. Tune `cursor-glide-ms`, `smooth-scroll-ms`, or `scroll-step` and restart.
+Full breakdown in [features.md](features.md).
 
-If you want to see the full breakdown of everything zinc does, check [features.md](features.md).
+<details>
+<summary><b>Default configuration (<code>~/.config/zinc/config</code>)</b></summary>
+
+```ini
+# Zinc configuration
+# Changes take effect when you open a new window.
+# When new settings ship, Zinc writes an updated reference file to
+# config.new next to this file without changing your config.
+config-version = 6
+
+# Shell
+# Command or binary to run, such as "fish" or "/bin/zsh".
+# Leave empty to read your login shell from /etc/passwd.
+shell = ""
+# Run the shell as a login shell by prepending "-" to argv[0].
+login-shell = false
+
+# Window size in character cells (for floating windows; tiling compositors override this)
+# Both Ghostty-style and Foot-style formats are supported:
+# window-width = 80
+# window-height = 24
+# Or combined (columns x rows):
+# window-size = 80x24
+
+# Fonts
+# Font family name or TTF path. Leave empty to use system Nerd Fonts.
+font-family = ""
+font-size = 12.0
+
+# Padding in pixels
+# Normal window padding.
+padding-x = 25
+padding-y = 25
+# Fullscreen and alt-screen padding for terminal apps like Neovim and btop.
+alt-padding-x = 0
+alt-padding-y = 0
+
+# Window decorations
+# Options: auto, none, csd, server.
+# auto uses server decorations on KDE and Sway, and client decorations on GNOME.
+decorations = auto
+
+# Colors (hex format: #RRGGBB)
+background = #0b0f11
+foreground = #dcdccc
+selection-background = #dcdccc
+selection-foreground = #0b0f11
+cursor-color = #dcdccc
+link-color = #8cd0d3
+
+# Background opacity from 0.0 (transparent) to 1.0 (opaque).
+background-opacity = 0.78
+
+# Cursor
+# Shape options: bar, block, underline.
+cursor-style = bar
+cursor-blink = true
+cursor-thickness = 1.5
+
+# Animation
+# Glide the cursor smoothly to new positions instead of jumping.
+cursor-glide = true
+cursor-glide-ms = 60
+# Overshoot bounce past target cell: 0.0 is smooth glide with no bounce, 1.0 is full bounce.
+cursor-overshoot = 1.0
+# Afterimage trail duration in milliseconds. 0 disables the trail.
+cursor-trail-ms = 0
+# Smooth scroll animation for scrollback jumps.
+smooth-scroll = true
+smooth-scroll-ms = 110
+# Rows scrolled per mouse wheel tick (1 to 100).
+scroll-step = 5
+
+# Selection
+# Set to true to show a 1-cell highlight on a single click before dragging.
+selection-single-cell = false
+
+# Search bar (Ctrl+Shift+F)
+# Show match index numbers on screen.
+find-match-numbers = false
+# Badge digit scale: 1 is small, 2 is medium, 3 is large.
+find-number-scale = 2
+
+# File and directory clicks
+# Command for opening file paths on Ctrl+click.
+# Leave empty to use $EDITOR, then xdg-open.
+# Supports {file}, {line}, and {col} substitutions.
+# Examples:
+# editor-command = "code --goto {file}:{line}:{col}"
+# editor-command = "zed {file}:{line}:{col}"
+editor-command = ""
+# In-terminal editor command executed directly inside the current shell session.
+# Examples:
+# editor-command-terminal = "nvim +{line} {file}"
+# editor-command-terminal = "nano +{line} {file}"
+editor-command-terminal = ""
+# Modifiers for clicking directories: ctrl, shift, ctrl+shift, or off.
+# dir-cd-mod changes directory in the current shell.
+dir-cd-mod = ctrl
+# dir-open-mod opens the directory in your graphical file manager.
+dir-open-mod = shift
+# Run ls automatically after changing directory with a gesture.
+dir-cd-ls = true
+```
+
+</details>
 
 
 ## Dependencies
