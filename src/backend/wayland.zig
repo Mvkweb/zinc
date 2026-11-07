@@ -178,6 +178,7 @@ extern fn xkb_state_new(map: ?*XkbKeymap) ?*XkbState;
 extern fn xkb_state_unref(state: ?*XkbState) void;
 extern fn xkb_state_update_mask(state: ?*XkbState, dep: u32, lat: u32, lock: u32, dep_lo: u32, lat_lo: u32, lock_lo: u32) c_int;
 extern fn xkb_state_mod_name_is_active(state: ?*XkbState, name: [*:0]const u8, tp: c_int) c_int;
+extern fn tcgetpgrp(fd: c_int) c_int;
 extern fn xkb_state_key_get_one_sym(state: ?*XkbState, keycode: u32) u32;
 extern fn xkb_state_key_get_utf8(state: ?*XkbState, keycode: u32, buf: [*]u8, size: usize) c_int;
 
@@ -368,6 +369,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
         hover_uri: ?[]u8 = null,
         /// True when the hover span is a file path (no URI string).
         hover_is_file: bool = false,
+        proc_cwd_buf: [4096]u8 = undefined,
         /// Server-side cursor shapes (wp_cursor_shape_manager_v1).
         cursor_shape_mgr: ?*P.CursorShapeManager = null,
         cursor_shape_dev: ?*P.CursorShapeDevice = null,
@@ -4037,9 +4039,20 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.clearHover();
         }
 
-        /// Live cwd for resolution (OSC 7 buffer, else launch PWD).
+        /// Live cwd for resolution (OSC 7 buffer, else /proc/<pid>/cwd fallback, else launch PWD).
         fn curCwd(self: *Self) []const u8 {
             if (self.ctx.cwd_len > 0) return self.ctx.cwd_buf[0..self.ctx.cwd_len];
+            if (self.pty_pid > 0) {
+                const fg = if (self.pty_fd >= 0) tcgetpgrp(self.pty_fd) else -1;
+                const target_pid: i32 = if (fg > 0) fg else self.pty_pid;
+                var proc_path: [64:0]u8 = undefined;
+                if (std.mem.printSentinel(&proc_path, "/proc/{d}/cwd", .{target_pid}, 0) catch null) |p| {
+                    const rc = linux.readlink(p.ptr, &self.proc_cwd_buf, self.proc_cwd_buf.len);
+                    if (linux.errno(rc) == .SUCCESS and rc > 0 and rc < self.proc_cwd_buf.len) {
+                        return self.proc_cwd_buf[0..rc];
+                    }
+                }
+            }
             if (std.c.getenv("PWD")) |p| {
                 const s = std.mem.span(p);
                 if (s.len > 0) return s;
