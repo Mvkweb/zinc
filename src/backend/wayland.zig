@@ -360,6 +360,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
         dnd_serial: u32 = 0,
         dnd_has_uri_list: bool = false,
         dnd_has_text: bool = false,
+        /// Wayland primary selection (auto-copy on select, middle-click paste).
+        pdm: ?*P.PrimarySelectionDeviceManager = null,
+        primary_device: ?*P.PrimarySelectionDevice = null,
+        cur_primary_source: ?*P.PrimarySelectionSource = null,
+        cur_primary_offer: ?*P.PrimarySelectionOffer = null,
+        incoming_primary_offer: ?*P.PrimarySelectionOffer = null,
+        primary_text: ?[]u8 = null,
+        primary_offer_mime: [128]u8 = undefined,
+        primary_offer_mime_len: usize = 0,
+        incoming_primary_mime: [128]u8 = undefined,
+        incoming_primary_mime_len: usize = 0,
         /// Ctrl+hover hyperlink state (screen coords, span, owned URI).
         hover_col: u16 = 0,
         hover_row: u16 = 0,
@@ -437,6 +448,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
         ddl: DataDeviceListener = undefined,
         dsl: DataSourceListener = undefined,
         dol: DataOfferListener = undefined,
+        pdl: PrimaryDeviceListener = undefined,
+        pol: PrimaryOfferListener = undefined,
+        psl: PrimarySourceListener = undefined,
         tdl: ToplevelDecorationListener = undefined,
         deco_manager: ?*anyopaque = null,
         toplevel_deco: ?*anyopaque = null,
@@ -479,6 +493,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
         name_wm_base: u32 = 0,
         name_seat: u32 = 0,
         name_ddm: u32 = 0,
+        name_pdm: u32 = 0,
+        want_pdm_v: u32 = 1,
         name_cursor_shape: u32 = 0,
         name_decoration: u32 = 0,
         want_decoration_v: u32 = 1,
@@ -882,6 +898,37 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 }
             }
 
+            // Primary selection manager (optional: auto-copy on select / middle-click paste).
+            if (cfg.clipboard and self.name_pdm != 0) {
+                const seat = self.seat orelse null;
+                if (seat != null) {
+                    const pdm_iface = &P.primary_selection.manager_interface;
+                    self.pdm = @ptrCast(c.wl_proxy_marshal_constructor(
+                        @ptrCast(reg),
+                        P.core.REGISTRY_BIND,
+                        pdm_iface,
+                        self.name_pdm,
+                        pdm_iface.*.name,
+                        self.want_pdm_v,
+                        @as(?*anyopaque, null),
+                    ));
+                    const pdev_iface = &P.primary_selection.device_interface;
+                    self.primary_device = @ptrCast(c.wl_proxy_marshal_constructor(
+                        @ptrCast(self.pdm),
+                        P.primary_selection.MANAGER_GET_DEVICE,
+                        pdev_iface,
+                        @as(?*anyopaque, @ptrCast(seat)),
+                        @as(?*anyopaque, @ptrCast(seat)),
+                        @as(?*anyopaque, null),
+                    ));
+                    self.pdl = PrimaryDeviceListener{
+                        .data_offer = appOnPrimaryDeviceOffer,
+                        .selection = appOnPrimaryDeviceSelection,
+                    };
+                    _ = c.wl_proxy_add_listener(@ptrCast(self.primary_device), @ptrCast(&self.pdl), @ptrCast(self));
+                }
+            }
+
             if (self.pending_resize) |p| {
                 self.pending_resize = null;
                 self.handleResize(p.w, p.h);
@@ -976,6 +1023,29 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 c.wl_proxy_destroy(@ptrCast(d));
             }
             if (self.ddm) |m| c.wl_proxy_destroy(@ptrCast(m));
+            if (self.cur_primary_source) |s| {
+                c.wl_proxy_marshal(@ptrCast(s), P.primary_selection.SOURCE_DESTROY);
+                c.wl_proxy_destroy(@ptrCast(s));
+            }
+            if (self.cur_primary_offer) |o| {
+                c.wl_proxy_marshal(@ptrCast(o), P.primary_selection.OFFER_DESTROY);
+                c.wl_proxy_destroy(@ptrCast(o));
+            }
+            if (self.incoming_primary_offer) |o| {
+                if (o != self.cur_primary_offer) {
+                    c.wl_proxy_marshal(@ptrCast(o), P.primary_selection.OFFER_DESTROY);
+                    c.wl_proxy_destroy(@ptrCast(o));
+                }
+            }
+            if (self.primary_device) |d| {
+                c.wl_proxy_marshal(@ptrCast(d), P.primary_selection.DEVICE_DESTROY);
+                c.wl_proxy_destroy(@ptrCast(d));
+            }
+            if (self.pdm) |m| {
+                c.wl_proxy_marshal(@ptrCast(m), P.primary_selection.MANAGER_DESTROY);
+                c.wl_proxy_destroy(@ptrCast(m));
+            }
+            if (self.primary_text) |t| self.gpa.free(t);
             if (self.cursor_shape_dev) |d| c.wl_proxy_destroy(@ptrCast(d));
             if (self.cursor_shape_mgr) |m| c.wl_proxy_destroy(@ptrCast(m));
             if (cfg.ime) {
@@ -3048,6 +3118,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (!empty) {
                 self.syncCopySel();
                 self.copySelection();
+                self.copyPrimary();
             }
             if (exit_after) {
                 self.exitCopyMode();
@@ -3075,6 +3146,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (mods.ctrl and mods.shift) {
                 if (sym == 'C' or sym == 'c') {
                     self.copySelection();
+                    self.copyPrimary();
                     return;
                 }
                 if (sym == 'V' or sym == 'v') {
@@ -3715,6 +3787,100 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
         }
 
+        fn appOnPrimaryDeviceOffer(data: ?*anyopaque, device: ?*P.PrimarySelectionDevice, id: ?*P.PrimarySelectionOffer) callconv(.c) void {
+            _ = device;
+            const self: *Self = @ptrCast(@alignCast(data));
+            const new_offer = id orelse return;
+
+            if (self.incoming_primary_offer) |old| {
+                if (old != self.cur_primary_offer) {
+                    c.wl_proxy_marshal(@ptrCast(old), P.primary_selection.OFFER_DESTROY);
+                    c.wl_proxy_destroy(@ptrCast(old));
+                }
+            }
+            self.incoming_primary_offer = new_offer;
+            self.incoming_primary_mime_len = 0;
+
+            self.pol = PrimaryOfferListener{
+                .offer = appOnPrimaryOfferMime,
+            };
+            _ = c.wl_proxy_add_listener(@ptrCast(new_offer), @ptrCast(&self.pol), @ptrCast(self));
+        }
+
+        fn appOnPrimaryOfferMime(data: ?*anyopaque, offer: ?*P.PrimarySelectionOffer, mime: [*:0]const u8) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(data));
+            if (offer != self.incoming_primary_offer) return;
+            const m = std.mem.span(mime);
+            var best: u8 = 0;
+            if (self.incoming_primary_mime_len > 0 and self.incoming_primary_mime_len < self.incoming_primary_mime.len) {
+                best = mimeRank(self.incoming_primary_mime[0..self.incoming_primary_mime_len]);
+            }
+            if (mimeRank(m) > best and m.len + 1 <= self.incoming_primary_mime.len) {
+                @memcpy(self.incoming_primary_mime[0..m.len], m);
+                self.incoming_primary_mime[m.len] = 0;
+                self.incoming_primary_mime_len = m.len;
+            }
+        }
+
+        fn appOnPrimaryDeviceSelection(data: ?*anyopaque, device: ?*P.PrimarySelectionDevice, id: ?*P.PrimarySelectionOffer) callconv(.c) void {
+            _ = device;
+            const self: *Self = @ptrCast(@alignCast(data));
+            if (id == null) {
+                if (self.cur_primary_offer) |old| {
+                    if (old != self.incoming_primary_offer) {
+                        c.wl_proxy_marshal(@ptrCast(old), P.primary_selection.OFFER_DESTROY);
+                        c.wl_proxy_destroy(@ptrCast(old));
+                    }
+                }
+                self.cur_primary_offer = null;
+                self.primary_offer_mime_len = 0;
+            } else {
+                if (self.cur_primary_offer) |old| {
+                    if (old != id and old != self.incoming_primary_offer) {
+                        c.wl_proxy_marshal(@ptrCast(old), P.primary_selection.OFFER_DESTROY);
+                        c.wl_proxy_destroy(@ptrCast(old));
+                    }
+                }
+                self.cur_primary_offer = id;
+                if (id == self.incoming_primary_offer) {
+                    self.primary_offer_mime = self.incoming_primary_mime;
+                    self.primary_offer_mime_len = self.incoming_primary_mime_len;
+                    self.incoming_primary_offer = null;
+                }
+            }
+        }
+
+        fn appOnPrimarySourceSend(data: ?*anyopaque, source: ?*P.PrimarySelectionSource, mime: [*:0]const u8, fd: i32) callconv(.c) void {
+            _ = source;
+            _ = mime;
+            const self: *Self = @ptrCast(@alignCast(data));
+            clipDbg("primary send enter have_text={}\n", .{self.primary_text != null});
+            if (self.primary_text) |text| {
+                var off: usize = 0;
+                while (off < text.len) {
+                    const w = linux.write(fd, text.ptr + off, text.len - off);
+                    if (linux.errno(w) != .SUCCESS or w == 0) break;
+                    off += w;
+                }
+                clipDbg("primary send wrote {}/{}\n", .{ off, text.len });
+            }
+            _ = linux.close(fd);
+            clipDbg("primary send done\n", .{});
+        }
+
+        fn appOnPrimarySourceCancelled(data: ?*anyopaque, source: ?*P.PrimarySelectionSource) callconv(.c) void {
+            const self: *Self = @ptrCast(@alignCast(data));
+            if (self.cur_primary_source == source) self.cur_primary_source = null;
+            if (source) |src| {
+                c.wl_proxy_marshal(@ptrCast(src), P.primary_selection.SOURCE_DESTROY);
+                c.wl_proxy_destroy(@ptrCast(src));
+            }
+            if (self.primary_text) |t| {
+                self.gpa.free(t);
+                self.primary_text = null;
+            }
+        }
+
         fn clipDbg(comptime fmt: []const u8, args: anytype) void {
             if (std.c.getenv("ZINC_DEBUG") == null) return;
             std.debug.print("[zinc clip] " ++ fmt, args);
@@ -3775,17 +3941,60 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.cur_source = source;
         }
 
-        /// Paste the Wayland clipboard into the PTY (bracketed when the app
-        /// asked for it). Reads are bounded; the compositor closes its end.
-        fn pasteClipboard(self: *Self) void {
+        /// Copy the active selection to the Wayland primary selection (no-op when
+        /// nothing is selected or no primary selection manager is present).
+        fn copyPrimary(self: *Self) void {
             if (!cfg.clipboard) return;
-            const offer = self.cur_offer orelse return;
-            if (self.offer_mime_len == 0 or self.offer_mime_len >= self.offer_mime.len) return;
-            const mime: [*:0]const u8 = @ptrCast(self.offer_mime[0..self.offer_mime_len].ptr);
-            clipDbg("paste enter own_source={} mime={s}\n", .{ self.cur_source != null, self.offer_mime[0..self.offer_mime_len] });
+            if (!self.sel.active) return;
+            if (!self.selection_single_cell and self.sel.isSingleCell()) return;
+            const text = (self.sel.extract(self.gpa, &self.ctx.grid) catch return) orelse return;
+            errdefer self.gpa.free(text);
+            if (self.primary_device == null or self.pdm == null) {
+                self.gpa.free(text);
+                return;
+            }
+            if (self.cur_primary_source) |old| {
+                c.wl_proxy_marshal(@ptrCast(old), P.primary_selection.SOURCE_DESTROY);
+                c.wl_proxy_destroy(@ptrCast(old));
+                self.cur_primary_source = null;
+            }
+            if (self.primary_text) |old| {
+                self.gpa.free(old);
+                self.primary_text = null;
+            }
+            const src: ?*P.PrimarySelectionSource = @ptrCast(c.wl_proxy_marshal_constructor(
+                @ptrCast(self.pdm),
+                P.primary_selection.MANAGER_CREATE_SOURCE,
+                &P.primary_selection.source_interface,
+                @as(?*anyopaque, null),
+            ));
+            const source = src orelse {
+                self.gpa.free(text);
+                return;
+            };
+            self.psl = PrimarySourceListener{
+                .send = appOnPrimarySourceSend,
+                .cancelled = appOnPrimarySourceCancelled,
+            };
+            _ = c.wl_proxy_add_listener(@ptrCast(source), @ptrCast(&self.psl), @ptrCast(self));
+            self.primary_text = text;
+            c.wl_proxy_marshal(@ptrCast(source), P.primary_selection.SOURCE_OFFER, @as([*:0]const u8, "text/plain;charset=utf-8"));
+            c.wl_proxy_marshal(@ptrCast(source), P.primary_selection.SOURCE_OFFER, @as([*:0]const u8, "text/plain"));
+            c.wl_proxy_marshal(@ptrCast(source), P.primary_selection.SOURCE_OFFER, @as([*:0]const u8, "UTF8_STRING"));
+            c.wl_proxy_marshal(
+                @ptrCast(self.primary_device),
+                P.primary_selection.DEVICE_SET_SELECTION,
+                @as(?*anyopaque, @ptrCast(source)),
+                self.last_serial,
+            );
+            self.cur_primary_source = source;
+            _ = c.wl_display_flush(self.display);
+        }
+
+        fn receiveOfferAndPaste(self: *Self, offer: *anyopaque, opcode: u32, mime: [*:0]const u8) void {
             var fds: [2]i32 = .{ -1, -1 };
             if (linux.errno(linux.pipe2(&fds, .{ .CLOEXEC = true })) != .SUCCESS) return;
-            c.wl_proxy_marshal(@ptrCast(offer), P.core.OFFER_RECEIVE, mime, fds[1]);
+            c.wl_proxy_marshal(@ptrCast(offer), opcode, mime, fds[1]);
             _ = linux.close(fds[1]);
             _ = c.wl_display_flush(self.display);
             const cap: usize = 1024 * 1024;
@@ -3837,6 +4046,35 @@ pub fn App(comptime cfg: config_mod.Config) type {
             } else {
                 self.sendToPty(data);
             }
+            self.needs_render = true;
+        }
+
+        /// Paste the Wayland clipboard into the PTY (bracketed when the app
+        /// asked for it). Reads are bounded; the compositor closes its end.
+        fn pasteClipboard(self: *Self) void {
+            if (!cfg.clipboard) return;
+            const offer = self.cur_offer orelse return;
+            if (self.offer_mime_len == 0 or self.offer_mime_len >= self.offer_mime.len) return;
+            const mime: [*:0]const u8 = @ptrCast(self.offer_mime[0..self.offer_mime_len].ptr);
+            clipDbg("paste enter own_source={} mime={s}\n", .{ self.cur_source != null, self.offer_mime[0..self.offer_mime_len] });
+            self.receiveOfferAndPaste(@ptrCast(offer), P.core.OFFER_RECEIVE, mime);
+        }
+
+        /// Paste from Wayland primary selection into the PTY. Falls back to
+        /// clipboard if primary selection is empty or unavailable.
+        fn pastePrimary(self: *Self) void {
+            if (!cfg.clipboard) return;
+            const offer = self.cur_primary_offer orelse {
+                self.pasteClipboard();
+                return;
+            };
+            if (self.primary_offer_mime_len == 0 or self.primary_offer_mime_len >= self.primary_offer_mime.len) {
+                self.pasteClipboard();
+                return;
+            }
+            const mime: [*:0]const u8 = @ptrCast(self.primary_offer_mime[0..self.primary_offer_mime_len].ptr);
+            clipDbg("primary paste enter own_source={} mime={s}\n", .{ self.cur_primary_source != null, self.primary_offer_mime[0..self.primary_offer_mime_len] });
+            self.receiveOfferAndPaste(@ptrCast(offer), P.primary_selection.OFFER_RECEIVE, mime);
         }
 
         fn appOnSeatCaps(data: ?*anyopaque, seat: ?*P.Seat, caps: u32) callconv(.c) void {
@@ -4673,12 +4911,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         self.sel_drag = false;
                         if (self.sel.mode == .cell and self.sel.anchor_col == self.sel.focus_col and self.sel.anchor_row == self.sel.focus_row) {
                             self.sel.clear();
+                        } else if (self.sel.active) {
+                            self.copyPrimary();
                         }
                         self.needs_render = true;
                     }
                 },
-                0x112 => { // middle: paste clipboard
-                    if (state == 1) self.pasteClipboard();
+                0x112 => { // middle: paste primary (or clipboard fallback)
+                    if (state == 1) {
+                        self.pastePrimary();
+                        self.needs_render = true;
+                    }
                 },
                 else => {},
             }
@@ -4835,6 +5078,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
             } else if (std.mem.eql(u8, iname, "wl_data_device_manager")) {
                 self.name_ddm = name;
                 self.want_ddm_v = @min(version, 3);
+            } else if (std.mem.eql(u8, iname, "zwp_primary_selection_device_manager_v1")) {
+                self.name_pdm = name;
+                self.want_pdm_v = @min(version, 1);
             } else if (std.mem.eql(u8, iname, "wp_cursor_shape_manager_v1")) {
                 self.name_cursor_shape = name;
             } else if (std.mem.eql(u8, iname, "zwp_text_input_manager_v3")) {
@@ -5207,6 +5453,20 @@ const DataSourceListener = extern struct {
     target: ?*const fn (?*anyopaque, ?*P.DataSource, ?[*:0]const u8) callconv(.c) void,
     send: ?*const fn (?*anyopaque, ?*P.DataSource, [*:0]const u8, i32) callconv(.c) void,
     cancelled: ?*const fn (?*anyopaque, ?*P.DataSource) callconv(.c) void,
+};
+
+const PrimaryDeviceListener = extern struct {
+    data_offer: ?*const fn (?*anyopaque, ?*P.PrimarySelectionDevice, ?*P.PrimarySelectionOffer) callconv(.c) void,
+    selection: ?*const fn (?*anyopaque, ?*P.PrimarySelectionDevice, ?*P.PrimarySelectionOffer) callconv(.c) void,
+};
+
+const PrimaryOfferListener = extern struct {
+    offer: ?*const fn (?*anyopaque, ?*P.PrimarySelectionOffer, [*:0]const u8) callconv(.c) void,
+};
+
+const PrimarySourceListener = extern struct {
+    send: ?*const fn (?*anyopaque, ?*P.PrimarySelectionSource, [*:0]const u8, i32) callconv(.c) void,
+    cancelled: ?*const fn (?*anyopaque, ?*P.PrimarySelectionSource) callconv(.c) void,
 };
 
 /// zwp_text_input_v3 event set. Slots match wl_proto.text_input order

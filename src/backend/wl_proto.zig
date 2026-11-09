@@ -95,6 +95,10 @@ pub const XdgSurface = opaque {};
 pub const XdgToplevel = opaque {};
 pub const CursorShapeManager = opaque {};
 pub const CursorShapeDevice = opaque {};
+pub const PrimarySelectionDeviceManager = opaque {};
+pub const PrimarySelectionDevice = opaque {};
+pub const PrimarySelectionOffer = opaque {};
+pub const PrimarySelectionSource = opaque {};
 
 /// wl_array mirror (wayland-util). Only size/data are read.
 pub const Array = extern struct {
@@ -232,6 +236,7 @@ pub fn linkAll() void {
     cursor_shape.link(core.pointer);
     text_input.link(core.seat, core.surface);
     decoration.link(&xdg_toplevel.interface);
+    primary_selection.link(core.seat);
 }
 
 // ---------------------------------------------------------------------------
@@ -426,6 +431,129 @@ pub const text_input = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// zwp_primary_selection_device_manager_v1 / zwp_primary_selection_device_v1 /
+// zwp_primary_selection_offer_v1 / zwp_primary_selection_source_v1
+// (primary-selection-unstable-v1, version 1; X11-style PRIMARY selection).
+// manager requests: create_source=0 ("n"), get_device=1 ("no"), destroy=2 ("")
+// device requests: set_selection=0 ("?ou"), destroy=1 ("")
+// device events: data_offer=0 ("n"), selection=1 ("?o")
+// offer requests: receive=0 ("sh"), destroy=1 ("")
+// offer events: offer=0 ("s")
+// source requests: offer=0 ("s"), destroy=1 ("")
+// source events: send=0 ("sh"), cancelled=1 ("")
+// ---------------------------------------------------------------------------
+
+pub const primary_selection = struct {
+    pub const version: c_int = 1;
+
+    // Manager requests
+    pub const MANAGER_CREATE_SOURCE: u32 = 0;
+    pub const MANAGER_GET_DEVICE: u32 = 1;
+    pub const MANAGER_DESTROY: u32 = 2;
+
+    // Device requests
+    pub const DEVICE_SET_SELECTION: u32 = 0;
+    pub const DEVICE_DESTROY: u32 = 1;
+
+    // Device events
+    pub const DEVICE_EVENT_DATA_OFFER: u32 = 0;
+    pub const DEVICE_EVENT_SELECTION: u32 = 1;
+
+    // Offer requests
+    pub const OFFER_RECEIVE: u32 = 0;
+    pub const OFFER_DESTROY: u32 = 1;
+
+    // Offer events
+    pub const OFFER_EVENT_OFFER: u32 = 0;
+
+    // Source requests
+    pub const SOURCE_OFFER: u32 = 0;
+    pub const SOURCE_DESTROY: u32 = 1;
+
+    // Source events
+    pub const SOURCE_EVENT_SEND: u32 = 0;
+    pub const SOURCE_EVENT_CANCELLED: u32 = 1;
+
+    var types_create_source = [_]?*const c.wl_interface{null};
+    var types_get_device = [_]?*const c.wl_interface{ null, null };
+    var manager_methods = [_]c.wl_message{
+        .{ .name = "create_source", .signature = "n", .types = &types_create_source },
+        .{ .name = "get_device", .signature = "no", .types = &types_get_device },
+        .{ .name = "destroy", .signature = "", .types = null },
+    };
+    pub var manager_interface: c.wl_interface = .{
+        .name = "zwp_primary_selection_device_manager_v1",
+        .version = version,
+        .method_count = 3,
+        .methods = &manager_methods,
+        .event_count = 0,
+        .events = null,
+    };
+
+    var types_set_selection = [_]?*const c.wl_interface{ null, null };
+    var device_methods = [_]c.wl_message{
+        .{ .name = "set_selection", .signature = "?ou", .types = &types_set_selection },
+        .{ .name = "destroy", .signature = "", .types = null },
+    };
+    var types_data_offer = [_]?*const c.wl_interface{null};
+    var types_selection = [_]?*const c.wl_interface{null};
+    var device_events = [_]c.wl_message{
+        .{ .name = "data_offer", .signature = "n", .types = &types_data_offer },
+        .{ .name = "selection", .signature = "?o", .types = &types_selection },
+    };
+    pub var device_interface: c.wl_interface = .{
+        .name = "zwp_primary_selection_device_v1",
+        .version = version,
+        .method_count = 2,
+        .methods = &device_methods,
+        .event_count = 2,
+        .events = &device_events,
+    };
+
+    var offer_methods = [_]c.wl_message{
+        .{ .name = "receive", .signature = "sh", .types = null },
+        .{ .name = "destroy", .signature = "", .types = null },
+    };
+    var offer_events = [_]c.wl_message{
+        .{ .name = "offer", .signature = "s", .types = null },
+    };
+    pub var offer_interface: c.wl_interface = .{
+        .name = "zwp_primary_selection_offer_v1",
+        .version = version,
+        .method_count = 2,
+        .methods = &offer_methods,
+        .event_count = 1,
+        .events = &offer_events,
+    };
+
+    var source_methods = [_]c.wl_message{
+        .{ .name = "offer", .signature = "s", .types = null },
+        .{ .name = "destroy", .signature = "", .types = null },
+    };
+    var source_events = [_]c.wl_message{
+        .{ .name = "send", .signature = "sh", .types = null },
+        .{ .name = "cancelled", .signature = "", .types = null },
+    };
+    pub var source_interface: c.wl_interface = .{
+        .name = "zwp_primary_selection_source_v1",
+        .version = version,
+        .method_count = 2,
+        .methods = &source_methods,
+        .event_count = 2,
+        .events = &source_events,
+    };
+
+    pub fn link(seat_iface: *const c.wl_interface) void {
+        types_create_source[0] = @ptrCast(&source_interface);
+        types_get_device[0] = @ptrCast(&device_interface);
+        types_get_device[1] = seat_iface;
+        types_set_selection[0] = @ptrCast(&source_interface);
+        types_data_offer[0] = @ptrCast(&offer_interface);
+        types_selection[0] = @ptrCast(&offer_interface);
+    }
+};
+
 const std = @import("std");
 
 fn cstr(p: [*c]const u8) ?[]const u8 {
@@ -523,4 +651,38 @@ test "xdg tables sane + linked" {
     try std.testing.expectEqual(@as(u32, 2), decoration.TOPLEVEL_DECORATION_UNSET_MODE);
     try std.testing.expectEqual(@as(u32, 1), decoration.MODE_CLIENT_SIDE);
     try std.testing.expectEqual(@as(u32, 2), decoration.MODE_SERVER_SIDE);
+    // primary-selection tables: names, counts, linkage, opcodes.
+    try expectName(&primary_selection.manager_interface, "zwp_primary_selection_device_manager_v1");
+    try expectName(&primary_selection.device_interface, "zwp_primary_selection_device_v1");
+    try expectName(&primary_selection.offer_interface, "zwp_primary_selection_offer_v1");
+    try expectName(&primary_selection.source_interface, "zwp_primary_selection_source_v1");
+    try std.testing.expectEqual(@as(c_int, 3), primary_selection.manager_interface.method_count);
+    try std.testing.expectEqual(@as(c_int, 0), primary_selection.manager_interface.event_count);
+    try std.testing.expectEqual(@as(c_int, 2), primary_selection.device_interface.method_count);
+    try std.testing.expectEqual(@as(c_int, 2), primary_selection.device_interface.event_count);
+    try std.testing.expectEqual(@as(c_int, 2), primary_selection.offer_interface.method_count);
+    try std.testing.expectEqual(@as(c_int, 1), primary_selection.offer_interface.event_count);
+    try std.testing.expectEqual(@as(c_int, 2), primary_selection.source_interface.method_count);
+    try std.testing.expectEqual(@as(c_int, 2), primary_selection.source_interface.event_count);
+    try std.testing.expect(primary_selection.types_create_source[0] != null);
+    try expectName(primary_selection.types_create_source[0].?, "zwp_primary_selection_source_v1");
+    try std.testing.expect(primary_selection.types_get_device[0] != null);
+    try std.testing.expect(primary_selection.types_get_device[1] != null);
+    try expectName(primary_selection.types_get_device[0].?, "zwp_primary_selection_device_v1");
+    try expectName(primary_selection.types_get_device[1].?, "wl_seat");
+    try std.testing.expect(primary_selection.types_set_selection[0] != null);
+    try expectName(primary_selection.types_set_selection[0].?, "zwp_primary_selection_source_v1");
+    try std.testing.expect(primary_selection.types_data_offer[0] != null);
+    try expectName(primary_selection.types_data_offer[0].?, "zwp_primary_selection_offer_v1");
+    try std.testing.expect(primary_selection.types_selection[0] != null);
+    try expectName(primary_selection.types_selection[0].?, "zwp_primary_selection_offer_v1");
+    try std.testing.expectEqual(@as(u32, 0), primary_selection.MANAGER_CREATE_SOURCE);
+    try std.testing.expectEqual(@as(u32, 1), primary_selection.MANAGER_GET_DEVICE);
+    try std.testing.expectEqual(@as(u32, 2), primary_selection.MANAGER_DESTROY);
+    try std.testing.expectEqual(@as(u32, 0), primary_selection.DEVICE_SET_SELECTION);
+    try std.testing.expectEqual(@as(u32, 1), primary_selection.DEVICE_DESTROY);
+    try std.testing.expectEqual(@as(u32, 0), primary_selection.OFFER_RECEIVE);
+    try std.testing.expectEqual(@as(u32, 1), primary_selection.OFFER_DESTROY);
+    try std.testing.expectEqual(@as(u32, 0), primary_selection.SOURCE_OFFER);
+    try std.testing.expectEqual(@as(u32, 1), primary_selection.SOURCE_DESTROY);
 }
