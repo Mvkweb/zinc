@@ -159,12 +159,18 @@ test "arrows encode" {
     var buf: [8]u8 = undefined;
     try std.testing.expectEqualSlices(u8, "\x1b[A", encode(.up, .{}, false, false, &buf));
     try std.testing.expectEqualSlices(u8, "\x1b[3~", encode(.delete, .{}, false, false, &buf));
+    // Home/End are CSI in normal cursor mode (xterm-compatible), SS3 in
+    // application cursor mode (matches xterm-256color terminfo khome/kend).
+    try std.testing.expectEqualSlices(u8, "\x1b[H", encode(.home, .{}, false, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[F", encode(.end, .{}, false, false, &buf));
     // DECCKM: unmodified arrows/home/end go SS3; modified stay CSI.
     try std.testing.expectEqualSlices(u8, "\x1bOA", encode(.up, .{}, false, true, &buf));
     try std.testing.expectEqualSlices(u8, "\x1bOH", encode(.home, .{}, false, true, &buf));
     try std.testing.expectEqualSlices(u8, "\x1bOF", encode(.end, .{}, false, true, &buf));
     const ctrl = Mods{ .ctrl = true };
     try std.testing.expectEqualSlices(u8, "\x1b[1;5D", encode(.left, ctrl, false, true, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[1;5H", encode(.home, ctrl, false, true, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[1;5F", encode(.end, ctrl, false, true, &buf));
 }
 
 test "modified keys encode" {

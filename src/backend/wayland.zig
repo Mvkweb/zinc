@@ -188,20 +188,31 @@ const XKB_STATE_MODS_EFFECTIVE: c_int = 8;
 // Relevant keysyms (xkbcommon-keysyms values, stable ABI).
 const K = struct {
     const Return: u32 = 0xff0d;
+    const KP_Enter: u32 = 0xff8d;
     const Space: u32 = 0x20;
     const Tab: u32 = 0xff09;
     const Escape: u32 = 0xff1b;
     const BackSpace: u32 = 0xff08;
     const Delete: u32 = 0xffff;
+    const KP_Delete: u32 = 0xff9f;
     const Home: u32 = 0xff50;
+    const KP_Home: u32 = 0xff95;
     const Left: u32 = 0xff51;
+    const KP_Left: u32 = 0xff96;
     const Up: u32 = 0xff52;
+    const KP_Up: u32 = 0xff97;
     const Right: u32 = 0xff53;
+    const KP_Right: u32 = 0xff98;
     const Down: u32 = 0xff54;
+    const KP_Down: u32 = 0xff99;
     const Page_Up: u32 = 0xff55;
+    const KP_Page_Up: u32 = 0xff9a;
     const Page_Down: u32 = 0xff56;
+    const KP_Page_Down: u32 = 0xff9b;
     const End: u32 = 0xff57;
+    const KP_End: u32 = 0xff9c;
     const Insert: u32 = 0xff63;
+    const KP_Insert: u32 = 0xff9e;
     const ISO_Left_Tab: u32 = 0xfe20;
     const F1: u32 = 0xffbe;
     const Control_L: u32 = 0xffe3;
@@ -3181,19 +3192,19 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     }
                     return;
                 }
-                if (sym == K.Return) {
+                if (sym == K.Return or sym == K.KP_Enter) {
                     self.yankCopy(true);
                     return;
                 }
-                if (sym == K.Up or sym == 'k' or sym == 'K') {
+                if (sym == K.Up or sym == K.KP_Up or sym == 'k' or sym == 'K') {
                     self.moveCopyCursor(-1, 0);
                     return;
                 }
-                if (sym == K.Down or sym == 'j' or sym == 'J') {
+                if (sym == K.Down or sym == K.KP_Down or sym == 'j' or sym == 'J') {
                     self.moveCopyCursor(1, 0);
                     return;
                 }
-                if (sym == K.Left or sym == 'h' or sym == 'H') {
+                if (sym == K.Left or sym == K.KP_Left or sym == 'h' or sym == 'H') {
                     if (mods.ctrl) {
                         const p = search_mod.wordBack(&self.ctx.grid, self.copy_arow, self.copy_acol);
                         self.placeCopyCursor(p.row, p.col);
@@ -3202,7 +3213,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     }
                     return;
                 }
-                if (sym == K.Right or sym == 'l' or sym == 'L') {
+                if (sym == K.Right or sym == K.KP_Right or sym == 'l' or sym == 'L') {
                     if (mods.ctrl) {
                         const p = search_mod.wordEnd(&self.ctx.grid, self.copy_arow, self.copy_acol);
                         self.placeCopyCursor(p.row, p.col);
@@ -3211,21 +3222,21 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     }
                     return;
                 }
-                if (sym == K.Page_Up) {
+                if (sym == K.Page_Up or sym == K.KP_Page_Up) {
                     self.moveCopyCursor(-@as(i64, self.ctx.grid.rows), 0);
                     return;
                 }
-                if (sym == K.Page_Down) {
+                if (sym == K.Page_Down or sym == K.KP_Page_Down) {
                     self.moveCopyCursor(@as(i64, self.ctx.grid.rows), 0);
                     return;
                 }
-                if (sym == K.Home) {
+                if (sym == K.Home or sym == K.KP_Home) {
                     self.copy_acol = 0;
                     self.syncCopySel();
                     self.needs_render = true;
                     return;
                 }
-                if (sym == K.End) {
+                if (sym == K.End or sym == K.KP_End) {
                     self.copy_acol = self.ctx.grid.cols -| 1;
                     self.syncCopySel();
                     self.needs_render = true;
@@ -3328,20 +3339,20 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 }
             }
             const key: ?input_kb.Key = switch (sym) {
-                K.Return => .enter,
+                K.Return, K.KP_Enter => .enter,
                 K.Tab => .tab,
                 K.Escape => .escape,
                 K.BackSpace => .backspace,
-                K.Delete => .delete,
-                K.Home => .home,
-                K.Left => .left,
-                K.Up => .up,
-                K.Right => .right,
-                K.Down => .down,
-                K.Page_Up => .page_up,
-                K.Page_Down => .page_down,
-                K.End => .end,
-                K.Insert => .insert,
+                K.Delete, K.KP_Delete => .delete,
+                K.Home, K.KP_Home => .home,
+                K.Left, K.KP_Left => .left,
+                K.Up, K.KP_Up => .up,
+                K.Right, K.KP_Right => .right,
+                K.Down, K.KP_Down => .down,
+                K.Page_Up, K.KP_Page_Up => .page_up,
+                K.Page_Down, K.KP_Page_Down => .page_down,
+                K.End, K.KP_End => .end,
+                K.Insert, K.KP_Insert => .insert,
                 K.ISO_Left_Tab => .backtab,
                 K.F1...K.F1 + 11 => @fromBackingInt(@intCast(@backingInt(input_kb.Key.f1) + (sym - K.F1))),
                 else => null,
