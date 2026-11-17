@@ -1245,6 +1245,12 @@ pub const Face = struct {
     /// Returns blank metrics instead of .notdef for missing glyphs.
     /// Emoji-range codepoints try the color face first (dedicated store);
     /// any color failure falls through to the monochrome chain below.
+    /// Glyph classes whose members must share one face. Mixed faces give
+    /// adjacent characters different bearings and baseline offsets.
+    fn singleFaceGlyph(cp: u21) bool {
+        return (cp >= 0x2500 and cp <= 0x257F) or (cp >= 0xE000 and cp <= 0xF8FF);
+    }
+
     pub fn bake(self: *Face, atlas: *atlas_mod.Atlas, color_atlas: ?*atlas_mod.ColorAtlas, cp: u21, style: Style) Error!atlas_mod.Baked {
         // U+20E3 rides the color lane: Noto Color Emoji carries the
         // enclosing keycap frame, which blits over the digit base that
@@ -1269,10 +1275,20 @@ pub const Face = struct {
         }
         var target: ?c.FT_Face = null;
         var slot_n: u3 = 0;
-        if (style_face) |f| {
-            if (cp == 0 or c.FT_Get_Char_Index(f, @intCast(cp)) != 0) {
-                target = f;
-                slot_n = 0;
+        if (singleFaceGlyph(cp)) {
+            if (self.ensureFallback(0)) |nerd| {
+                if (c.FT_Get_Char_Index(nerd, @intCast(cp)) != 0) {
+                    target = nerd;
+                    slot_n = 1;
+                }
+            }
+        }
+        if (target == null) {
+            if (style_face) |f| {
+                if (cp == 0 or c.FT_Get_Char_Index(f, @intCast(cp)) != 0) {
+                    target = f;
+                    slot_n = 0;
+                }
             }
         }
         if (target == null and (style_face == null or style_face.? != self.face)) {
