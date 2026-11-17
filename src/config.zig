@@ -109,6 +109,7 @@ pub const Config = struct {
     custom_boxes: bool = true,
     wide_chars: bool = true,
     font_bleed: bool = true,
+    font_subpixel: bool = true,
     font_zoom: bool = true,
 
     // Cursor / underline.

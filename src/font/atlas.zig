@@ -24,6 +24,8 @@ pub const Baked = struct {
     /// legend needs guaranteed contrast. Sampled from the plate interior
     /// at bake: true = light plate = draw the legend dark (and vice versa).
     keycap_dark: bool = false,
+    /// LCD subpixel glyph: 3 coverage bytes per pixel in the atlas.
+    lcd: bool = false,
     /// Color emoji (CBDT/COLR): pixels live in ColorAtlas at (cx, cy).
     color: bool = false,
     cx: u16 = 0,

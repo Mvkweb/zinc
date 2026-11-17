@@ -575,6 +575,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 color_atlas = atlas_mod.ColorAtlas.init(gpa) catch atlas_mod.ColorAtlas{};
             }
             ft_face.emoji_enabled = cfg.emoji;
+            ft_face.subpixel = cfg.font_subpixel;
             // ascii_only runes can't store CJK (setRune maps to '?'):
             // skip the ~16MB face entirely on that profile.
             ft_face.cjk_enabled = !cfg.ascii_only;
@@ -1385,23 +1386,42 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 dmgMerge(dmg, gdmg);
                 return;
             }
-            const gdmg = software.blitGlyph(
-                self.pool_pixels,
-                W,
-                H,
-                self.atlas.pixels,
-                self.atlas.size,
-                g.x,
-                g.y,
-                g.w,
-                g.h,
-                g.xoff,
-                g.yoff,
-                @intCast(x),
-                @as(i32, @intCast(y)) + self.ascent,
-                fg,
-                &self.gamma_cache,
-            );
+            const gdmg = if (g.lcd)
+                software.blitLcdGlyph(
+                    self.pool_pixels,
+                    W,
+                    H,
+                    self.atlas.pixels,
+                    self.atlas.size,
+                    g.x,
+                    g.y,
+                    g.w,
+                    g.h,
+                    g.xoff,
+                    g.yoff,
+                    @intCast(x),
+                    @as(i32, @intCast(y)) + self.ascent,
+                    fg,
+                    &self.gamma_cache,
+                )
+            else
+                software.blitGlyph(
+                    self.pool_pixels,
+                    W,
+                    H,
+                    self.atlas.pixels,
+                    self.atlas.size,
+                    g.x,
+                    g.y,
+                    g.w,
+                    g.h,
+                    g.xoff,
+                    g.yoff,
+                    @intCast(x),
+                    @as(i32, @intCast(y)) + self.ascent,
+                    fg,
+                    &self.gamma_cache,
+                );
             dmgMerge(dmg, gdmg);
         }
 
@@ -1411,23 +1431,42 @@ pub fn App(comptime cfg: config_mod.Config) type {
             for (text) |b| {
                 const cp: u21 = b; // bar strings are ASCII-only by construction
                 if (self.glyphFor(cp, .regular)) |g| {
-                    const gdmg = software.blitGlyph(
-                        self.pool_pixels,
-                        W,
-                        H,
-                        self.atlas.pixels,
-                        self.atlas.size,
-                        g.x,
-                        g.y,
-                        g.w,
-                        g.h,
-                        g.xoff,
-                        g.yoff,
-                        x,
-                        @as(i32, @intCast(y)) + self.ascent,
-                        fg,
-                        &self.gamma_cache,
-                    );
+                    const gdmg = if (g.lcd)
+                        software.blitLcdGlyph(
+                            self.pool_pixels,
+                            W,
+                            H,
+                            self.atlas.pixels,
+                            self.atlas.size,
+                            g.x,
+                            g.y,
+                            g.w,
+                            g.h,
+                            g.xoff,
+                            g.yoff,
+                            x,
+                            @as(i32, @intCast(y)) + self.ascent,
+                            fg,
+                            &self.gamma_cache,
+                        )
+                    else
+                        software.blitGlyph(
+                            self.pool_pixels,
+                            W,
+                            H,
+                            self.atlas.pixels,
+                            self.atlas.size,
+                            g.x,
+                            g.y,
+                            g.w,
+                            g.h,
+                            g.xoff,
+                            g.yoff,
+                            x,
+                            @as(i32, @intCast(y)) + self.ascent,
+                            fg,
+                            &self.gamma_cache,
+                        );
                     dmgMerge(dmg, gdmg);
                 }
                 x += cw;

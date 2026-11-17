@@ -230,6 +230,49 @@ pub fn blitGlyph(
     return dmg;
 }
 
+/// Blit an LCD-subpixel glyph: 3 coverage bytes (RGB) per pixel.
+pub fn blitLcdGlyph(
+    buf: []u32,
+    stride: u32,
+    height: u32,
+    atlas_px: []const u8,
+    atlas_stride: u32,
+    ax: u16,
+    ay: u16,
+    gw: u16,
+    gh: u16,
+    xoff: i16,
+    yoff: i16,
+    dx: i32,
+    dy_baseline: i32,
+    color: u32,
+    gamma_cache: *gamma_mod.Cache,
+) Damage {
+    var dmg = Damage{};
+    if (gw == 0 or gh == 0) return dmg;
+    const ox = dx + @as(i32, xoff);
+    const oy = dy_baseline - @as(i32, yoff);
+    const st: i32 = @intCast(stride);
+    const ht: i32 = @intCast(height);
+    const x0 = @max(ox, 0);
+    const y0 = @max(oy, 0);
+    const x1 = @min(ox + @as(i32, gw), st);
+    const y1 = @min(oy + @as(i32, gh), ht);
+    if (x0 >= x1 or y0 >= y1) return dmg;
+    const bg = buf[@as(usize, @intCast(y0)) * stride + @as(usize, @intCast(x0))];
+    const gamma = gamma_cache.get(color, bg);
+    const byte_off: usize = @as(usize, @intCast(x0 - ox)) * 3;
+    const n: usize = @intCast(x1 - x0);
+    var yy = y0;
+    while (yy < y1) : (yy += 1) {
+        const arow = (@as(usize, ay) + @as(usize, @intCast(yy - oy))) * atlas_stride + ax;
+        const base = @as(usize, @intCast(yy)) * stride + @as(usize, @intCast(x0));
+        blendLcdRow(buf[base..][0..n], atlas_px[arow + byte_off ..][0 .. n * 3], color, gamma);
+    }
+    dmg.add(x0, y0, x1 - x0, y1 - y0);
+    return dmg;
+}
+
 const LANES = 8;
 const V8 = @Vector(LANES, u8);
 const V16 = @Vector(LANES, u16);
@@ -285,6 +328,62 @@ fn blendCoverageRow(dst: []u32, cov: []const u8, color: u32, gamma: *const gamma
     var db: [LANES]u32 = @splat(0);
     @memcpy(db[0..rem], dst[i..]);
     const out: [LANES]u32 = blendLanes(db, cv, color);
+    @memcpy(dst[i..], out[0..rem]);
+}
+
+/// Per-channel LCD blend with corrected coverages. Each channel gets its own
+/// coverage, so gamma correction is exact on R, G and B independently.
+fn blendLcdLanes(d: V32, ar: V8, ag: V8, ab: V8, color: u32) V32 {
+    const m: V32 = @splat(0xFF);
+    const one: V16 = @splat(255);
+    const ar16: V16 = ar;
+    const ag16: V16 = ag;
+    const ab16: V16 = ab;
+    const sr: V16 = @splat(@intCast((color >> 16) & 0xFF));
+    const sg: V16 = @splat(@intCast((color >> 8) & 0xFF));
+    const sb: V16 = @splat(@intCast(color & 0xFF));
+    const oa: V16 = @max(@max(ar16, ag16), ab16);
+    const out_a: V32 = oa + div255v(@as(V16, @intCast(d >> @splat(24))) * (one - oa));
+    const orr: V32 = div255v(@as(V16, @intCast((d >> @splat(16)) & m)) * (one - ar16) + sr * ar16);
+    const og: V32 = div255v(@as(V16, @intCast((d >> @splat(8)) & m)) * (one - ag16) + sg * ag16);
+    const ob: V32 = div255v(@as(V16, @intCast(d & m)) * (one - ab16) + sb * ab16);
+    return (out_a << @splat(24)) | (orr << @splat(16)) | (og << @splat(8)) | ob;
+}
+
+fn blendLcdRow(dst: []u32, cov: []const u8, color: u32, gamma: *const gamma_mod.Gamma) void {
+    var i: usize = 0;
+    while (i + LANES <= dst.len) : (i += LANES) {
+        var r: [LANES]u8 = undefined;
+        var g: [LANES]u8 = undefined;
+        var b: [LANES]u8 = undefined;
+        var any = false;
+        for (0..LANES) |j| {
+            const o = (i + j) * 3;
+            r[j] = gamma.rgb[0][cov[o]];
+            g[j] = gamma.rgb[1][cov[o + 1]];
+            b[j] = gamma.rgb[2][cov[o + 2]];
+            if (r[j] | g[j] | b[j] != 0) any = true;
+        }
+        if (!any) continue;
+        dst[i..][0..LANES].* = blendLcdLanes(dst[i..][0..LANES].*, r, g, b, color);
+    }
+    const rem = dst.len - i;
+    if (rem == 0) return;
+    var r: [LANES]u8 = @splat(0);
+    var g: [LANES]u8 = @splat(0);
+    var b: [LANES]u8 = @splat(0);
+    var any = false;
+    for (0..rem) |j| {
+        const o = (i + j) * 3;
+        r[j] = gamma.rgb[0][cov[o]];
+        g[j] = gamma.rgb[1][cov[o + 1]];
+        b[j] = gamma.rgb[2][cov[o + 2]];
+        if (r[j] | g[j] | b[j] != 0) any = true;
+    }
+    if (!any) return;
+    var db: [LANES]u32 = @splat(0);
+    @memcpy(db[0..rem], dst[i..]);
+    const out: [LANES]u32 = blendLcdLanes(db, r, g, b, color);
     @memcpy(dst[i..], out[0..rem]);
 }
 
@@ -373,6 +472,21 @@ test "blitGlyph paints coverage" {
     try std.testing.expect(!dmg.empty);
     try std.testing.expect(buf[1 * 4 + 1] != 0xFF000000);
     try std.testing.expectEqual(@as(u32, 0xFF000000), buf[3 * 4 + 3]);
+}
+
+test "blitLcdGlyph blends each subpixel channel" {
+    // 2x2 pixel LCD atlas = 2*3 bytes per row.
+    const atlas_px = [_]u8{
+        255, 0,   0, 0, 255, 0,
+        0,   0, 255, 255, 255, 255,
+    };
+    var buf: [16]u32 = @splat(0xFF000000);
+    var cache: gamma_mod.Cache = .{};
+    const dmg = blitLcdGlyph(&buf, 4, 4, &atlas_px, 6, 0, 0, 2, 2, 0, 2, 1, 2, 0xFFFFFFFF, &cache);
+    try std.testing.expect(!dmg.empty);
+    try std.testing.expectEqual(@as(u32, 0xFFFF0000), buf[0 * 4 + 1]); // red subpixel
+    try std.testing.expectEqual(@as(u32, 0xFF00FF00), buf[0 * 4 + 2]); // green subpixel
+    try std.testing.expectEqual(@as(u32, 0xFF0000FF), buf[1 * 4 + 1]); // blue subpixel
 }
 
 test "blitColorGlyph blends premultiplied BGRA, skips transparent + OOB" {
