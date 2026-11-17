@@ -133,7 +133,7 @@ Zinc can open a file path with Ctrl+click. To open it in Micro in the current te
 For relative paths to resolve after changing directories, Bash can report its current directory to the terminal at each prompt. Add the following to `~/.bashrc` (and preserve any existing `PROMPT_COMMAND`):
 
 ```bash
-__zinc_report_cwd() { printf "\\033]7;file://%s%s\\033\\\\" "${HOSTNAME:-localhost}" "$PWD"; }
+__zinc_report_cwd() { printf "\033]7;file://%s%s\033\\" "${HOSTNAME:-localhost}" "$PWD"; }
 case ";${PROMPT_COMMAND:-};" in
     *";__zinc_report_cwd;"*) ;;
     *) PROMPT_COMMAND="__zinc_report_cwd${PROMPT_COMMAND:+;$PROMPT_COMMAND}" ;;
