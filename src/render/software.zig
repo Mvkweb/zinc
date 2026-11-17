@@ -3,6 +3,7 @@
 //! cursor, trail). Double-buffer memcpy skipped when disabled.
 
 const std = @import("std");
+pub const gamma_mod = @import("gamma.zig");
 
 pub const Damage = struct {
     x: i32 = 0,
@@ -200,6 +201,7 @@ pub fn blitGlyph(
     dx: i32,
     dy_baseline: i32,
     color: u32,
+    gamma_cache: *gamma_mod.Cache,
 ) Damage {
     var dmg = Damage{};
     if (gw == 0 or gh == 0) return dmg;
@@ -212,6 +214,8 @@ pub fn blitGlyph(
     const x1 = @min(ox + @as(i32, gw), st);
     const y1 = @min(oy + @as(i32, gh), ht);
     if (x0 >= x1 or y0 >= y1) return dmg;
+    const bg = buf[@as(usize, @intCast(y0)) * stride + @as(usize, @intCast(x0))];
+    const gamma = gamma_cache.get(color, bg);
     const a_stride: usize = atlas_stride;
     const a_x: usize = ax + @as(usize, @intCast(x0 - ox));
     const a_y: usize = ay;
@@ -220,7 +224,7 @@ pub fn blitGlyph(
     while (yy < y1) : (yy += 1) {
         const arow = (a_y + @as(usize, @intCast(yy - oy))) * a_stride + a_x;
         const base = @as(usize, @intCast(yy)) * stride + @as(usize, @intCast(x0));
-        blendCoverageRow(buf[base..][0..n], atlas_px[arow..][0..n], color);
+        blendCoverageRow(buf[base..][0..n], atlas_px[arow..][0..n], color, gamma);
     }
     dmg.add(x0, y0, x1 - x0, y1 - y0);
     return dmg;
@@ -260,19 +264,24 @@ fn blendLanes(d: V32, cov: V8, color: u32) V32 {
 
 /// Coverage-blend one glyph row: full vectors, all-empty spans skipped
 /// (glyph margins), and a zero-padded final vector for the tail.
-fn blendCoverageRow(dst: []u32, cov: []const u8, color: u32) void {
+fn blendCoverageRow(dst: []u32, cov: []const u8, color: u32, gamma: *const gamma_mod.Gamma) void {
     var i: usize = 0;
     while (i + LANES <= dst.len) : (i += LANES) {
-        const cv: V8 = cov[i..][0..LANES].*;
-        if (@reduce(.Or, cv) == 0) continue;
+        const raw: V8 = cov[i..][0..LANES].*;
+        if (@reduce(.Or, raw) == 0) continue;
+        var mapped: [LANES]u8 = undefined;
+        for (0..LANES) |j| mapped[j] = gamma.gray[cov[i + j]];
+        const cv: V8 = mapped;
         dst[i..][0..LANES].* = blendLanes(dst[i..][0..LANES].*, cv, color);
     }
     const rem = dst.len - i;
     if (rem == 0) return;
     var cb: [LANES]u8 = @splat(0);
     @memcpy(cb[0..rem], cov[i..]);
-    const cv: V8 = cb;
-    if (@reduce(.Or, cv) == 0) return;
+    if (@reduce(.Or, @as(V8, cb)) == 0) return;
+    var mapped: [LANES]u8 = @splat(0);
+    for (0..rem) |j| mapped[j] = gamma.gray[cb[j]];
+    const cv: V8 = mapped;
     var db: [LANES]u32 = @splat(0);
     @memcpy(db[0..rem], dst[i..]);
     const out: [LANES]u32 = blendLanes(db, cv, color);
@@ -345,9 +354,11 @@ test "blitGlyph rows match scalar blend incl. tails and clipping" {
     var atlas_px: [19 * 3]u8 = undefined;
     for (&atlas_px, 0..) |*p, i| p.* = @intCast((i * 37) % 256);
     var buf: [24 * 4]u32 = @splat(0xE6181818);
-    _ = blitGlyph(&buf, 24, 4, &atlas_px, 19, 0, 0, 19, 3, 0, 0, -5, 1, 0xFFD8D8D8);
+    var cache: gamma_mod.Cache = .{};
+    _ = blitGlyph(&buf, 24, 4, &atlas_px, 19, 0, 0, 19, 3, 0, 0, -5, 1, 0xFFD8D8D8, &cache);
+    const gamma = cache.get(0xFFD8D8D8, 0xE6181818);
     for (0..3) |gy| for (5..19) |gx| {
-        const want = blendArgb(0xE6181818, 0xFFD8D8D8, atlas_px[gy * 19 + gx]);
+        const want = blendArgb(0xE6181818, 0xFFD8D8D8, gamma.gray[atlas_px[gy * 19 + gx]]);
         try std.testing.expectEqual(want, buf[(1 + gy) * 24 + (gx - 5)]);
     };
     try std.testing.expectEqual(@as(u32, 0xE6181818), buf[14]); // row 0 untouched
@@ -357,7 +368,8 @@ test "blitGlyph paints coverage" {
     // 2x2 atlas, full coverage block at (0,0).
     const atlas_px = [_]u8{ 255, 255, 255, 255 };
     var buf: [16]u32 = @splat(0xFF000000);
-    const dmg = blitGlyph(&buf, 4, 4, &atlas_px, 2, 0, 0, 2, 2, 0, 2, 1, 2, 0xFFFFFFFF);
+    var cache: gamma_mod.Cache = .{};
+    const dmg = blitGlyph(&buf, 4, 4, &atlas_px, 2, 0, 0, 2, 2, 0, 2, 1, 2, 0xFFFFFFFF, &cache);
     try std.testing.expect(!dmg.empty);
     try std.testing.expect(buf[1 * 4 + 1] != 0xFF000000);
     try std.testing.expectEqual(@as(u32, 0xFF000000), buf[3 * 4 + 3]);

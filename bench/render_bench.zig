@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const software = @import("software");
+const gamma_mod = software.gamma_mod;
 const flow_mod = @import("flow");
 
 fn nowNs() u64 {
@@ -51,6 +52,7 @@ fn refBlitGlyph(
     dx: i32,
     dy_baseline: i32,
     color: u32,
+    gamma_cache: *gamma_mod.Cache,
 ) void {
     if (gw == 0 or gh == 0) return;
     const ox = dx + @as(i32, xoff);
@@ -65,13 +67,15 @@ fn refBlitGlyph(
     const a_stride: usize = atlas_stride;
     const a_x: usize = ax;
     const a_y: usize = ay;
+    const bg = buf[@as(usize, @intCast(y0)) * stride + @as(usize, @intCast(x0))];
+    const gamma = gamma_cache.get(color, bg);
     var yy = y0;
     while (yy < y1) : (yy += 1) {
         const arow = (a_y + @as(usize, @intCast(yy - oy))) * a_stride;
         const base = @as(usize, @intCast(yy)) * stride;
         var xx = x0;
         while (xx < x1) : (xx += 1) {
-            const cov = atlas_px[arow + a_x + @as(usize, @intCast(xx - ox))];
+            const cov = gamma.gray[atlas_px[arow + a_x + @as(usize, @intCast(xx - ox))]];
             if (cov == 0) continue;
             const idx = base + @as(usize, @intCast(xx));
             buf[idx] = refBlend(buf[idx], color, cov);
@@ -188,6 +192,7 @@ pub fn main(init: std.process.Init) !void {
 
     const bg: u32 = 0xE6181818;
     const fg: u32 = 0xFFD8D8D8;
+    var gamma_cache: gamma_mod.Cache = .{};
 
     // Correctness: new blit == frozen baseline, bit for bit, incl. a
     // translucent bg (alpha-mode=matching) and clipped edges.
@@ -201,8 +206,8 @@ pub fn main(init: std.process.Init) !void {
             const x: i32 = @intCast((i % cols) * CW);
             const y: i32 = @intCast((i / cols) * CH);
             const gx: u16 = @intCast(@as(u32, g) * GW);
-            refBlitGlyph(a, W, H, atlas, ATLAS_W, gx, 0, GW, GH, -1, 13, x - 3, y + 13, fg);
-            _ = software.blitGlyph(b, W, H, atlas, ATLAS_W, gx, 0, GW, GH, -1, 13, x - 3, y + 13, fg);
+            refBlitGlyph(a, W, H, atlas, ATLAS_W, gx, 0, GW, GH, -1, 13, x - 3, y + 13, fg, &gamma_cache);
+            _ = software.blitGlyph(b, W, H, atlas, ATLAS_W, gx, 0, GW, GH, -1, 13, x - 3, y + 13, fg, &gamma_cache);
         }
         if (!std.mem.eql(u32, a, b)) {
             std.debug.print("MISMATCH: new blitGlyph differs from baseline\n", .{});
@@ -230,9 +235,9 @@ pub fn main(init: std.process.Init) !void {
                     const y: i32 = @intCast((i / cols) * CH);
                     const gx: u16 = @intCast(@as(u32, g) * GW);
                     if (use_ref) {
-                        refBlitGlyph(a, W, H, atlas, ATLAS_W, gx, 0, GW, GH, -1, 13, x, y + 13, fg);
+                        refBlitGlyph(a, W, H, atlas, ATLAS_W, gx, 0, GW, GH, -1, 13, x, y + 13, fg, &gamma_cache);
                     } else {
-                        _ = software.blitGlyph(a, W, H, atlas, ATLAS_W, gx, 0, GW, GH, -1, 13, x, y + 13, fg);
+                        _ = software.blitGlyph(a, W, H, atlas, ATLAS_W, gx, 0, GW, GH, -1, 13, x, y + 13, fg, &gamma_cache);
                     }
                 }
                 std.mem.doNotOptimizeAway(a[W * H / 2]);

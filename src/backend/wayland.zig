@@ -157,6 +157,7 @@ const mouse_mod = @import("../input/mouse.zig");
 const hyperlink_mod = @import("../term/hyperlink.zig");
 const cell_mod = @import("../term/cell.zig");
 const software = @import("../render/software.zig");
+const gamma_mod = @import("../render/gamma.zig");
 const box_drawing = @import("../render/box_drawing.zig");
 const flow_mod = @import("../render/flow.zig");
 const scrollbar_mod = @import("../render/scrollbar.zig");
@@ -245,6 +246,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// Twin RGBA store for color emoji (empty unless cfg.emoji).
         color_atlas: atlas_mod.ColorAtlas = .{},
         glyphs: std.AutoHashMap(u32, atlas_mod.Baked),
+        gamma_cache: gamma_mod.Cache = .{},
         cell_w: i32,
         cell_h: i32,
         ascent: i32,
@@ -1398,6 +1400,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 @intCast(x),
                 @as(i32, @intCast(y)) + self.ascent,
                 fg,
+                &self.gamma_cache,
             );
             dmgMerge(dmg, gdmg);
         }
@@ -1423,6 +1426,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         x,
                         @as(i32, @intCast(y)) + self.ascent,
                         fg,
+                        &self.gamma_cache,
                     );
                     dmgMerge(dmg, gdmg);
                 }
