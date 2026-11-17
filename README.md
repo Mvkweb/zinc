@@ -47,6 +47,8 @@ login-shell = false
 # Font family name or TTF path. Leave empty to use system Nerd Fonts.
 font-family = ""
 font-size = 12.0
+# LCD subpixel antialiasing (3x horizontal coverage). Disable on BGR panels.
+font-subpixel = true
 
 # Padding in pixels
 # Normal window padding.

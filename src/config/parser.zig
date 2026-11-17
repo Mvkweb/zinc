@@ -9,6 +9,7 @@ pub const DecorationMode = config_mod.DecorationMode;
 
 pub const RuntimeConfig = struct {
     font_size: ?f32 = null,
+    font_subpixel: ?bool = null,
     font_family: ?[]const u8 = null,
     shell: ?[]const u8 = null,
     login_shell: ?bool = null,
@@ -167,6 +168,8 @@ pub fn parse(content: []const u8, cfg: *RuntimeConfig, gpa: std.mem.Allocator) v
             if (std.fmt.parseFloat(f32, trimQuotes(val))) |fs| {
                 if (fs >= 1.0 and fs <= 128.0) cfg.font_size = fs;
             } else |_| {}
+        } else if (std.ascii.eqlIgnoreCase(key, "font-subpixel") or std.ascii.eqlIgnoreCase(key, "font_subpixel")) {
+            if (parseBool(val)) |b| cfg.font_subpixel = b;
         } else if (std.ascii.eqlIgnoreCase(key, "font-family") or std.ascii.eqlIgnoreCase(key, "font_family") or std.ascii.eqlIgnoreCase(key, "font")) {
             const font_name = trimQuotes(val);
             if (cfg.font_family) |old| gpa.free(old);
@@ -352,6 +355,7 @@ test "parse complete config content" {
     const text =
         \\# Test Config
         \\font-size = 14.5
+        \\font-subpixel = false
         \\font-family = "JetBrainsMono Nerd Font"
         \\padding-x = 30
         \\padding-y = 20
@@ -387,6 +391,7 @@ test "parse complete config content" {
     try std.testing.expectEqual(@as(?DecorationMode, .csd), cfg.decorations);
 
     try std.testing.expectEqual(@as(?f32, 14.5), cfg.font_size);
+    try std.testing.expectEqual(@as(?bool, false), cfg.font_subpixel);
     try std.testing.expectEqualStrings("JetBrainsMono Nerd Font", cfg.font_family.?);
     try std.testing.expectEqual(@as(?u32, 30), cfg.pad_x);
     try std.testing.expectEqual(@as(?u32, 20), cfg.pad_y);

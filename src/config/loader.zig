@@ -58,6 +58,8 @@ pub const DEFAULT_CONFIG_TEMPLATE =
     \\# Font family name or TTF path. Leave empty to use system Nerd Fonts.
     \\font-family = ""
     \\font-size = 12.0
+    \\# LCD subpixel antialiasing (3x horizontal coverage). Disable on BGR panels.
+    \\font-subpixel = true
     \\
     \\# Padding in pixels
     \\# Normal window padding.
@@ -378,7 +380,7 @@ test "template stamp matches CURRENT_CONFIG_VERSION" {
 
 test "template documents every supported key" {
     const keys = [_][]const u8{
-        "font-size",             "font-family",             "padding-x",
+        "font-size",            "font-subpixel",         "font-family",            "padding-x",
         "padding-y",             "alt-padding-x",           "alt-padding-y",
         "decorations",           "background",              "foreground",
         "selection-background",  "selection-foreground",    "cursor-color",

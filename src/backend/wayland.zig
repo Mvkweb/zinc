@@ -575,7 +575,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 color_atlas = atlas_mod.ColorAtlas.init(gpa) catch atlas_mod.ColorAtlas{};
             }
             ft_face.emoji_enabled = cfg.emoji;
-            ft_face.subpixel = cfg.font_subpixel;
+            ft_face.subpixel = runtime_cfg.font_subpixel orelse cfg.font_subpixel;
             // ascii_only runes can't store CJK (setRune maps to '?'):
             // skip the ~16MB face entirely on that profile.
             ft_face.cjk_enabled = !cfg.ascii_only;
@@ -2546,7 +2546,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             var old = self.runtime_cfg;
             const geo_changed = old.font_size != next.font_size or
                 old.pad_x != next.pad_x or old.pad_y != next.pad_y or
-                old.alt_pad_x != next.alt_pad_x or old.alt_pad_y != next.alt_pad_y;
+                old.alt_pad_x != next.alt_pad_x or old.alt_pad_y != next.alt_pad_y or
+                old.font_subpixel != next.font_subpixel;
             self.runtime_cfg = next;
             old.deinit(self.gpa);
 
@@ -2579,6 +2580,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.alt_pad_y = self.runtime_cfg.alt_pad_y orelse cfg.alt_pad_y;
 
             if (geo_changed) {
+                self.ft_face.subpixel = self.runtime_cfg.font_subpixel orelse cfg.font_subpixel;
                 const pt = self.runtime_cfg.font_size orelse cfg.font_default_size;
                 self.setFontSize(pt);
             }
