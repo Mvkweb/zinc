@@ -17,6 +17,13 @@ pub const BackendError = error{
 /// Painted cursor rect in surface pixels (glide-interpolated + stretch).
 const CurRect = struct { x: i32, y: i32, w: i32, h: i32 };
 
+// inotify mask: in-place writes and editor atomic-rename swaps.
+const IN_MODIFY: u32 = 0x00000002;
+const IN_CLOSE_WRITE: u32 = 0x00000008;
+const IN_MOVED_TO: u32 = 0x00000080;
+const IN_CREATE: u32 = 0x00000100;
+const IN_DELETE: u32 = 0x00000200;
+
 pub const ShmBuffer = struct {
     w: i32 = 0,
     h: i32 = 0,
@@ -479,6 +486,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
         repeat_delay: i32 = 0,
         /// Key-repeat timerfd + the pressed key being repeated.
         repeat_fd: i32 = -1,
+        /// inotify fd watching the config directory for live reload.
+        config_fd: i32 = -1,
         repeat_sym: u32 = 0,
         repeat_keycode: u32 = 0,
         repeat_armed: bool = false,
@@ -974,6 +983,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (linux.errno(tfd) == .SUCCESS) self.repeat_fd = @intCast(tfd);
             self.last_activity_ms = context_mod.nowMs();
             trimMemory();
+            self.watchConfig();
 
             return self;
         }
@@ -983,6 +993,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.pty_fd = -1;
             if (self.repeat_fd >= 0) _ = linux.close(self.repeat_fd);
             self.repeat_fd = -1;
+            if (self.config_fd >= 0) _ = linux.close(self.config_fd);
+            self.config_fd = -1;
             if (self.buffer) |b| {
                 c.wl_proxy_marshal(@ptrCast(b), 0); // wl_buffer.destroy
                 c.wl_proxy_destroy(@ptrCast(b));
@@ -2460,6 +2472,77 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.setFontSize(default_pt);
         }
 
+        /// Start watching the config directory. Soft-fails to no watcher.
+        fn watchConfig(self: *Self) void {
+            var dir_buf: [512:0]u8 = undefined;
+            const dir = config_loader.resolveDir(&dir_buf) orelse return;
+            const flags: u32 = @bitCast(linux.O{ .CLOEXEC = true, .NONBLOCK = true });
+            const fd = linux.inotify_init1(flags);
+            if (linux.errno(fd) != .SUCCESS) return;
+            const mask = IN_MODIFY | IN_CLOSE_WRITE | IN_MOVED_TO | IN_CREATE | IN_DELETE;
+            const wd = linux.inotify_add_watch(@intCast(fd), dir.ptr, mask);
+            if (linux.errno(wd) != .SUCCESS) {
+                _ = linux.close(@intCast(fd));
+                return;
+            }
+            self.config_fd = @intCast(fd);
+        }
+
+        /// Drain inotify events and re-read the config. One reload per batch
+        /// is enough: writers emit several events (MODIFY + CLOSE_WRITE).
+        fn drainConfigEvents(self: *Self) void {
+            var buf: [4096]u8 align(@alignOf(linux.inotify_event)) = undefined;
+            _ = linux.read(self.config_fd, &buf, buf.len);
+            self.reloadConfig();
+        }
+
+        /// Re-read the config file and apply settings that need no shell,
+        /// font-face or surface recreation. Font size/padding reuse setFontSize.
+        fn reloadConfig(self: *Self) void {
+            const next = config_loader.loadOrCreate(self.gpa);
+            var old = self.runtime_cfg;
+            const geo_changed = old.font_size != next.font_size or
+                old.pad_x != next.pad_x or old.pad_y != next.pad_y or
+                old.alt_pad_x != next.alt_pad_x or old.alt_pad_y != next.alt_pad_y;
+            self.runtime_cfg = next;
+            old.deinit(self.gpa);
+
+            self.ctx.bg = self.runtime_cfg.bg orelse cfg.bg;
+            self.ctx.fg = self.runtime_cfg.fg orelse cfg.fg;
+            self.ctx.cursor_color = self.runtime_cfg.cursor_color orelse cfg.cursor_color;
+            self.bg_opacity = self.runtime_cfg.bg_opacity orelse cfg.bg_opacity;
+            self.selection_bg = self.runtime_cfg.selection_bg orelse cfg.selection_bg;
+            self.selection_fg = self.runtime_cfg.selection_fg orelse cfg.selection_fg;
+            self.link_color = self.runtime_cfg.link_color orelse cfg.link_color;
+            self.cursor_style = self.runtime_cfg.cursor_style orelse cfg.cursor_style;
+            self.cursor_blink = self.runtime_cfg.cursor_blink orelse cfg.cursor_blink;
+            self.ctx.blink_enabled = self.cursor_blink;
+            self.cursor_thick_px = self.runtime_cfg.cursor_thick_px orelse cfg.cursor_thick_px;
+            self.selection_single_cell = self.runtime_cfg.selection_single_cell orelse cfg.selection_single_cell;
+            self.find_numbers = self.runtime_cfg.find_match_numbers orelse cfg.find_match_numbers;
+            self.find_num_scale = self.runtime_cfg.find_number_scale orelse cfg.find_number_scale;
+            self.glide = self.runtime_cfg.cursor_glide orelse cfg.cursor_glide;
+            self.glide_ms = self.runtime_cfg.cursor_glide_ms orelse cfg.cursor_glide_ms;
+            self.cursor_overshoot = self.runtime_cfg.cursor_overshoot orelse cfg.cursor_overshoot;
+            self.trail_ms = self.runtime_cfg.cursor_trail_ms orelse cfg.cursor_trail_ms;
+            self.smooth_scroll = self.runtime_cfg.smooth_scroll orelse cfg.smooth_scroll;
+            self.smooth_scroll_ms = self.runtime_cfg.smooth_scroll_ms orelse cfg.smooth_scroll_ms;
+            self.wheel_step = self.runtime_cfg.scroll_step orelse cfg.scroll_step;
+            self.dir_cd_mod = self.runtime_cfg.dir_cd_mod orelse cfg.dir_cd_mod;
+            self.dir_open_mod = self.runtime_cfg.dir_open_mod orelse cfg.dir_open_mod;
+            self.pad_x = self.runtime_cfg.pad_x orelse cfg.pad_x;
+            self.pad_y = self.runtime_cfg.pad_y orelse cfg.pad_y;
+            self.alt_pad_x = self.runtime_cfg.alt_pad_x orelse cfg.alt_pad_x;
+            self.alt_pad_y = self.runtime_cfg.alt_pad_y orelse cfg.alt_pad_y;
+
+            if (geo_changed) {
+                const pt = self.runtime_cfg.font_size orelse cfg.font_default_size;
+                self.setFontSize(pt);
+            }
+            self.ctx.grid.markAllDirty();
+            self.needs_render = true;
+        }
+
         fn setFontSize(self: *Self, new_pt: f32) void {
             if (self.width <= 0 or self.height <= 0) return;
             const clamped_pt = @max(cfg.font_min_size, @min(cfg.font_max_size, new_pt));
@@ -2661,8 +2744,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     .{ .fd = wl_fd, .events = linux.POLL.IN, .revents = 0 },
                     .{ .fd = self.pty_fd, .events = linux.POLL.IN, .revents = 0 },
                     .{ .fd = self.repeat_fd, .events = linux.POLL.IN, .revents = 0 },
+                    .{ .fd = self.config_fd, .events = linux.POLL.IN, .revents = 0 },
                 };
-                const nfds: usize = if (self.repeat_fd >= 0) 3 else 2;
+                const nfds: usize = 4;
                 var poll_timeout: i32 = self.ctx.getTimeoutMs();
                 // A pending frame callback arrives on wl_fd (polled): no
                 // timer wake can present before it (present is gated on
@@ -2754,7 +2838,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         if (context_mod.nowMs() - drain_t0 >= 8) break;
                     }
                 }
-                if (nfds == 3 and (fds[2].revents & linux.POLL.IN) != 0) {
+                if (self.config_fd >= 0 and (fds[3].revents & linux.POLL.IN) != 0) {
+                    self.drainConfigEvents();
+                }
+                if (self.repeat_fd >= 0 and (fds[2].revents & linux.POLL.IN) != 0) {
                     self.markActivity();
                     // Repeat tick: drain the timer and re-emit.
                     var exp: u64 = 0;
