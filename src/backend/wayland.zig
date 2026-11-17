@@ -4599,6 +4599,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // A release outside the window never arrives: end a drag here
             // rather than strand the capture (re-enter starts clean).
             self.sb_dragging = false;
+            self.sel_drag = false;
+            // Mouse-aware apps need button-up on surface leave.
+            if (self.ctx.mouse_mode != .off and self.mouse_buttons != 0) {
+                const cc = self.ptrCell(self.ptr_sx, self.ptr_sy);
+                var held = self.mouse_buttons;
+                while (held != 0) {
+                    held &= held - 1;
+                    self.reportMouse(3, false, false, cc.col, cc.row);
+                }
+            }
+            self.mouse_buttons = 0;
             self.clearHover();
         }
 

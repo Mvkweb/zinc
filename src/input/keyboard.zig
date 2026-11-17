@@ -70,9 +70,10 @@ pub fn encode(key: Key, mods: Mods, kitty_mode: bool, cursor_app: bool, out: []u
             return std.fmt.bufPrint(out, "\x1b[27;{d}u", .{m}) catch out[0..0];
         },
         .backspace => {
-            // Ctrl+BS erases a word (fish binds ESC DEL like Alt+BS);
-            // plain ^H has no default word binding anywhere. Ctrl+Alt
-            // keeps the old ^H-with-prefix form.
+            // Ctrl+BS: kitty CSI u; fish binds ESC[127;5u as ctrl-backspace.
+            if (mods.ctrl and !mods.alt and !mods.shift and !mods.super) {
+                return std.fmt.bufPrint(out, "\x1b[127;5u", .{}) catch out[0..0];
+            }
             const base: u8 = if (mods.ctrl and mods.alt) 0x08 else 0x7f;
             if (mods.alt or mods.ctrl) {
                 if (out.len < 2) return out[0..0];
@@ -176,7 +177,7 @@ test "modified keys encode" {
     try std.testing.expectEqualSlices(u8, "\x1b[1;5C", encode(.right, ctrl, false, false, &buf));
     // Word erase forward/backward.
     try std.testing.expectEqualSlices(u8, "\x1b[3;5~", encode(.delete, ctrl, false, false, &buf));
-    try std.testing.expectEqualSlices(u8, "\x1b\x7f", encode(.backspace, ctrl, false, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[127;5u", encode(.backspace, ctrl, false, false, &buf));
     try std.testing.expectEqualSlices(u8, "\x1b\x7f", encode(.backspace, alt, false, false, &buf));
     // Shift+Enter newline continuation, Shift+Tab backtab.
     try std.testing.expectEqualSlices(u8, "\x1b[13;2u", encode(.enter, shift, false, false, &buf));
