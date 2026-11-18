@@ -1240,6 +1240,8 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// Switch to the alternate screen (TUI mode). O(1) swap.
         fn enterAlt(self: *Self) void {
             if (!cfg.alt_screen or self.alt_active or self.grid.alt_ring.len == 0) return;
+            // 1049 clears the alternate screen, including its images.
+            self.clearKittyPlacements(true);
             self.alt_saved_col = self.cursor_col;
             self.alt_saved_row = self.cursor_row;
             self.alt_saved_wrap = self.pending_wrap;
@@ -1981,6 +1983,23 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
         }
 
+        /// Remove Kitty placements on one buffer without freeing image data.
+        /// CSI 2J/3J must clear visible images so `clear` works (Kitty graphics
+        /// protocol, "Interaction with other terminal actions"). Inactive-screen
+        /// placements stay intact, and text-only erase commands leave graphics
+        /// untouched.
+        fn clearKittyPlacements(self: *Self, alt: bool) void {
+            if (!cfg.kitty_gfx) return;
+            var i: usize = 0;
+            while (i < self.images.placements.items.len) {
+                if (self.images.placements.items[i].alt_screen == alt) {
+                    _ = self.images.placements.swapRemove(i);
+                } else {
+                    i += 1;
+                }
+            }
+        }
+
         fn scrollRegionUp(self: *Self) void {
             if (self.prompt_start_row) |*psr| {
                 if (psr.* > 0) {
@@ -2117,6 +2136,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     @memset(self.grid.rowSlice(self.cursor_row)[0 .. self.cursor_col + 1], blank);
                 },
                 2, 3 => {
+                    self.clearKittyPlacements(self.alt_active);
                     self.grid.clearScreen(blank);
                     if (mode == 3 and cfg.scrollback_clear_on_ed3) self.grid.clearScrollback();
                     self.in_prompt = false;
@@ -2169,6 +2189,10 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         fn reset(self: *Self) void {
             const CellT = cell_mod.Cell(cfg);
             const blank = CellT{};
+            // RIS clears all visible images on both buffers.
+            if (cfg.kitty_gfx) {
+                self.images.placements.clearRetainingCapacity();
+            }
             self.grid.clearScreen(blank);
             self.grid.offset = 0;
             self.grid.alt_offset = 0;
@@ -2364,6 +2388,54 @@ test "kitty transmit RGBA end-to-end" {
     ctx.parse("\x1b_Gi=916472805,s=1,v=1,a=q,t=s,f=24;AAAA\x1b\\");
     try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "Gi=916472805;OK") == null);
     try std.testing.expect(std.mem.indexOf(u8, sink.buf[0..sink.len], "Gi=916472805;") != null);
+}
+
+test "kitty clear screen and reset clear placements" {
+    var ctx = try Context(.{ .cols = 8, .rows = 4 }).init(std.testing.allocator);
+    defer ctx.deinit();
+    // 2x1 opaque RGBA pixels.
+    const b64 = "/wAA/wD/AP8=";
+    var seq: [128]u8 = undefined;
+
+    // EL is a text-only erase and must leave graphics untouched.
+    ctx.cursor_col = 0;
+    ctx.cursor_row = 0;
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=2,v=1,i=7,q=2;{s}\x1b\\", .{b64}));
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
+    ctx.parse("\x1b[1;1H\x1b[2K");
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
+    try std.testing.expect(ctx.images.findImage(7).?.visible);
+
+    // CSI 2J clears visible placements and keeps image data for redisplay.
+    ctx.parse("\x1b[2J");
+    try std.testing.expectEqual(@as(usize, 0), ctx.images.placements.items.len);
+    try std.testing.expect(ctx.images.findImage(7) != null);
+
+    // A redisplay makes it visible again; RIS must clear both.
+    ctx.parse("\x1b_Ga=p,i=7,q=2\x1b\\");
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
+    ctx.parse("\x1bc");
+    try std.testing.expectEqual(@as(usize, 0), ctx.images.placements.items.len);
+}
+
+test "kitty alternate screen entry clears stale placements" {
+    var ctx = try Context(.{ .cols = 8, .rows = 4, .alt_screen = true }).init(std.testing.allocator);
+    defer ctx.deinit();
+    const b64 = "/wAA/wD/AP8=";
+    var seq: [128]u8 = undefined;
+
+    // Create one main-screen and two stale alternate-screen placements.
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=2,v=1,i=7,q=2;{s}\x1b\\", .{b64}));
+    ctx.parse("\x1b[?1049h");
+    ctx.parse(try std.fmt.bufPrint(&seq, "\x1b_Ga=T,f=32,s=2,v=1,i=8,q=2;{s}\x1b\\", .{b64}));
+    ctx.parse("\x1b_Ga=p,i=7,q=2\x1b\\");
+    try std.testing.expectEqual(@as(usize, 3), ctx.images.placements.items.len);
+
+    ctx.parse("\x1b[?1049l");
+    ctx.parse("\x1b[?1049h");
+    try std.testing.expectEqual(@as(usize, 1), ctx.images.placements.items.len);
+    try std.testing.expect(!ctx.images.placements.items[0].alt_screen);
+    try std.testing.expectEqual(@as(u32, 7), ctx.images.placements.items[0].img_id);
 }
 
 test "kitty legacy tiled placement stores geometry" {
