@@ -27,7 +27,7 @@ Full breakdown in [features.md](features.md).
 # require a new window.
 # When new settings ship, Zinc writes an updated reference file to
 # config.new next to this file without changing your config.
-config-version = 6
+config-version = 7
 
 # Shell
 # Command or binary to run, such as "fish" or "/bin/zsh".
@@ -47,8 +47,12 @@ login-shell = false
 # Font family name or TTF path. Leave empty to use system Nerd Fonts.
 font-family = ""
 font-size = 12.0
-# LCD subpixel antialiasing (3x horizontal coverage). Disable on BGR panels.
-font-subpixel = true
+# Subpixel antialiasing: sharper text on RGB LCD panels. Only applies
+# when background-opacity is 1.0, translucent windows get color fringes.
+font-subpixel = false
+# Text blending: native (default) or linear. Linear is gamma-correct and
+# makes light text on dark backgrounds look brighter and bolder.
+alpha-blending = native
 
 # Padding in pixels
 # Normal window padding.

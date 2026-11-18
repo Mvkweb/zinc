@@ -382,8 +382,9 @@ pub const Face = struct {
     emoji_face: ?c.FT_Face = null,
     emoji_tried: bool = false,
     emoji_enabled: bool = true,
-    /// LCD subpixel antialiasing (3x horizontal coverage).
-    subpixel: bool = true,
+    /// LCD subpixel antialiasing (3x horizontal coverage). The backend
+    /// only enables it on opaque windows.
+    subpixel: bool = false,
     /// CJK face, lazy-loaded on first CJK bake (~16MB/weight, never at
     /// startup). Null = absent or unwanted; cjk_enabled=false (ascii_only
     /// profile) skips loading entirely.
@@ -1243,12 +1244,6 @@ pub const Face = struct {
         _ = c.FT_Done_FreeType(self.lib);
     }
 
-    /// Glyph classes whose members must share one face. Mixed faces give
-    /// adjacent characters different bearings and baseline offsets.
-    fn singleFaceGlyph(cp: u21) bool {
-        return (cp >= 0x2500 and cp <= 0x257F) or (cp >= 0xE000 and cp <= 0xF8FF);
-    }
-
     /// Bake one codepoint+style into the atlas. Style face first, then
     /// regular, then fallback faces (char index 0 = missing everywhere).
     /// Returns blank metrics instead of .notdef for missing glyphs.
@@ -1278,20 +1273,10 @@ pub const Face = struct {
         }
         var target: ?c.FT_Face = null;
         var slot_n: u3 = 0;
-        if (singleFaceGlyph(cp)) {
-            if (self.ensureFallback(0)) |nerd| {
-                if (c.FT_Get_Char_Index(nerd, @intCast(cp)) != 0) {
-                    target = nerd;
-                    slot_n = 1;
-                }
-            }
-        }
-        if (target == null) {
-            if (style_face) |f| {
-                if (cp == 0 or c.FT_Get_Char_Index(f, @intCast(cp)) != 0) {
-                    target = f;
-                    slot_n = 0;
-                }
+        if (style_face) |f| {
+            if (cp == 0 or c.FT_Get_Char_Index(f, @intCast(cp)) != 0) {
+                target = f;
+                slot_n = 0;
             }
         }
         if (target == null and (style_face == null or style_face.? != self.face)) {
@@ -1644,6 +1629,7 @@ test "bake produces LCD coverage when subpixel enabled" {
     _ = c.FT_Library_SetLcdFilter(lib, c.FT_LCD_FILTER_DEFAULT);
     var face = Face.tryFace(lib, 16, m.path) orelse return;
     defer _ = c.FT_Done_Face(face.face);
+    face.subpixel = true;
     var atlas = try atlas_mod.Atlas.init(std.testing.allocator, 512);
     defer atlas.deinit(std.testing.allocator);
     const b = face.bake(&atlas, null, 'a', .regular) catch return error.Fail;

@@ -201,7 +201,7 @@ pub fn blitGlyph(
     dx: i32,
     dy_baseline: i32,
     color: u32,
-    gamma_cache: *gamma_mod.Cache,
+    gamma_cache: ?*gamma_mod.Cache,
 ) Damage {
     var dmg = Damage{};
     if (gw == 0 or gh == 0) return dmg;
@@ -214,8 +214,7 @@ pub fn blitGlyph(
     const x1 = @min(ox + @as(i32, gw), st);
     const y1 = @min(oy + @as(i32, gh), ht);
     if (x0 >= x1 or y0 >= y1) return dmg;
-    const bg = buf[@as(usize, @intCast(y0)) * stride + @as(usize, @intCast(x0))];
-    const gamma = gamma_cache.get(color, bg);
+    const gamma = if (gamma_cache) |gc| gc.get(color, buf[@as(usize, @intCast(y0)) * stride + @as(usize, @intCast(x0))]) else null;
     const a_stride: usize = atlas_stride;
     const a_x: usize = ax + @as(usize, @intCast(x0 - ox));
     const a_y: usize = ay;
@@ -246,7 +245,7 @@ pub fn blitLcdGlyph(
     dx: i32,
     dy_baseline: i32,
     color: u32,
-    gamma_cache: *gamma_mod.Cache,
+    gamma_cache: ?*gamma_mod.Cache,
 ) Damage {
     var dmg = Damage{};
     if (gw == 0 or gh == 0) return dmg;
@@ -259,8 +258,7 @@ pub fn blitLcdGlyph(
     const x1 = @min(ox + @as(i32, gw), st);
     const y1 = @min(oy + @as(i32, gh), ht);
     if (x0 >= x1 or y0 >= y1) return dmg;
-    const bg = buf[@as(usize, @intCast(y0)) * stride + @as(usize, @intCast(x0))];
-    const gamma = gamma_cache.get(color, bg);
+    const gamma = if (gamma_cache) |gc| gc.get(color, buf[@as(usize, @intCast(y0)) * stride + @as(usize, @intCast(x0))]) else null;
     const byte_off: usize = @as(usize, @intCast(x0 - ox)) * 3;
     const n: usize = @intCast(x1 - x0);
     var yy = y0;
@@ -305,9 +303,30 @@ fn blendLanes(d: V32, cov: V8, color: u32) V32 {
     return (oa << @splat(24)) | (orr << @splat(16)) | (og << @splat(8)) | ob;
 }
 
+fn blendCoverageRowRaw(dst: []u32, cov: []const u8, color: u32) void {
+    var i: usize = 0;
+    while (i + LANES <= dst.len) : (i += LANES) {
+        const cv: V8 = cov[i..][0..LANES].*;
+        if (@reduce(.Or, cv) == 0) continue;
+        dst[i..][0..LANES].* = blendLanes(dst[i..][0..LANES].*, cv, color);
+    }
+    const rem = dst.len - i;
+    if (rem == 0) return;
+    var cb: [LANES]u8 = @splat(0);
+    @memcpy(cb[0..rem], cov[i..]);
+    const cv: V8 = cb;
+    if (@reduce(.Or, cv) == 0) return;
+    var db: [LANES]u32 = @splat(0);
+    @memcpy(db[0..rem], dst[i..]);
+    const out: [LANES]u32 = blendLanes(db, cv, color);
+    @memcpy(dst[i..], out[0..rem]);
+}
+
 /// Coverage-blend one glyph row: full vectors, all-empty spans skipped
 /// (glyph margins), and a zero-padded final vector for the tail.
-fn blendCoverageRow(dst: []u32, cov: []const u8, color: u32, gamma: *const gamma_mod.Gamma) void {
+/// A null gamma blends raw coverage (native sRGB, no lookup per lane).
+fn blendCoverageRow(dst: []u32, cov: []const u8, color: u32, gamma_opt: ?*const gamma_mod.Gamma) void {
+    const gamma = gamma_opt orelse return blendCoverageRowRaw(dst, cov, color);
     var i: usize = 0;
     while (i + LANES <= dst.len) : (i += LANES) {
         const raw: V8 = cov[i..][0..LANES].*;
@@ -350,7 +369,7 @@ fn blendLcdLanes(d: V32, ar: V8, ag: V8, ab: V8, color: u32) V32 {
     return (out_a << @splat(24)) | (orr << @splat(16)) | (og << @splat(8)) | ob;
 }
 
-fn blendLcdRow(dst: []u32, cov: []const u8, color: u32, gamma: *const gamma_mod.Gamma) void {
+fn blendLcdRow(dst: []u32, cov: []const u8, color: u32, gamma: ?*const gamma_mod.Gamma) void {
     var i: usize = 0;
     while (i + LANES <= dst.len) : (i += LANES) {
         var r: [LANES]u8 = undefined;
@@ -359,9 +378,9 @@ fn blendLcdRow(dst: []u32, cov: []const u8, color: u32, gamma: *const gamma_mod.
         var any = false;
         for (0..LANES) |j| {
             const o = (i + j) * 3;
-            r[j] = gamma.rgb[0][cov[o]];
-            g[j] = gamma.rgb[1][cov[o + 1]];
-            b[j] = gamma.rgb[2][cov[o + 2]];
+            r[j] = if (gamma) |gm| gm.rgb[0][cov[o]] else cov[o];
+            g[j] = if (gamma) |gm| gm.rgb[1][cov[o + 1]] else cov[o + 1];
+            b[j] = if (gamma) |gm| gm.rgb[2][cov[o + 2]] else cov[o + 2];
             if (r[j] | g[j] | b[j] != 0) any = true;
         }
         if (!any) continue;
@@ -375,9 +394,9 @@ fn blendLcdRow(dst: []u32, cov: []const u8, color: u32, gamma: *const gamma_mod.
     var any = false;
     for (0..rem) |j| {
         const o = (i + j) * 3;
-        r[j] = gamma.rgb[0][cov[o]];
-        g[j] = gamma.rgb[1][cov[o + 1]];
-        b[j] = gamma.rgb[2][cov[o + 2]];
+        r[j] = if (gamma) |gm| gm.rgb[0][cov[o]] else cov[o];
+        g[j] = if (gamma) |gm| gm.rgb[1][cov[o + 1]] else cov[o + 1];
+        b[j] = if (gamma) |gm| gm.rgb[2][cov[o + 2]] else cov[o + 2];
         if (r[j] | g[j] | b[j] != 0) any = true;
     }
     if (!any) return;
@@ -463,6 +482,17 @@ test "blitGlyph rows match scalar blend incl. tails and clipping" {
     try std.testing.expectEqual(@as(u32, 0xE6181818), buf[14]); // row 0 untouched
 }
 
+test "blitGlyph without gamma blends raw coverage" {
+    var atlas_px: [19 * 3]u8 = undefined;
+    for (&atlas_px, 0..) |*p, i| p.* = @intCast((i * 37) % 256);
+    var buf: [24 * 4]u32 = @splat(0xE6181818);
+    _ = blitGlyph(&buf, 24, 4, &atlas_px, 19, 0, 0, 19, 3, 0, 0, -5, 1, 0xFFD8D8D8, null);
+    for (0..3) |gy| for (5..19) |gx| {
+        const want = blendArgb(0xE6181818, 0xFFD8D8D8, atlas_px[gy * 19 + gx]);
+        try std.testing.expectEqual(want, buf[(1 + gy) * 24 + (gx - 5)]);
+    };
+}
+
 test "blitGlyph paints coverage" {
     // 2x2 atlas, full coverage block at (0,0).
     const atlas_px = [_]u8{ 255, 255, 255, 255 };
@@ -477,7 +507,7 @@ test "blitGlyph paints coverage" {
 test "blitLcdGlyph blends each subpixel channel" {
     // 2x2 pixel LCD atlas = 2*3 bytes per row.
     const atlas_px = [_]u8{
-        255, 0,   0, 0, 255, 0,
+        255, 0, 0,   0,   255, 0,
         0,   0, 255, 255, 255, 255,
     };
     var buf: [16]u32 = @splat(0xFF000000);

@@ -1,7 +1,8 @@
 //! Gamma-correct coverage tables. Each (fg,bg) pair gets a 256-entry map from
 //! FreeType coverage to the sRGB coverage that makes the existing SIMD lerp
 //! produce light-correct compositing. Built once per pair, cached for the life
-//! of the App.
+//! of the App. Opt-in (`alpha-blending = linear`); native blending skips
+//! this module entirely.
 
 const std = @import("std");
 
@@ -66,16 +67,17 @@ pub fn build(fg: u32, bg: u32) Gamma {
 pub const Cache = struct {
     const Entry = struct {
         key: u64 = 0,
+        valid: bool = false,
         gamma: Gamma = .{},
     };
-    entries: [32]Entry = undefined,
+    entries: [32]Entry = @splat(.{}),
 
     pub fn get(self: *Cache, fg: u32, bg: u32) *const Gamma {
         const key = (@as(u64, fg) << 32) | bg;
         const idx: usize = @intCast((key *% 0x9E3779B97F4A7C15) >> 59);
         const slot = &self.entries[idx];
-        if (slot.key == key) return &slot.gamma;
-        slot.* = .{ .key = key, .gamma = build(fg, bg) };
+        if (slot.valid and slot.key == key) return &slot.gamma;
+        slot.* = .{ .key = key, .valid = true, .gamma = build(fg, bg) };
         return &slot.gamma;
     }
 };
@@ -85,6 +87,13 @@ test "white on black brightens mid coverage" {
     try std.testing.expect(g.gray[0] == 0);
     try std.testing.expect(g.gray[255] == 255);
     try std.testing.expect(g.gray[128] > 128);
+}
+
+test "cache never serves an unbuilt slot" {
+    var cache: Cache = .{};
+    // fg=bg=0 hashes to key 0, which an empty slot must not match.
+    const g = cache.get(0, 0);
+    for (0..256) |i| try std.testing.expectEqual(@as(u8, @intCast(i)), g.gray[i]);
 }
 
 test "identical colors are identity" {

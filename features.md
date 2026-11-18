@@ -28,6 +28,7 @@ A list of what zinc does.
 * **Font fallbacks.** Auto-discovers fonts on your system with fallback for Nerd Font icons, CJK characters, and emoji.
 * **Clean box drawing.** Box drawing characters and block elements align with zero pixel gaps between cells.
 * **Underline styles and colors.** Supports curly, dotted, and dashed underlines, 24-bit TrueColor, and separate underline colors.
+* **Text rendering options.** Optional subpixel antialiasing (`font-subpixel`, opaque windows only) and gamma-correct blending (`alpha-blending = linear`). Both are off by default.
 * **Keycap emoji.** Renders compound keycap symbols (like `1️⃣`) as a unit without splitting them across lines.
 
 ## Scrollback and reflow
@@ -44,4 +45,5 @@ A list of what zinc does.
 ## Configuration
 
 * **Config file.** Settings live in `~/.config/zinc/config` with simple `key = value` lines. Zinc creates it on first launch.
+* **Live reload.** Saving the config applies colors, cursor, animation, padding, font size and text rendering right away. Shell, font family and decorations need a new window.
 * **Install and uninstall.** `zig build -Doptimize=ReleaseSafe --prefix ~/.local` installs it. `zig build uninstall --prefix ~/.local` removes it.

@@ -109,7 +109,11 @@ pub const Config = struct {
     custom_boxes: bool = true,
     wide_chars: bool = true,
     font_bleed: bool = true,
-    font_subpixel: bool = true,
+    /// LCD subpixel AA. Off by default and forced off on translucent
+    /// windows: the compositor blends RGB-split coverage into color fringes.
+    font_subpixel: bool = false,
+    /// Linear-light (gamma-correct) glyph blending. Off = native sRGB blend.
+    linear_blending: bool = false,
     font_zoom: bool = true,
 
     // Cursor / underline.

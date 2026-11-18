@@ -12,7 +12,7 @@ pub const RuntimeConfig = parser.RuntimeConfig;
 /// Checklist for a new key: parser arm + RuntimeConfig field + template
 /// entry + template test asserts + bump here. Guard tests below enforce
 /// everything except the bump itself.
-pub const CURRENT_CONFIG_VERSION: u32 = 6;
+pub const CURRENT_CONFIG_VERSION: u32 = 7;
 
 /// True when content predates CURRENT_CONFIG_VERSION (a missing or
 /// unparseable stamp counts as v0). Pure helper for headless tests.
@@ -38,7 +38,7 @@ pub const DEFAULT_CONFIG_TEMPLATE =
     \\# still require a new window.
     \\# When new settings ship, Zinc writes an updated reference file to
     \\# config.new next to this file without changing your config.
-    \\config-version = 6
+    \\config-version = 7
     \\
     \\# Shell
     \\# Command or binary to run, such as "fish" or "/bin/zsh".
@@ -58,8 +58,12 @@ pub const DEFAULT_CONFIG_TEMPLATE =
     \\# Font family name or TTF path. Leave empty to use system Nerd Fonts.
     \\font-family = ""
     \\font-size = 12.0
-    \\# LCD subpixel antialiasing (3x horizontal coverage). Disable on BGR panels.
-    \\font-subpixel = true
+    \\# Subpixel antialiasing: sharper text on RGB LCD panels. Only applies
+    \\# when background-opacity is 1.0, translucent windows get color fringes.
+    \\font-subpixel = false
+    \\# Text blending: native (default) or linear. Linear is gamma-correct and
+    \\# makes light text on dark backgrounds look brighter and bolder.
+    \\alpha-blending = native
     \\
     \\# Padding in pixels
     \\# Normal window padding.
@@ -252,6 +256,8 @@ test "default template parses valid config" {
 
     // Verify template defaults match current Zinc defaults 100%
     try std.testing.expectEqual(@as(?f32, 12.0), cfg.font_size);
+    try std.testing.expectEqual(@as(?bool, false), cfg.font_subpixel);
+    try std.testing.expectEqual(@as(?bool, false), cfg.linear_blending);
     try std.testing.expectEqual(@as(?u32, 25), cfg.pad_x);
     try std.testing.expectEqual(@as(?u32, 25), cfg.pad_y);
     try std.testing.expectEqual(@as(?u32, 0), cfg.alt_pad_x);
@@ -290,8 +296,9 @@ test "needsMigration stamps" {
     try std.testing.expect(needsMigration("config-version = 3\n"));
     try std.testing.expect(needsMigration("config-version = 4\n"));
     try std.testing.expect(needsMigration("config-version = 5\n"));
+    try std.testing.expect(needsMigration("config-version = 6\n"));
     try std.testing.expect(needsMigration("config-version = banana\n"));
-    try std.testing.expect(!needsMigration("config-version = 6\n"));
+    try std.testing.expect(!needsMigration("config-version = 7\n"));
     try std.testing.expect(!needsMigration("# c\nconfig_version = 99\n"));
     try std.testing.expect(!needsMigration(DEFAULT_CONFIG_TEMPLATE));
 }
@@ -344,7 +351,7 @@ test "outdated config writes config.new once, leaves config alone" {
     var nbuf: [8192]u8 = undefined;
     const nlen = H.readAll(tnew.ptr, &nbuf);
     try std.testing.expect(nlen > 0);
-    try std.testing.expect(std.mem.indexOf(u8, nbuf[0..nlen], "config-version = 6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, nbuf[0..nlen], "config-version = 7") != null);
     try std.testing.expect(std.mem.indexOf(u8, nbuf[0..nlen], "find-match-numbers") != null);
     try std.testing.expect(std.mem.indexOf(u8, nbuf[0..nlen], "cursor-glide") != null);
     try std.testing.expect(std.mem.indexOf(u8, nbuf[0..nlen], "window-width") != null);
@@ -380,19 +387,14 @@ test "template stamp matches CURRENT_CONFIG_VERSION" {
 
 test "template documents every supported key" {
     const keys = [_][]const u8{
-        "font-size",            "font-subpixel",         "font-family",            "padding-x",
-        "padding-y",             "alt-padding-x",           "alt-padding-y",
-        "decorations",           "background",              "foreground",
-        "selection-background",  "selection-foreground",    "cursor-color",
-        "link-color",            "background-opacity",      "cursor-style",
-        "cursor-blink",          "cursor-thickness",        "cursor-glide",
-        "cursor-glide-ms",       "cursor-overshoot",        "cursor-trail-ms",
-        "smooth-scroll",         "smooth-scroll-ms",        "scroll-step",
-        "selection-single-cell", "find-match-numbers",      "find-number-scale",
-        "editor-command",        "editor-command-terminal", "dir-cd-mod",
-        "dir-open-mod",          "dir-cd-ls",               "shell",
-        "login-shell",           "window-width",            "window-height",
-        "window-size",           "config-version",
+        "font-size",               "font-subpixel",         "alpha-blending",       "font-family",       "padding-x",
+        "padding-y",               "alt-padding-x",         "alt-padding-y",        "decorations",       "background",
+        "foreground",              "selection-background",  "selection-foreground", "cursor-color",      "link-color",
+        "background-opacity",      "cursor-style",          "cursor-blink",         "cursor-thickness",  "cursor-glide",
+        "cursor-glide-ms",         "cursor-overshoot",      "cursor-trail-ms",      "smooth-scroll",     "smooth-scroll-ms",
+        "scroll-step",             "selection-single-cell", "find-match-numbers",   "find-number-scale", "editor-command",
+        "editor-command-terminal", "dir-cd-mod",            "dir-open-mod",         "dir-cd-ls",         "shell",
+        "login-shell",             "window-width",          "window-height",        "window-size",       "config-version",
     };
     for (keys) |k| {
         try std.testing.expect(std.mem.indexOf(u8, DEFAULT_CONFIG_TEMPLATE, k) != null);

@@ -258,6 +258,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
         color_atlas: atlas_mod.ColorAtlas = .{},
         glyphs: std.AutoHashMap(u32, atlas_mod.Baked),
         gamma_cache: gamma_mod.Cache = .{},
+        /// alpha-blending = linear: route glyph blits through gamma_cache.
+        linear_blending: bool = cfg.linear_blending,
         cell_w: i32,
         cell_h: i32,
         ascent: i32,
@@ -586,7 +588,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 color_atlas = atlas_mod.ColorAtlas.init(gpa) catch atlas_mod.ColorAtlas{};
             }
             ft_face.emoji_enabled = cfg.emoji;
-            ft_face.subpixel = runtime_cfg.font_subpixel orelse cfg.font_subpixel;
+            ft_face.subpixel = wantSubpixel(&runtime_cfg);
             // ascii_only runes can't store CJK (setRune maps to '?'):
             // skip the ~16MB face entirely on that profile.
             ft_face.cjk_enabled = !cfg.ascii_only;
@@ -611,6 +613,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .alt_pad_x = runtime_cfg.alt_pad_x orelse cfg.alt_pad_x,
                 .alt_pad_y = runtime_cfg.alt_pad_y orelse cfg.alt_pad_y,
                 .bg_opacity = runtime_cfg.bg_opacity orelse cfg.bg_opacity,
+                .linear_blending = runtime_cfg.linear_blending orelse cfg.linear_blending,
                 .selection_bg = runtime_cfg.selection_bg orelse cfg.selection_bg,
                 .selection_fg = runtime_cfg.selection_fg orelse cfg.selection_fg,
                 .link_color = runtime_cfg.link_color orelse cfg.link_color,
@@ -1413,7 +1416,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     @intCast(x),
                     @as(i32, @intCast(y)) + self.ascent,
                     fg,
-                    &self.gamma_cache,
+                    self.gammaCache(),
                 )
             else
                 software.blitGlyph(
@@ -1431,7 +1434,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     @intCast(x),
                     @as(i32, @intCast(y)) + self.ascent,
                     fg,
-                    &self.gamma_cache,
+                    self.gammaCache(),
                 );
             dmgMerge(dmg, gdmg);
         }
@@ -1458,7 +1461,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                             x,
                             @as(i32, @intCast(y)) + self.ascent,
                             fg,
-                            &self.gamma_cache,
+                            self.gammaCache(),
                         )
                     else
                         software.blitGlyph(
@@ -1476,7 +1479,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                             x,
                             @as(i32, @intCast(y)) + self.ascent,
                             fg,
-                            &self.gamma_cache,
+                            self.gammaCache(),
                         );
                     dmgMerge(dmg, gdmg);
                 }
@@ -2557,8 +2560,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             var old = self.runtime_cfg;
             const geo_changed = old.font_size != next.font_size or
                 old.pad_x != next.pad_x or old.pad_y != next.pad_y or
-                old.alt_pad_x != next.alt_pad_x or old.alt_pad_y != next.alt_pad_y or
-                old.font_subpixel != next.font_subpixel;
+                old.alt_pad_x != next.alt_pad_x or old.alt_pad_y != next.alt_pad_y;
             self.runtime_cfg = next;
             old.deinit(self.gpa);
 
@@ -2589,14 +2591,34 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.pad_y = self.runtime_cfg.pad_y orelse cfg.pad_y;
             self.alt_pad_x = self.runtime_cfg.alt_pad_x orelse cfg.alt_pad_x;
             self.alt_pad_y = self.runtime_cfg.alt_pad_y orelse cfg.alt_pad_y;
+            self.linear_blending = self.runtime_cfg.linear_blending orelse cfg.linear_blending;
+
+            // Subpixel flips with font-subpixel or background-opacity; baked
+            // glyphs carry their coverage format, so drop them on a change.
+            const subpixel = wantSubpixel(&self.runtime_cfg);
+            if (subpixel != self.ft_face.subpixel) {
+                self.ft_face.subpixel = subpixel;
+                self.atlas.clear();
+                self.glyphs.clearRetainingCapacity();
+            }
 
             if (geo_changed) {
-                self.ft_face.subpixel = self.runtime_cfg.font_subpixel orelse cfg.font_subpixel;
                 const pt = self.runtime_cfg.font_size orelse cfg.font_default_size;
                 self.setFontSize(pt);
             }
             self.ctx.grid.markAllDirty();
             self.needs_render = true;
+        }
+
+        /// LCD subpixel only on fully opaque windows: on a translucent
+        /// surface the compositor blends the RGB split into color fringes.
+        fn wantSubpixel(rc: *const config_loader.RuntimeConfig) bool {
+            const opacity = rc.bg_opacity orelse cfg.bg_opacity;
+            return (rc.font_subpixel orelse cfg.font_subpixel) and opacity == 0xFF;
+        }
+
+        fn gammaCache(self: *Self) ?*gamma_mod.Cache {
+            return if (self.linear_blending) &self.gamma_cache else null;
         }
 
         fn setFontSize(self: *Self, new_pt: f32) void {
