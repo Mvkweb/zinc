@@ -1273,7 +1273,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         pub fn setFocus(self: *Self, focused: bool) void {
             if (focused == self.focused) return;
             self.focused = focused;
-            if (self.focus_tracking) self.emit(if (focused) "\x1b[I" else "\x1b[O]");
+            if (self.focus_tracking) self.emit(if (focused) "\x1b[I" else "\x1b[O");
         }
 
         /// Intern a URI, returning its 1-based link id (0 = none).
@@ -3660,4 +3660,34 @@ test "resize clears active prompt rows when in_prompt" {
 
     // Active prompt row should be cleared to blank default cells
     try std.testing.expect(ctx.grid.at(0, ctx.cursor_row).rune == 0 or ctx.grid.at(0, ctx.cursor_row).rune == ' ');
+}
+
+test "focus tracking reports exact CSI I and CSI O sequences" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+
+    const Sink = struct {
+        buf: [32]u8 = undefined,
+        len: usize = 0,
+        fn cb(user: ?*anyopaque, data: []const u8) void {
+            const self: *@This() = @ptrCast(@alignCast(user));
+            const n = @min(data.len, self.buf.len - self.len);
+            @memcpy(self.buf[self.len..][0..n], data[0..n]);
+            self.len += n;
+        }
+    };
+    var sink = Sink{};
+    ctx.onWrite(Sink.cb, &sink);
+
+    // Apps must explicitly enable DECSET 1004 before focus reports are sent.
+    ctx.setFocus(true);
+    try std.testing.expectEqual(@as(usize, 0), sink.len);
+
+    ctx.parse("\x1b[?1004h");
+    ctx.setFocus(false);
+    try std.testing.expectEqualStrings("\x1b[O", sink.buf[0..sink.len]);
+
+    sink.len = 0;
+    ctx.setFocus(true);
+    try std.testing.expectEqualStrings("\x1b[I", sink.buf[0..sink.len]);
 }

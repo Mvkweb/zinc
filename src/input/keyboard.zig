@@ -70,9 +70,10 @@ pub fn encode(key: Key, mods: Mods, kitty_mode: bool, cursor_app: bool, out: []u
             return std.fmt.bufPrint(out, "\x1b[27;{d}u", .{m}) catch out[0..0];
         },
         .backspace => {
-            // Ctrl+BS erases a word (fish binds ESC DEL like Alt+BS);
-            // plain ^H has no default word binding anywhere. Ctrl+Alt
-            // keeps the old ^H-with-prefix form.
+            // Ctrl+BS erases a word as ESC DEL (readline, zle and fish all
+            // bind it). No CSI u here: we answer the kitty keyboard query
+            // with flags 0, so legacy apps would get a sequence they never
+            // asked for. Ctrl+Alt keeps the ^H-with-prefix form.
             const base: u8 = if (mods.ctrl and mods.alt) 0x08 else 0x7f;
             if (mods.alt or mods.ctrl) {
                 if (out.len < 2) return out[0..0];
@@ -158,12 +159,18 @@ test "arrows encode" {
     var buf: [8]u8 = undefined;
     try std.testing.expectEqualSlices(u8, "\x1b[A", encode(.up, .{}, false, false, &buf));
     try std.testing.expectEqualSlices(u8, "\x1b[3~", encode(.delete, .{}, false, false, &buf));
+    // Home/End are CSI in normal cursor mode (xterm-compatible), SS3 in
+    // application cursor mode (matches xterm-256color terminfo khome/kend).
+    try std.testing.expectEqualSlices(u8, "\x1b[H", encode(.home, .{}, false, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[F", encode(.end, .{}, false, false, &buf));
     // DECCKM: unmodified arrows/home/end go SS3; modified stay CSI.
     try std.testing.expectEqualSlices(u8, "\x1bOA", encode(.up, .{}, false, true, &buf));
     try std.testing.expectEqualSlices(u8, "\x1bOH", encode(.home, .{}, false, true, &buf));
     try std.testing.expectEqualSlices(u8, "\x1bOF", encode(.end, .{}, false, true, &buf));
     const ctrl = Mods{ .ctrl = true };
     try std.testing.expectEqualSlices(u8, "\x1b[1;5D", encode(.left, ctrl, false, true, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[1;5H", encode(.home, ctrl, false, true, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[1;5F", encode(.end, ctrl, false, true, &buf));
 }
 
 test "modified keys encode" {
