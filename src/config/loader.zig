@@ -34,7 +34,8 @@ pub fn needsMigration(content: []const u8) bool {
 
 pub const DEFAULT_CONFIG_TEMPLATE =
     \\# Zinc configuration
-    \\# Changes take effect when you open a new window.
+    \\# Changes take effect immediately. Shell, font family and decorations
+    \\# still require a new window.
     \\# When new settings ship, Zinc writes an updated reference file to
     \\# config.new next to this file without changing your config.
     \\config-version = 6
@@ -135,27 +136,27 @@ pub const DEFAULT_CONFIG_TEMPLATE =
     \\
 ;
 
-pub fn loadOrCreate(gpa: std.mem.Allocator) RuntimeConfig {
-    var dir_buf: [512:0]u8 = undefined;
-
-    var dir_path: [:0]const u8 = "";
+/// Resolve the zinc config directory into `out`. Shared by the loader and the
+/// live-reload watcher so both watch/read the exact same location.
+pub fn resolveDir(out: *[512:0]u8) ?[:0]const u8 {
     if (std.c.getenv("XDG_CONFIG_HOME")) |xdg| {
         const xdg_s = std.mem.span(xdg);
         if (xdg_s.len > 0) {
-            dir_path = std.mem.printSentinel(&dir_buf, "{s}/zinc", .{xdg_s}, 0) catch return RuntimeConfig{};
+            return std.mem.printSentinel(out, "{s}/zinc", .{xdg_s}, 0) catch null;
         }
     }
-
-    if (dir_path.len == 0) {
-        if (std.c.getenv("HOME")) |home| {
-            const home_s = std.mem.span(home);
-            if (home_s.len > 0) {
-                dir_path = std.mem.printSentinel(&dir_buf, "{s}/.config/zinc", .{home_s}, 0) catch return RuntimeConfig{};
-            }
+    if (std.c.getenv("HOME")) |home| {
+        const home_s = std.mem.span(home);
+        if (home_s.len > 0) {
+            return std.mem.printSentinel(out, "{s}/.config/zinc", .{home_s}, 0) catch null;
         }
     }
+    return null;
+}
 
-    if (dir_path.len == 0) return RuntimeConfig{};
+pub fn loadOrCreate(gpa: std.mem.Allocator) RuntimeConfig {
+    var dir_buf: [512:0]u8 = undefined;
+    const dir_path = resolveDir(&dir_buf) orelse return RuntimeConfig{};
     return loadOrCreateAt(gpa, dir_path);
 }
 

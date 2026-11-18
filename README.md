@@ -23,7 +23,8 @@ Full breakdown in [features.md](features.md).
 
 ```ini
 # Zinc configuration
-# Changes take effect when you open a new window.
+# Changes take effect immediately. Shell, font family and decorations still
+# require a new window.
 # When new settings ship, Zinc writes an updated reference file to
 # config.new next to this file without changing your config.
 config-version = 6
