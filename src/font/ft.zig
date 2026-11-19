@@ -382,6 +382,11 @@ pub const Face = struct {
     emoji_face: ?c.FT_Face = null,
     emoji_tried: bool = false,
     emoji_enabled: bool = true,
+    /// LCD subpixel antialiasing (3x horizontal coverage). The backend
+    /// only enables it on opaque windows.
+    subpixel: bool = false,
+    /// Prefer the Nerd fallback face for box-drawing and PUA glyphs.
+    nerd_symbols: bool = false,
     /// CJK face, lazy-loaded on first CJK bake (~16MB/weight, never at
     /// startup). Null = absent or unwanted; cjk_enabled=false (ascii_only
     /// profile) skips loading entirely.
@@ -459,6 +464,7 @@ pub const Face = struct {
         var lib: c.FT_Library = undefined;
         if (c.FT_Init_FreeType(&lib) != 0) return error.InitFailed;
         errdefer _ = c.FT_Done_FreeType(lib);
+        _ = c.FT_Library_SetLcdFilter(lib, c.FT_LCD_FILTER_DEFAULT);
 
         var primary: ?Face = null;
         var ppath_buf: [1024]u8 = undefined;
@@ -1240,6 +1246,12 @@ pub const Face = struct {
         _ = c.FT_Done_FreeType(self.lib);
     }
 
+    /// Glyph classes whose members must share one face. Mixed faces give
+    /// adjacent characters different bearings and baseline offsets.
+    fn singleFaceGlyph(cp: u21) bool {
+        return (cp >= 0x2500 and cp <= 0x257F) or (cp >= 0xE000 and cp <= 0xF8FF);
+    }
+
     /// Bake one codepoint+style into the atlas. Style face first, then
     /// regular, then fallback faces (char index 0 = missing everywhere).
     /// Returns blank metrics instead of .notdef for missing glyphs.
@@ -1269,10 +1281,20 @@ pub const Face = struct {
         }
         var target: ?c.FT_Face = null;
         var slot_n: u3 = 0;
-        if (style_face) |f| {
-            if (cp == 0 or c.FT_Get_Char_Index(f, @intCast(cp)) != 0) {
-                target = f;
-                slot_n = 0;
+        if (self.nerd_symbols and singleFaceGlyph(cp)) {
+            if (self.ensureFallback(0)) |nerd| {
+                if (c.FT_Get_Char_Index(nerd, @intCast(cp)) != 0) {
+                    target = nerd;
+                    slot_n = 1;
+                }
+            }
+        }
+        if (target == null) {
+            if (style_face) |f| {
+                if (cp == 0 or c.FT_Get_Char_Index(f, @intCast(cp)) != 0) {
+                    target = f;
+                    slot_n = 0;
+                }
             }
         }
         if (target == null and (style_face == null or style_face.? != self.face)) {
@@ -1333,13 +1355,16 @@ pub const Face = struct {
         if (want_ital and !real_ital) matrix.xy = 14438; // ~0.22 slant
         c.FT_Set_Transform(t, &matrix, null);
 
-        if (c.FT_Load_Char(t, @intCast(cp), 0) != 0) return error.RenderFailed;
+        const load_flags: i32 = if (self.subpixel) c.FT_LOAD_TARGET_LCD else 0;
+        if (c.FT_Load_Char(t, @intCast(cp), load_flags) != 0) return error.RenderFailed;
         const slot = t.*.glyph;
         if (want_bold and !real_bold) c.FT_GlyphSlot_Embolden(slot);
-        if (c.FT_Render_Glyph(slot, 0) != 0) return error.RenderFailed; // NORMAL
+        const render_mode: c.FT_Render_Mode = if (self.subpixel) c.FT_RENDER_MODE_LCD else c.FT_RENDER_MODE_NORMAL;
+        if (c.FT_Render_Glyph(slot, render_mode) != 0) return error.RenderFailed;
 
         const bmp = slot.*.bitmap;
-        if (bmp.pixel_mode != 2 and bmp.pixel_mode != 1) return error.RenderFailed; // GRAY or MONO
+        const lcd = bmp.pixel_mode == c.FT_PIXEL_MODE_LCD;
+        if (bmp.pixel_mode != 2 and bmp.pixel_mode != 1 and !lcd) return error.RenderFailed;
         const w: u16 = @intCast(bmp.width);
         const h: u16 = @intCast(bmp.rows);
         if (w == 0 or h == 0) {
@@ -1360,15 +1385,17 @@ pub const Face = struct {
         copyBitmap(atlas, pos.x, pos.y, &bmp);
 
         const adv: i64 = slot.*.advance.x >> 6;
+        const pix_w: u16 = if (lcd) w / 3 else w;
         return .{
             .x = pos.x,
             .y = pos.y,
-            .w = @intCast(@min(w, 255)),
+            .w = @intCast(@min(pix_w, 255)),
             .h = @intCast(@min(h, 255)),
             .xoff = @intCast(@max(-128, @min(127, slot.*.bitmap_left))),
             .yoff = @intCast(@max(-128, @min(127, slot.*.bitmap_top))),
             .advance = @intCast(@max(0, @min(adv, 255))),
             .font_slot = slot_n,
+            .lcd = lcd,
         };
     }
 
@@ -1483,8 +1510,8 @@ fn copyBitmap(atlas: *atlas_mod.Atlas, dx: u16, dy: u16, bmp: anytype) void {
     const w: usize = @intCast(bmp.width);
     const h: usize = @intCast(bmp.rows);
     const pitch: isize = bmp.pitch;
-    if (bmp.pixel_mode == 2) {
-        // 8-bit grayscale; pitch may be negative.
+    if (bmp.pixel_mode == 2 or bmp.pixel_mode == c.FT_PIXEL_MODE_LCD) {
+        // 8-bit grayscale or LCD triplets; pitch may be negative.
         var row: usize = 0;
         while (row < h) : (row += 1) {
             const off: usize = if (pitch >= 0)
@@ -1608,6 +1635,24 @@ test "fontconfig sort fallbacks" {
     var lens: [4]usize = .{ 0, 0, 0, 0 };
     const n = fc.sortFallbacks("monospace", "", &paths, &lens);
     _ = n;
+}
+
+test "bake produces LCD coverage when subpixel enabled" {
+    defer fc.deinit();
+    var buf: [1024]u8 = undefined;
+    const m = fc.match("monospace", null, null, true, &buf) orelse return;
+    var lib: c.FT_Library = undefined;
+    if (c.FT_Init_FreeType(&lib) != 0) return;
+    defer _ = c.FT_Done_FreeType(lib);
+    _ = c.FT_Library_SetLcdFilter(lib, c.FT_LCD_FILTER_DEFAULT);
+    var face = Face.tryFace(lib, 16, m.path) orelse return;
+    defer _ = c.FT_Done_Face(face.face);
+    face.subpixel = true;
+    var atlas = try atlas_mod.Atlas.init(std.testing.allocator, 512);
+    defer atlas.deinit(std.testing.allocator);
+    const b = face.bake(&atlas, null, 'a', .regular) catch return error.Fail;
+    try std.testing.expect(b.lcd);
+    try std.testing.expect(b.w > 0);
 }
 
 test "Face setPixelSize scaling" {

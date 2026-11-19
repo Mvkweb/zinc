@@ -202,7 +202,7 @@ pub fn main(init: std.process.Init) !void {
             const y: i32 = @intCast((i / cols) * CH);
             const gx: u16 = @intCast(@as(u32, g) * GW);
             refBlitGlyph(a, W, H, atlas, ATLAS_W, gx, 0, GW, GH, -1, 13, x - 3, y + 13, fg);
-            _ = software.blitGlyph(b, W, H, atlas, ATLAS_W, gx, 0, GW, GH, -1, 13, x - 3, y + 13, fg);
+            _ = software.blitGlyph(b, W, H, atlas, ATLAS_W, gx, 0, GW, GH, -1, 13, x - 3, y + 13, fg, null);
         }
         if (!std.mem.eql(u32, a, b)) {
             std.debug.print("MISMATCH: new blitGlyph differs from baseline\n", .{});
@@ -232,7 +232,7 @@ pub fn main(init: std.process.Init) !void {
                     if (use_ref) {
                         refBlitGlyph(a, W, H, atlas, ATLAS_W, gx, 0, GW, GH, -1, 13, x, y + 13, fg);
                     } else {
-                        _ = software.blitGlyph(a, W, H, atlas, ATLAS_W, gx, 0, GW, GH, -1, 13, x, y + 13, fg);
+                        _ = software.blitGlyph(a, W, H, atlas, ATLAS_W, gx, 0, GW, GH, -1, 13, x, y + 13, fg, null);
                     }
                 }
                 std.mem.doNotOptimizeAway(a[W * H / 2]);

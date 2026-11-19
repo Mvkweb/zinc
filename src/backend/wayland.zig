@@ -157,6 +157,7 @@ const mouse_mod = @import("../input/mouse.zig");
 const hyperlink_mod = @import("../term/hyperlink.zig");
 const cell_mod = @import("../term/cell.zig");
 const software = @import("../render/software.zig");
+const gamma_mod = @import("../render/gamma.zig");
 const box_drawing = @import("../render/box_drawing.zig");
 const flow_mod = @import("../render/flow.zig");
 const scrollbar_mod = @import("../render/scrollbar.zig");
@@ -256,6 +257,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// Twin RGBA store for color emoji (empty unless cfg.emoji).
         color_atlas: atlas_mod.ColorAtlas = .{},
         glyphs: std.AutoHashMap(u32, atlas_mod.Baked),
+        gamma_cache: gamma_mod.Cache = .{},
+        /// alpha-blending = linear: route glyph blits through gamma_cache.
+        linear_blending: bool = cfg.linear_blending,
         cell_w: i32,
         cell_h: i32,
         ascent: i32,
@@ -584,6 +588,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 color_atlas = atlas_mod.ColorAtlas.init(gpa) catch atlas_mod.ColorAtlas{};
             }
             ft_face.emoji_enabled = cfg.emoji;
+            ft_face.subpixel = wantSubpixel(&runtime_cfg);
+            ft_face.nerd_symbols = runtime_cfg.font_nerd_symbols orelse cfg.font_nerd_symbols;
             // ascii_only runes can't store CJK (setRune maps to '?'):
             // skip the ~16MB face entirely on that profile.
             ft_face.cjk_enabled = !cfg.ascii_only;
@@ -608,6 +614,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .alt_pad_x = runtime_cfg.alt_pad_x orelse cfg.alt_pad_x,
                 .alt_pad_y = runtime_cfg.alt_pad_y orelse cfg.alt_pad_y,
                 .bg_opacity = runtime_cfg.bg_opacity orelse cfg.bg_opacity,
+                .linear_blending = runtime_cfg.linear_blending orelse cfg.linear_blending,
                 .selection_bg = runtime_cfg.selection_bg orelse cfg.selection_bg,
                 .selection_fg = runtime_cfg.selection_fg orelse cfg.selection_fg,
                 .link_color = runtime_cfg.link_color orelse cfg.link_color,
@@ -1394,22 +1401,42 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 dmgMerge(dmg, gdmg);
                 return;
             }
-            const gdmg = software.blitGlyph(
-                self.pool_pixels,
-                W,
-                H,
-                self.atlas.pixels,
-                self.atlas.size,
-                g.x,
-                g.y,
-                g.w,
-                g.h,
-                g.xoff,
-                g.yoff,
-                @intCast(x),
-                @as(i32, @intCast(y)) + self.ascent,
-                fg,
-            );
+            const gdmg = if (g.lcd)
+                software.blitLcdGlyph(
+                    self.pool_pixels,
+                    W,
+                    H,
+                    self.atlas.pixels,
+                    self.atlas.size,
+                    g.x,
+                    g.y,
+                    g.w,
+                    g.h,
+                    g.xoff,
+                    g.yoff,
+                    @intCast(x),
+                    @as(i32, @intCast(y)) + self.ascent,
+                    fg,
+                    self.gammaCache(),
+                )
+            else
+                software.blitGlyph(
+                    self.pool_pixels,
+                    W,
+                    H,
+                    self.atlas.pixels,
+                    self.atlas.size,
+                    g.x,
+                    g.y,
+                    g.w,
+                    g.h,
+                    g.xoff,
+                    g.yoff,
+                    @intCast(x),
+                    @as(i32, @intCast(y)) + self.ascent,
+                    fg,
+                    self.gammaCache(),
+                );
             dmgMerge(dmg, gdmg);
         }
 
@@ -1419,22 +1446,42 @@ pub fn App(comptime cfg: config_mod.Config) type {
             for (text) |b| {
                 const cp: u21 = b; // bar strings are ASCII-only by construction
                 if (self.glyphFor(cp, .regular)) |g| {
-                    const gdmg = software.blitGlyph(
-                        self.pool_pixels,
-                        W,
-                        H,
-                        self.atlas.pixels,
-                        self.atlas.size,
-                        g.x,
-                        g.y,
-                        g.w,
-                        g.h,
-                        g.xoff,
-                        g.yoff,
-                        x,
-                        @as(i32, @intCast(y)) + self.ascent,
-                        fg,
-                    );
+                    const gdmg = if (g.lcd)
+                        software.blitLcdGlyph(
+                            self.pool_pixels,
+                            W,
+                            H,
+                            self.atlas.pixels,
+                            self.atlas.size,
+                            g.x,
+                            g.y,
+                            g.w,
+                            g.h,
+                            g.xoff,
+                            g.yoff,
+                            x,
+                            @as(i32, @intCast(y)) + self.ascent,
+                            fg,
+                            self.gammaCache(),
+                        )
+                    else
+                        software.blitGlyph(
+                            self.pool_pixels,
+                            W,
+                            H,
+                            self.atlas.pixels,
+                            self.atlas.size,
+                            g.x,
+                            g.y,
+                            g.w,
+                            g.h,
+                            g.xoff,
+                            g.yoff,
+                            x,
+                            @as(i32, @intCast(y)) + self.ascent,
+                            fg,
+                            self.gammaCache(),
+                        );
                     dmgMerge(dmg, gdmg);
                 }
                 x += cw;
@@ -2545,6 +2592,23 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.pad_y = self.runtime_cfg.pad_y orelse cfg.pad_y;
             self.alt_pad_x = self.runtime_cfg.alt_pad_x orelse cfg.alt_pad_x;
             self.alt_pad_y = self.runtime_cfg.alt_pad_y orelse cfg.alt_pad_y;
+            self.linear_blending = self.runtime_cfg.linear_blending orelse cfg.linear_blending;
+
+            // Subpixel flips with font-subpixel or background-opacity; baked
+            // glyphs carry their coverage format, so drop them on a change.
+            const subpixel = wantSubpixel(&self.runtime_cfg);
+            if (subpixel != self.ft_face.subpixel) {
+                self.ft_face.subpixel = subpixel;
+                self.atlas.clear();
+                self.glyphs.clearRetainingCapacity();
+            }
+
+            const nerd_symbols = self.runtime_cfg.font_nerd_symbols orelse cfg.font_nerd_symbols;
+            if (nerd_symbols != self.ft_face.nerd_symbols) {
+                self.ft_face.nerd_symbols = nerd_symbols;
+                self.atlas.clear();
+                self.glyphs.clearRetainingCapacity();
+            }
 
             if (geo_changed) {
                 const pt = self.runtime_cfg.font_size orelse cfg.font_default_size;
@@ -2552,6 +2616,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             self.ctx.grid.markAllDirty();
             self.needs_render = true;
+        }
+
+        /// LCD subpixel only on fully opaque windows: on a translucent
+        /// surface the compositor blends the RGB split into color fringes.
+        fn wantSubpixel(rc: *const config_loader.RuntimeConfig) bool {
+            const opacity = rc.bg_opacity orelse cfg.bg_opacity;
+            return (rc.font_subpixel orelse cfg.font_subpixel) and opacity == 0xFF;
+        }
+
+        fn gammaCache(self: *Self) ?*gamma_mod.Cache {
+            return if (self.linear_blending) &self.gamma_cache else null;
         }
 
         fn setFontSize(self: *Self, new_pt: f32) void {

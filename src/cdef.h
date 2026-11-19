@@ -7,6 +7,7 @@
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include <freetype/ftsynth.h>
+#include <freetype/ftlcdfil.h>
 #include <freetype/tttables.h>
 
 // Fontconfig for font discovery and ranking.
