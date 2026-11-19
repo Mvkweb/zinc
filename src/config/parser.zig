@@ -10,6 +10,7 @@ pub const DecorationMode = config_mod.DecorationMode;
 pub const RuntimeConfig = struct {
     font_size: ?f32 = null,
     font_subpixel: ?bool = null,
+    font_nerd_symbols: ?bool = null,
     linear_blending: ?bool = null,
     font_family: ?[]const u8 = null,
     shell: ?[]const u8 = null,
@@ -171,6 +172,8 @@ pub fn parse(content: []const u8, cfg: *RuntimeConfig, gpa: std.mem.Allocator) v
             } else |_| {}
         } else if (std.ascii.eqlIgnoreCase(key, "font-subpixel") or std.ascii.eqlIgnoreCase(key, "font_subpixel")) {
             if (parseBool(val)) |b| cfg.font_subpixel = b;
+        } else if (std.ascii.eqlIgnoreCase(key, "font-nerd-symbols") or std.ascii.eqlIgnoreCase(key, "font_nerd_symbols")) {
+            if (parseBool(val)) |b| cfg.font_nerd_symbols = b;
         } else if (std.ascii.eqlIgnoreCase(key, "alpha-blending") or std.ascii.eqlIgnoreCase(key, "alpha_blending")) {
             const mode = trimQuotes(val);
             if (std.ascii.eqlIgnoreCase(mode, "linear")) {
@@ -365,6 +368,7 @@ test "parse complete config content" {
         \\font-size = 14.5
         \\font-subpixel = false
         \\alpha-blending = linear
+        \\font-nerd-symbols = true
         \\font-family = "JetBrainsMono Nerd Font"
         \\padding-x = 30
         \\padding-y = 20
@@ -401,6 +405,7 @@ test "parse complete config content" {
 
     try std.testing.expectEqual(@as(?f32, 14.5), cfg.font_size);
     try std.testing.expectEqual(@as(?bool, false), cfg.font_subpixel);
+    try std.testing.expectEqual(@as(?bool, true), cfg.font_nerd_symbols);
     try std.testing.expectEqual(@as(?bool, true), cfg.linear_blending);
     try std.testing.expectEqualStrings("JetBrainsMono Nerd Font", cfg.font_family.?);
     try std.testing.expectEqual(@as(?u32, 30), cfg.pad_x);

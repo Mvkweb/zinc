@@ -589,6 +589,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             ft_face.emoji_enabled = cfg.emoji;
             ft_face.subpixel = wantSubpixel(&runtime_cfg);
+            ft_face.nerd_symbols = runtime_cfg.font_nerd_symbols orelse cfg.font_nerd_symbols;
             // ascii_only runes can't store CJK (setRune maps to '?'):
             // skip the ~16MB face entirely on that profile.
             ft_face.cjk_enabled = !cfg.ascii_only;
@@ -2598,6 +2599,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const subpixel = wantSubpixel(&self.runtime_cfg);
             if (subpixel != self.ft_face.subpixel) {
                 self.ft_face.subpixel = subpixel;
+                self.atlas.clear();
+                self.glyphs.clearRetainingCapacity();
+            }
+
+            const nerd_symbols = self.runtime_cfg.font_nerd_symbols orelse cfg.font_nerd_symbols;
+            if (nerd_symbols != self.ft_face.nerd_symbols) {
+                self.ft_face.nerd_symbols = nerd_symbols;
                 self.atlas.clear();
                 self.glyphs.clearRetainingCapacity();
             }

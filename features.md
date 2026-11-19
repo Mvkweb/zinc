@@ -29,6 +29,7 @@ A list of what zinc does.
 * **Clean box drawing.** Box drawing characters and block elements align with zero pixel gaps between cells.
 * **Underline styles and colors.** Supports curly, dotted, and dashed underlines, 24-bit TrueColor, and separate underline colors.
 * **Text rendering options.** Optional subpixel antialiasing (`font-subpixel`, opaque windows only) and gamma-correct blending (`alpha-blending = linear`). Both are off by default.
+* **Consistent box glyphs.** `font-nerd-symbols = true` draws box-drawing lines and private-use icons with the Nerd Font fallback face, so adjacent cells align and borders have no seams. Off by default.
 * **Keycap emoji.** Renders compound keycap symbols (like `1️⃣`) as a unit without splitting them across lines.
 
 ## Scrollback and reflow

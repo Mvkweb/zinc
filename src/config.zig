@@ -112,6 +112,10 @@ pub const Config = struct {
     /// LCD subpixel AA. Off by default and forced off on translucent
     /// windows: the compositor blends RGB-split coverage into color fringes.
     font_subpixel: bool = false,
+    /// Prefer the Nerd Font fallback face for box-drawing (U+2500..U+257F)
+    /// and private-use glyphs, so borders and icons share one face. No
+    /// effect when the primary font is already a Nerd Font (fallback skips).
+    font_nerd_symbols: bool = false,
     /// Linear-light (gamma-correct) glyph blending. Off = native sRGB blend.
     linear_blending: bool = false,
     font_zoom: bool = true,
