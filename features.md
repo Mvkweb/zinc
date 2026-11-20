@@ -16,6 +16,7 @@ A list of what zinc does.
 ## Clicks and interaction
 
 * **Smart text selection.** Double-click selects words, file paths, or URLs across wrapped lines. Triple-click selects the full line.
+* **Column selection.** Hold `Alt` and drag to select a rectangle: only the cells between the start and end columns are highlighted and copied on each row, never the whole line. `Alt` bypasses app mouse tracking, and pressing it mid-drag switches the active selection to rectangle mode. `Alt+double-click` / `Alt+triple-click` keep the word/line columns as a rectangle.
 * **Clickable links and paths.** `Ctrl + Click` opens URLs in your browser and files in your editor. `Ctrl + Click` on a folder runs `cd` into it. `Shift + Click` on a folder opens your file manager.
 * **Mouse tracking.** Supports mouse events in apps like tmux and htop. Hold `Shift` to bypass tracking and select text directly.
 * **In-terminal search.** Press `Ctrl + Shift + F` to search through the screen and scrollback history.
