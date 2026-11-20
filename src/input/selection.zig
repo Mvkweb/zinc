@@ -7,6 +7,8 @@ pub const Mode = enum {
     cell,
     word,
     line,
+    /// Alt+drag: a rectangle clipped to the same columns on every row.
+    column,
 };
 
 pub const CharClass = enum(u2) {
@@ -209,6 +211,31 @@ pub const Selection = struct {
         };
     }
 
+    /// Start a rectangular selection. Motion uses the plain `update`:
+    /// unlike cell mode, every row stays inside the anchor/focus columns.
+    pub fn beginColumn(self: *Selection, col: u16, row: u16) void {
+        self.* = .{
+            .active = true,
+            .mode = .column,
+            .anchor_col = col,
+            .anchor_row = row,
+            .focus_col = col,
+            .focus_row = row,
+            .init_start_col = col,
+            .init_start_row = row,
+            .init_end_col = col,
+            .init_end_row = row,
+        };
+    }
+
+    /// Reuse an existing selection's bounds as a rectangle. O(1), no
+    /// re-sampling: word/line spans and cell drags already carry the
+    /// columns that define the vertical slice.
+    pub fn makeColumn(self: *Selection) void {
+        if (!self.active or self.mode == .column) return;
+        self.mode = .column;
+    }
+
     pub fn beginWord(self: *Selection, span: Span) void {
         self.* = .{
             .active = true,
@@ -345,12 +372,29 @@ pub const Selection = struct {
         };
     }
 
+    /// Independent min/max bounds for rectangular selection: columns are
+    /// normalized even when the drag goes upward (cell mode ties the end
+    /// of the first/last row to drag direction, column mode does not).
+    fn columnBounds(self: *const Selection) struct { lo_col: u16, hi_col: u16, lo_row: usize, hi_row: usize } {
+        return .{
+            .lo_col = @min(self.anchor_col, self.focus_col),
+            .hi_col = @max(self.anchor_col, self.focus_col),
+            .lo_row = @min(self.anchor_row, self.focus_row),
+            .hi_row = @max(self.anchor_row, self.focus_row),
+        };
+    }
+
     /// True when (col, abs_row) is covered (inclusive both ends).
     /// Rows are absolute: callers map viewport rows via toAbs (out of
     /// range simply never intersects — evicted/resized content can't
     /// highlight or copy).
     pub fn contains(self: *const Selection, col: u16, abs_row: usize) bool {
         if (!self.active) return false;
+        if (self.mode == .column) {
+            const b = self.columnBounds();
+            return abs_row >= b.lo_row and abs_row <= b.hi_row and
+                col >= b.lo_col and col <= b.hi_col;
+        }
         var sc = self.anchor_col;
         var sr: usize = self.anchor_row;
         var ec = self.focus_col;
@@ -371,16 +415,25 @@ pub const Selection = struct {
     /// Extract selected text as owned UTF-8, or null when empty/inactive.
     /// Wrapped rows join without newlines; other row breaks emit '\n'
     /// (none trailing). Wide-char follower columns are skipped like the
-    /// renderer does; combining marks ride along. Rows are absolute, so
-    /// extraction is viewport-independent: scrolling mid-drag (or after
-    /// release) copies the same content, and evicted rows just clip.
+    /// renderer does; combining marks ride along. Column mode clips every
+    /// row to the same column span instead of expanding to row boundaries.
+    /// Rows are absolute, so extraction is viewport-independent: scrolling
+    /// mid-drag (or after release) copies the same content, and evicted rows
+    /// just clip.
     pub fn extract(self: *const Selection, gpa: std.mem.Allocator, grid: anytype) !?[]u8 {
         if (!self.active) return null;
+        const column_mode = self.mode == .column;
         var sc = self.anchor_col;
         var sr: usize = self.anchor_row;
         var ec = self.focus_col;
         var er: usize = self.focus_row;
-        if (sr > er or (sr == er and sc > ec)) {
+        if (column_mode) {
+            const b = self.columnBounds();
+            sc = b.lo_col;
+            sr = b.lo_row;
+            ec = b.hi_col;
+            er = b.hi_row;
+        } else if (sr > er or (sr == er and sc > ec)) {
             sc = self.focus_col;
             sr = self.focus_row;
             ec = self.anchor_col;
@@ -398,10 +451,15 @@ pub const Selection = struct {
         while (true) {
             const first = r == sr;
             const last = r == er;
-            const c0: usize = if (first) @min(@as(usize, sc), cols - 1) else 0;
-            const c1: usize = if (last) @min(@as(usize, ec), cols - 1) else cols - 1;
+            const c0: usize = if (column_mode or first) @min(@as(usize, sc), cols - 1) else 0;
+            const c1: usize = if (column_mode or last) @min(@as(usize, ec), cols - 1) else cols - 1;
             const row_start = out.items.len;
             var prev_wide = false;
+            if (c0 > 0) {
+                if (absCell(grid, r, @intCast(c0 - 1))) |prev| {
+                    prev_wide = utf8_mod.isWide(@intCast(prev.rune));
+                }
+            }
             var c: usize = c0;
             while (c <= c1) : (c += 1) {
                 const cell = absCell(grid, r, @intCast(c)) orelse break;
@@ -750,4 +808,45 @@ test "dragRowAt rides paint, identity at rest" {
     try std.testing.expectEqual(@as(u16, 0), dragRowAt(0, 1, 9, 24));
     try std.testing.expectEqual(@as(u16, 23), dragRowAt(23, 9, 1, 24));
     try std.testing.expectEqual(@as(u16, 7), dragRowAt(7, 0, 0, 0));
+}
+
+test "column selection clips every row to the column span" {
+    var s = Selection{};
+    s.beginColumn(5, 0);
+    s.update(2, 2);
+    try std.testing.expect(s.contains(2, 0));
+    try std.testing.expect(s.contains(5, 2));
+    try std.testing.expect(s.contains(4, 1));
+    try std.testing.expect(!s.contains(1, 1));
+    try std.testing.expect(!s.contains(6, 1));
+    try std.testing.expect(!s.contains(3, 3));
+
+    s.beginColumn(1, 2);
+    s.update(4, 0);
+    try std.testing.expect(s.contains(4, 2));
+    try std.testing.expect(s.contains(1, 0));
+    try std.testing.expect(!s.contains(5, 0));
+}
+
+test "column selection extracts a rectangle" {
+    const grid_mod = @import("../term/grid.zig");
+    const G = grid_mod.Grid(.{});
+    var g = try G.init(std.testing.allocator, 10, 3);
+    defer g.deinit();
+    for ("abcdefgh", 0..) |ch, i| g.at(@intCast(i), 0).setRune(ch);
+    for ("ABCDEFGH", 0..) |ch, i| g.at(@intCast(i), 1).setRune(ch);
+    for ("01234567", 0..) |ch, i| g.at(@intCast(i), 2).setRune(ch);
+
+    var s = Selection{};
+    s.beginColumn(5, 0);
+    s.update(2, 2);
+    const text = try s.extract(std.testing.allocator, &g) orelse return error.Fail;
+    defer std.testing.allocator.free(text);
+    try std.testing.expectEqualStrings("cdef\nCDEF\n2345", text);
+
+    s.beginColumn(2, 2);
+    s.update(5, 0);
+    const again = try s.extract(std.testing.allocator, &g) orelse return error.Fail;
+    defer std.testing.allocator.free(again);
+    try std.testing.expectEqualStrings(text, again);
 }
