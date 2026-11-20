@@ -4832,9 +4832,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     self.refreshCursor();
                 }
             }
-            // App-owned mouse reports to the PTY; Shift bypasses to local
+            // App-owned mouse reports to the PTY; Shift/Alt bypass to local
             // handling (foot parity: select/copy out of mouse apps).
-            if (self.ctx.mouse_mode != .off and !mods.shift) {
+            if (self.ctx.mouse_mode != .off and !mods.shift and !mods.alt) {
                 self.clearHover();
                 self.refreshCursor();
                 const want = switch (self.ctx.mouse_mode) {
@@ -4866,7 +4866,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 const erow = selection_mod.dragRowAt(cc.row, @min(self.ctx.grid.view_offset, sb), self.flow.viewEff(sb), self.ctx.grid.rows);
                 const abs_row: u16 = @intCast(selection_mod.Selection.toAbs(&self.ctx.grid, erow));
                 switch (self.sel.mode) {
-                    .cell => self.sel.update(cc.col, abs_row),
+                    .cell, .column => self.sel.update(cc.col, abs_row),
                     .word => self.sel.updateWordDrag(&self.ctx.grid, cc.col, erow),
                     .line => self.sel.updateLineDrag(&self.ctx.grid, erow),
                 }
@@ -4978,8 +4978,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // then flings the selection to the viewport edge.
             if (button == 0x110 and state == 0) self.sel_drag = false;
             // App-owned mouse reports to the PTY (DECSET 1000/1002/1003);
-            // Shift bypasses to local selection (foot parity).
-            if (self.ctx.mouse_mode != .off and !mods.shift) {
+            // Shift/Alt bypasses to local selection (foot parity).
+            if (self.ctx.mouse_mode != .off and !mods.shift and !mods.alt) {
                 const bit: u8 = switch (button) {
                     0x110 => 1,
                     0x111 => 2,
@@ -5026,6 +5026,21 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     if (cfg.copy_mode and self.copy_active and state == 1) self.exitCopyMode();
                     const cc = self.ptrCell(self.ptr_sx, self.ptr_sy);
                     if (state == 1) {
+                        // Multi-click detection (double-click word, triple-click line)
+                        const DOUBLE_CLICK_TIME_MS: u32 = 400;
+                        const is_multi_click = (time >= self.last_click_time) and
+                            (time - self.last_click_time <= DOUBLE_CLICK_TIME_MS) and
+                            (cc.col == self.last_click_col and cc.row == self.last_click_row);
+
+                        if (is_multi_click) {
+                            self.click_count = if (self.click_count >= 3) 1 else self.click_count + 1;
+                        } else {
+                            self.click_count = 1;
+                        }
+                        self.last_click_time = time;
+                        self.last_click_col = cc.col;
+                        self.last_click_row = cc.row;
+
                         if (mods.ctrl) {
                             if (self.linkUriAt(cc.col, cc.row)) |u| {
                                 defer self.gpa.free(u);
@@ -5060,21 +5075,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
                             }
                         }
 
-                        // Multi-click detection (double-click word, triple-click line)
-                        const DOUBLE_CLICK_TIME_MS: u32 = 400;
-                        const is_multi_click = (time >= self.last_click_time) and
-                            (time - self.last_click_time <= DOUBLE_CLICK_TIME_MS) and
-                            (cc.col == self.last_click_col and cc.row == self.last_click_row);
-
-                        if (is_multi_click) {
-                            self.click_count = if (self.click_count >= 3) 1 else self.click_count + 1;
-                        } else {
-                            self.click_count = 1;
-                        }
-                        self.last_click_time = time;
-                        self.last_click_col = cc.col;
-                        self.last_click_row = cc.row;
-
                         switch (self.click_count) {
                             2 => {
                                 const span = selection_mod.findWordSpan(&self.ctx.grid, cc.col, cc.row);
@@ -5088,12 +5088,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
                                 self.sel.begin(cc.col, @intCast(selection_mod.Selection.toAbs(&self.ctx.grid, cc.row)));
                             },
                         }
+                        if (mods.alt) self.sel.makeColumn();
                         self.sel_drag = true;
                         self.sel.beginExtend(self.flow.shown_off);
                         self.needs_render = true;
                     } else {
                         self.sel_drag = false;
-                        if (self.sel.mode == .cell and self.sel.anchor_col == self.sel.focus_col and self.sel.anchor_row == self.sel.focus_row) {
+                        if ((self.sel.mode == .cell or self.sel.mode == .column) and self.sel.anchor_col == self.sel.focus_col and self.sel.anchor_row == self.sel.focus_row) {
                             self.sel.clear();
                         } else if (self.sel.active) {
                             self.copyPrimary();
@@ -5535,7 +5536,23 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const self: *Self = @ptrCast(@alignCast(data));
             // group is depressed layout; latched/locked layouts track depressed here.
             const had_ctrl = self.ctrlHeld();
+            const had_alt = self.currentMods().alt;
             _ = xkb_state_update_mask(self.xkb_state, dep, lat, lock, group, group, group);
+            const now_alt = self.currentMods().alt;
+            if (cfg.selection and !had_alt and now_alt) {
+                if (self.sel.active) {
+                    self.sel.makeColumn();
+                    self.needs_render = true;
+                } else if (self.mouse_buttons & 1 != 0) {
+                    const cc = self.ptrCell(self.ptr_sx, self.ptr_sy);
+                    const sb = self.ctx.grid.sb_len;
+                    const erow = selection_mod.dragRowAt(cc.row, @min(self.ctx.grid.view_offset, sb), self.flow.viewEff(sb), self.ctx.grid.rows);
+                    self.sel.beginColumn(cc.col, @intCast(selection_mod.Selection.toAbs(&self.ctx.grid, erow)));
+                    self.sel_drag = true;
+                    self.sel.beginExtend(self.flow.shown_off);
+                    self.needs_render = true;
+                }
+            }
             // Modifier flip (Ctrl for links, Shift for mouse bypass): link underline
             // visibility and cursor shape may change even with the pointer parked.
             if (cfg.hyperlinks) {

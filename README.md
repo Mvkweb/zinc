@@ -14,6 +14,7 @@ Keep in mind this is still experimental and you will surely find issues. If you 
 - **Kitty graphics**: inline image previews for `yazi`, `chafa`, etc.
 - **Adaptive TUI padding**: pads your shell, but drops to 0px edge-to-edge in full-screen apps (`nvim`, `btop`, `yazi`).
 - **Smart click**: `Ctrl+click` files to open in your editor, `Ctrl+click` folders to `cd`.
+- **Smart selection**: double-click words/URLs, triple-click lines, and `Alt+drag` for a rectangular column of text.
 - **Lightweight**: memory footprint stays around ~23MB in a maximized window.
 
 Full breakdown in [features.md](features.md).
