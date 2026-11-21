@@ -121,6 +121,8 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// DECCKM cursor application mode (DECSET 1): arrows/home/end
         /// report as SS3 (ESC O x) for ncurses apps.
         decckm: bool = false,
+        /// Kitty keyboard progressive-enhancement flags (CSI =/> flags u).
+        kitty_kb: u8 = 0,
         /// DECSCUSR cursor style override (CSI Ps SP q, nvim mode shapes).
         /// Null = configured default. Blink overridden alongside.
         decscusr_style: ?config_mod.CursorStyle = null,
@@ -1026,7 +1028,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 },
                 .bel => {},
                 .esc_dispatch => |e| self.applyEsc(e),
-                .csi_dispatch => |d| self.applyCsi(d.final, d.params[0..d.count], d.sub[0..d.count], d.priv),
+                .csi_dispatch => |d| self.applyCsi(d.final, d.params[0..d.count], d.sub[0..d.count], d.priv, d.marker),
                 .osc_dispatch => {
                     self.dispatchOsc();
                     self.osc_buf.clearRetainingCapacity();
@@ -1065,13 +1067,17 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             }
         }
 
-        fn applyCsi(self: *Self, final: u8, params: []const u16, sub: []const bool, priv: bool) void {
+        fn applyCsi(self: *Self, final: u8, params: []const u16, sub: []const bool, priv: bool, marker: u8) void {
             const n = struct {
                 fn get(p: []const u16, i: usize, dflt: u16) u16 {
                     if (i < p.len and p[i] != 0) return p[i];
                     return dflt;
                 }
             }.get;
+            if (marker != 0 and final == 'u') {
+                self.kitty_kb = if (marker == '<') 0 else @intCast(@min(@as(u32, n(params, 0, 0)), 255));
+                return;
+            }
             switch (final) {
                 'A' => {
                     self.pending_wrap = false;
@@ -2216,6 +2222,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             self.prompt_start_row = null;
             self.cur_link = 0;
             self.decckm = false;
+            self.kitty_kb = 0;
             self.decscusr_style = null;
             self.decscusr_blink = null;
             self.utf8_carry_len = 0;
@@ -2902,6 +2909,20 @@ test "decset cursor visibility + mouse modes" {
     try std.testing.expectEqual(mouse_mod.MouseMode.button_event, ctx.mouse_mode);
     ctx.parse("\x1b[?1002l");
     try std.testing.expectEqual(mouse_mod.MouseMode.off, ctx.mouse_mode);
+}
+
+test "kitty keyboard protocol mode tracking" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+    ctx.parse("\x1b[=5u");
+    try std.testing.expectEqual(@as(u8, 5), ctx.kitty_kb);
+    ctx.parse("\x1b[>1u");
+    try std.testing.expectEqual(@as(u8, 1), ctx.kitty_kb);
+    ctx.parse("\x1b[<u");
+    try std.testing.expectEqual(@as(u8, 0), ctx.kitty_kb);
+    ctx.parse("\x1b[=7u");
+    ctx.parse("\x1bc");
+    try std.testing.expectEqual(@as(u8, 0), ctx.kitty_kb);
 }
 
 test "decscusr cursor style override" {

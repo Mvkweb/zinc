@@ -42,14 +42,19 @@ pub const Mods = packed struct(u4) {
 };
 
 /// Encode key into `out`. Returns bytes written. Unmodified keys keep
-/// their classic sequences; modified keys use xterm modify encodings
+/// their classic sequences; modified keys use CSI u when the app enabled
+/// kitty keyboard disambiguation, otherwise xterm modify encodings
 /// (CSI 1 ; m for arrows/home/end, CSI param ; m for tilde keys, CSI u
 /// for enter/tab/escape) so shells can bind word jumps, word erase,
 /// and Shift+Enter newline continuations. cursor_app (DECCKM) sends
 /// unmodified arrows/home/end as SS3 (ESC O x) for ncurses apps.
 pub fn encode(key: Key, mods: Mods, kitty_mode: bool, cursor_app: bool, out: []u8) []u8 {
-    _ = kitty_mode;
     const m: u8 = modParam(mods);
+    if (kitty_mode and m != 1) {
+        if (kittyCode(key)) |code| {
+            return std.fmt.bufPrint(out, "\x1b[{d};{d}u", .{ code, m }) catch out[0..0];
+        }
+    }
     switch (key) {
         .none => return out[0..0],
         .backtab => {
@@ -70,10 +75,8 @@ pub fn encode(key: Key, mods: Mods, kitty_mode: bool, cursor_app: bool, out: []u
             return std.fmt.bufPrint(out, "\x1b[27;{d}u", .{m}) catch out[0..0];
         },
         .backspace => {
-            // Ctrl+BS erases a word as ESC DEL (readline, zle and fish all
-            // bind it). No CSI u here: we answer the kitty keyboard query
-            // with flags 0, so legacy apps would get a sequence they never
-            // asked for. Ctrl+Alt keeps the ^H-with-prefix form.
+            // Legacy ESC DEL is bound as word erase by readline/zle/fish;
+            // kitty disambiguation uses the CSI u path above.
             const base: u8 = if (mods.ctrl and mods.alt) 0x08 else 0x7f;
             if (mods.alt or mods.ctrl) {
                 if (out.len < 2) return out[0..0];
@@ -139,6 +142,30 @@ pub fn encode(key: Key, mods: Mods, kitty_mode: bool, cursor_app: bool, out: []u
     }
 }
 
+/// Kitty protocol key codes for named keys (legacy X11 keysyms are not
+/// used here: these are the stable values from the kitty specification).
+fn kittyCode(key: Key) ?u32 {
+    return switch (key) {
+        .backspace => 127,
+        .tab, .backtab => 9,
+        .enter => 13,
+        .escape => 27,
+        .left => 57417,
+        .right => 57418,
+        .up => 57419,
+        .down => 57420,
+        .page_up => 57421,
+        .page_down => 57422,
+        .home => 57423,
+        .end => 57424,
+        .insert => 57425,
+        .delete => 57426,
+        .f1, .f2, .f3, .f4, .f5, .f6, .f7, .f8, .f9, .f10, .f11, .f12 =>
+            57376 + @as(u32, @intFromEnum(key) - @intFromEnum(Key.f1)),
+        .none => null,
+    };
+}
+
 /// xterm modifier parameter: 1 + shift(1) + alt(2) + ctrl(4) [+ super(8)].
 fn modParam(mods: Mods) u8 {
     var m: u8 = 1;
@@ -193,4 +220,16 @@ test "modified keys encode" {
     try std.testing.expectEqualSlices(u8, "\t", encode(.tab, .{}, false, false, &buf));
     try std.testing.expectEqualSlices(u8, "\x1bOP", encode(.f1, .{}, false, false, &buf));
     try std.testing.expectEqualSlices(u8, "\x1b[1;5P", encode(.f1, ctrl, false, false, &buf));
+}
+
+test "kitty keyboard modified keys" {
+    var buf: [24]u8 = undefined;
+    const ctrl = Mods{ .ctrl = true };
+    const shift = Mods{ .shift = true };
+    try std.testing.expectEqualSlices(u8, "\x1b[127;5u", encode(.backspace, ctrl, true, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[127;3u", encode(.backspace, .{ .alt = true }, true, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[57423;5u", encode(.home, ctrl, true, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[13;2u", encode(.enter, shift, true, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[H", encode(.home, .{}, true, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x7f", encode(.backspace, .{}, true, false, &buf));
 }
