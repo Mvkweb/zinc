@@ -8,6 +8,7 @@ const config_mod = @import("config.zig");
 const context_mod = @import("context.zig");
 const wayland_mod = @import("backend/wayland.zig");
 const pty_mod = @import("pty.zig");
+const session_mod = @import("session.zig");
 const utf8_mod = @import("util/utf8.zig");
 const linux = std.os.linux;
 
@@ -52,7 +53,12 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Default: run the terminal. Opens a Wayland window; the USER runs this.
-    var app = wayland_mod.App(config_mod.active).open(gpa, io) catch |err| {
+    var shared_cwd: [4096:0]u8 = undefined;
+    const start_cwd: ?[]const u8 = if (args.len > 2 and std.mem.eql(u8, args[1], "--cwd"))
+        args[2]
+    else
+        session_mod.read(&shared_cwd);
+    var app = wayland_mod.App(config_mod.active).open(gpa, io, start_cwd) catch |err| {
         var eb: [256]u8 = undefined;
         var w = std.Io.File.stderr().writer(io, &eb);
         try w.interface.print("zinc: failed to start: {t}\n", .{err});
@@ -84,7 +90,7 @@ fn smokeMain(gpa: std.mem.Allocator, io: std.Io) !void {
     log(io, "smoke: spawn shell\n");
     // TERM=dumb: fish/dash use a plain reader (no probes, no highlighting),
     // so the run is deterministic. Still a real shell on a real PTY.
-    const child = pty_mod.spawnShell(config_mod.active.cols, config_mod.active.rows, 0, 0, "dumb", null, false) catch |err| {
+    const child = pty_mod.spawnShell(config_mod.active.cols, config_mod.active.rows, 0, 0, "dumb", null, false, null) catch |err| {
         var eb: [128]u8 = undefined;
         var w = std.Io.File.stderr().writer(io, &eb);
         try w.interface.print("smoke: pty spawn failed: {t}\n", .{err});
@@ -461,6 +467,7 @@ test {
     _ = @import("backend/wayland.zig");
     _ = @import("backend/wl_proto.zig");
     _ = @import("pty.zig");
+    _ = @import("session.zig");
     _ = @import("input/keyboard.zig");
     _ = @import("input/mouse.zig");
     _ = @import("input/selection.zig");

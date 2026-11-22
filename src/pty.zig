@@ -107,7 +107,8 @@ pub fn shellPath() [*:0]const u8 {
 }
 
 /// Fork a shell on a new PTY sized cols x rows (and px_w x px_h pixels).
-/// Returns parent side. `term_env` sets $TERM in the child.
+/// Returns parent side. `term_env` sets $TERM in the child; `start_cwd`, when
+/// set, becomes the shell's working directory.
 pub fn spawnShell(
     cols: u16,
     rows: u16,
@@ -116,6 +117,7 @@ pub fn spawnShell(
     term_env: ?[*:0]const u8,
     cfg_shell: ?[]const u8,
     login_shell: bool,
+    start_cwd: ?[]const u8,
 ) SpawnError!Child {
     const master_rc = linux.open("/dev/ptmx", .{ .ACCMODE = .RDWR, .NOCTTY = true, .NONBLOCK = true }, 0);
     const master_err = linux.errno(master_rc);
@@ -144,7 +146,7 @@ pub fn spawnShell(
 
     if (pid_rc == 0) {
         // Child: new session, attach slave as controlling terminal.
-        childMain(master, slave_path, cols, rows, px_w, px_h, term_env, cfg_shell, login_shell);
+        childMain(master, slave_path, cols, rows, px_w, px_h, term_env, cfg_shell, login_shell, start_cwd);
         unreachable; // childMain execs or exits.
     }
 
@@ -161,6 +163,7 @@ fn childMain(
     term_env: ?[*:0]const u8,
     cfg_shell: ?[]const u8,
     login_shell: bool,
+    start_cwd: ?[]const u8,
 ) noreturn {
     if (linux.errno(linux.setsid()) != .SUCCESS) linux.exit(1);
     const slave_rc = linux.open(slave_path, .{ .ACCMODE = .RDWR }, 0);
@@ -177,6 +180,18 @@ fn childMain(
     if (linux.errno(linux.dup2(slave, 1)) != .SUCCESS) linux.exit(1);
     if (linux.errno(linux.dup2(slave, 2)) != .SUCCESS) linux.exit(1);
     if (slave > 2) _ = linux.close(slave);
+
+    if (start_cwd) |cwd| {
+        if (cwd.len > 0 and cwd.len < 4096) {
+            var cwd_buf: [4096:0]u8 = undefined;
+            @memcpy(cwd_buf[0..cwd.len], cwd);
+            cwd_buf[cwd.len] = 0;
+            const zcwd: [:0]const u8 = cwd_buf[0..cwd.len :0];
+            if (linux.errno(linux.chdir(zcwd.ptr)) == .SUCCESS) {
+                _ = setenv("PWD", zcwd.ptr, 1);
+            }
+        }
+    }
 
     // Child-only env tweak (post-fork: parent/system untouched).
     if (term_env) |t| {

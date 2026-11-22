@@ -32,6 +32,10 @@ A list of what zinc does.
 * **Consistent box glyphs.** `font-nerd-symbols = true` draws box-drawing lines and private-use icons with the Nerd Font fallback face, so adjacent cells align and borders have no seams. Off by default.
 * **Keycap emoji.** Renders compound keycap symbols (like `1️⃣`) as a unit without splitting them across lines.
 
+## Sessions
+
+* **Shared working directory.** A new window starts its shell in the directory of the last focused zinc window (from the shell's OSC 7 report). The handoff record lives in `$XDG_RUNTIME_DIR/zinc/cwd`, falling back to `~/.cache/zinc/cwd`; records from dead windows or removed directories are ignored. Pass `zinc --cwd /path` to start in an explicit directory instead.
+
 ## Scrollback and reflow
 
 * **Text reflow.** Resizing the window rewraps lines without breaking spacing, ASCII art, or shell prompts.

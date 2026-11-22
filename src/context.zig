@@ -22,6 +22,7 @@ const base64_mod = @import("util/base64.zig");
 const linux = std.os.linux;
 
 pub const WriteCb = *const fn (user_data: ?*anyopaque, data: []const u8) void;
+pub const CwdCb = *const fn (user_data: ?*anyopaque, path: []const u8) void;
 
 /// Monotonic milliseconds (raw Linux clock; no Io needed).
 pub fn nowMs() i64 {
@@ -68,6 +69,9 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// resolve relative Ctrl+click file paths.
         cwd_buf: [4096]u8 = @splat(0),
         cwd_len: usize = 0,
+        /// Optional notification when the shell directory actually changes.
+        cwd_cb: ?CwdCb = null,
+        cwd_cb_user: ?*anyopaque = null,
         /// Row-switch write tracking for per-row cwd stamps (click
         /// resolution): the last viewport row stamped, and whether the
         /// stamp is trustworthy. Cleared on every real cwd change so the
@@ -201,6 +205,11 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         pub fn onWrite(self: *Self, cb: WriteCb, user: ?*anyopaque) void {
             self.write_cb = cb;
             self.write_user = user;
+        }
+
+        pub fn onCwdChange(self: *Self, cb: CwdCb, user: ?*anyopaque) void {
+            self.cwd_cb = cb;
+            self.cwd_cb_user = user;
         }
 
         fn emit(self: *Self, data: []const u8) void {
@@ -1383,6 +1392,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     }
                     if (self.grid.noteCwdChange(self.cwd_buf[0..self.cwd_len], p) catch false) {
                         self.stamped_ok = false;
+                        if (self.cwd_cb) |cb| cb(self.cwd_cb_user, p);
                     }
                     const n = @min(p.len, self.cwd_buf.len);
                     @memcpy(self.cwd_buf[0..n], p[0..n]);
