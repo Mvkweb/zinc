@@ -5,6 +5,7 @@
 const std = @import("std");
 const c = @import("c");
 const trimMemory = @import("../util/malloc.zig").trimMemory;
+const session_mod = @import("../session.zig");
 
 const wl_proto = @import("wl_proto.zig");
 
@@ -497,6 +498,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         pty_pid: i32 = 0,
         pty_fd: i32 = -1,
+        /// Directory inherited from the last active zinc window or set via --cwd.
+        startup_cwd: ?[]const u8 = null,
+        shared_cwd: [4096:0]u8 = undefined,
         repeat_rate: i32 = 0,
         repeat_delay: i32 = 0,
         /// Key-repeat timerfd + the pressed key being repeated.
@@ -549,7 +553,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         // -- lifecycle ------------------------------------------------------
 
-        pub fn open(gpa: std.mem.Allocator, io: std.Io) (AppError || std.mem.Allocator.Error)!*Self {
+        pub fn open(gpa: std.mem.Allocator, io: std.Io, cli_cwd: ?[]const u8) (AppError || std.mem.Allocator.Error)!*Self {
             comptime cfg.validate();
             P.linkAll();
 
@@ -568,6 +572,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Font first: cell metrics size the default window.
             // Manual unwind until self exists (then errdefer self.deinit()).
             var ctx = try context_mod.Context(cfg).init(gpa);
+            ctx.onCwdChange(cwdChanged, null);
             if (runtime_cfg.bg) |color| ctx.bg = color;
             if (runtime_cfg.fg) |color| ctx.fg = color;
             if (runtime_cfg.cursor_color) |color| ctx.cursor_color = color;
@@ -977,6 +982,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.ctx.cell_h_px = @intCast(@max(1, self.cell_h));
 
             // Spawn the shell.
+            if (cli_cwd) |sc| {
+                if (session_mod.validPath(sc) and session_mod.isDir(sc)) {
+                    const n = @min(sc.len, self.shared_cwd.len - 1);
+                    @memcpy(self.shared_cwd[0..n], sc[0..n]);
+                    self.shared_cwd[n] = 0;
+                    self.startup_cwd = self.shared_cwd[0..n :0];
+                }
+            } else if (self.runtime_cfg.session_inherit_cwd orelse cfg.session_inherit_cwd) {
+                self.startup_cwd = session_mod.read(&self.shared_cwd);
+            }
+
             const term = try gpa.dupeSentinel(u8, cfg.term_env, 0);
             defer gpa.free(term);
             const pty_px = self.ptyPixels(self.ctx.grid.cols, self.ctx.grid.rows);
@@ -990,9 +1006,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 term,
                 shell_override,
                 login_sh,
+                self.startup_cwd,
             ) catch return error.PtyFailed;
             self.pty_pid = child.pid;
             self.pty_fd = child.fd;
+            publishCwd(self.startup_cwd orelse self.curCwd());
             // Shell query replies (DA/DSR/...) go straight back to the PTY.
             self.ctx.onWrite(ptyWrite, @ptrFromInt(@as(usize, @intCast(child.fd))));
 
@@ -4455,6 +4473,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.clearHover();
         }
 
+        fn cwdChanged(data: ?*anyopaque, path: []const u8) void {
+            _ = data;
+            publishCwd(path);
+        }
+
+        /// Publish a window's cwd for instances launched afterwards.
+        fn publishCwd(path: []const u8) void {
+            if (!session_mod.validPath(path) or path.len > 4096) return;
+            session_mod.publish(@intCast(linux.getpid()), path);
+        }
+
         /// Live cwd for resolution (OSC 7 buffer, else /proc/<pid>/cwd fallback, else launch PWD).
         fn curCwd(self: *Self) []const u8 {
             if (self.ctx.cwd_len > 0) return self.ctx.cwd_buf[0..self.ctx.cwd_len];
@@ -4588,12 +4617,14 @@ pub fn App(comptime cfg: config_mod.Config) type {
             while (end > 1 and path[end - 1] == '/') end -= 1;
             // Learn the new cwd (see noteCwdChange): keeps later relative
             // clicks resolving instead of dying on the stale directory.
-            if (self.ctx.grid.noteCwdChange(self.ctx.cwd_buf[0..self.ctx.cwd_len], path[0..end]) catch false) {
+            const changed = self.ctx.grid.noteCwdChange(self.ctx.cwd_buf[0..self.ctx.cwd_len], path[0..end]) catch false;
+            if (changed) {
                 self.ctx.stamped_ok = false;
             }
             const n = @min(end, self.ctx.cwd_buf.len);
             @memcpy(self.ctx.cwd_buf[0..n], path[0..n]);
             self.ctx.cwd_len = n;
+            if (changed) publishCwd(path[0..n]);
         }
 
         /// Open a verified absolute path. Terminal editors (editor-command-
@@ -5412,6 +5443,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const self: *Self = @ptrCast(@alignCast(data));
             self.repeatDisarm();
             self.ctx.setFocus(true);
+            publishCwd(self.curCwd());
             self.needs_render = true;
         }
 
@@ -5422,6 +5454,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const self: *Self = @ptrCast(@alignCast(data));
             self.repeatDisarm();
             self.ctx.setFocus(false);
+            publishCwd(self.curCwd());
             // Safety: some compositors skip ti-leave on focus loss.
             if (cfg.ime) self.imeDisable();
             self.needs_render = true;
