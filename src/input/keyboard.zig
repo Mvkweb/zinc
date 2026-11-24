@@ -142,27 +142,18 @@ pub fn encode(key: Key, mods: Mods, kitty_mode: bool, cursor_app: bool, out: []u
     }
 }
 
-/// Kitty protocol key codes for named keys (legacy X11 keysyms are not
-/// used here: these are the stable values from the kitty specification).
+/// Kitty protocol key codes for keys requiring disambiguation under
+/// progressive enhancement flag 1 (disambiguate escape codes). Keys that
+/// already have unambiguous xterm modifier encodings (arrows, home/end,
+/// page navigation, function keys) continue to use their standard sequences
+/// so shells (fish, readline) retain word jumps and navigation.
 fn kittyCode(key: Key) ?u32 {
     return switch (key) {
         .backspace => 127,
         .tab, .backtab => 9,
         .enter => 13,
         .escape => 27,
-        .left => 57417,
-        .right => 57418,
-        .up => 57419,
-        .down => 57420,
-        .page_up => 57421,
-        .page_down => 57422,
-        .home => 57423,
-        .end => 57424,
-        .insert => 57425,
-        .delete => 57426,
-        .f1, .f2, .f3, .f4, .f5, .f6, .f7, .f8, .f9, .f10, .f11, .f12 =>
-            57376 + @as(u32, @intFromEnum(key) - @intFromEnum(Key.f1)),
-        .none => null,
+        else => null,
     };
 }
 
@@ -228,7 +219,13 @@ test "kitty keyboard modified keys" {
     const shift = Mods{ .shift = true };
     try std.testing.expectEqualSlices(u8, "\x1b[127;5u", encode(.backspace, ctrl, true, false, &buf));
     try std.testing.expectEqualSlices(u8, "\x1b[127;3u", encode(.backspace, .{ .alt = true }, true, false, &buf));
-    try std.testing.expectEqualSlices(u8, "\x1b[57423;5u", encode(.home, ctrl, true, false, &buf));
+    // Functional keys with legacy modifier sequences keep standard xterm encodings:
+    try std.testing.expectEqualSlices(u8, "\x1b[1;5H", encode(.home, ctrl, true, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[1;5D", encode(.left, ctrl, true, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[1;5C", encode(.right, ctrl, true, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[1;5A", encode(.up, ctrl, true, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[1;5B", encode(.down, ctrl, true, false, &buf));
+    try std.testing.expectEqualSlices(u8, "\x1b[1;5P", encode(.f1, ctrl, true, false, &buf));
     try std.testing.expectEqualSlices(u8, "\x1b[13;2u", encode(.enter, shift, true, false, &buf));
     try std.testing.expectEqualSlices(u8, "\x1b[H", encode(.home, .{}, true, false, &buf));
     try std.testing.expectEqualSlices(u8, "\x7f", encode(.backspace, .{}, true, false, &buf));
