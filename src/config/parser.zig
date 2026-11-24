@@ -15,6 +15,7 @@ pub const RuntimeConfig = struct {
     font_family: ?[]const u8 = null,
     shell: ?[]const u8 = null,
     login_shell: ?bool = null,
+    session_inherit_cwd: ?bool = null,
     window_width: ?u16 = null,
     window_height: ?u16 = null,
     decorations: ?DecorationMode = null,
@@ -278,6 +279,8 @@ pub fn parse(content: []const u8, cfg: *RuntimeConfig, gpa: std.mem.Allocator) v
             cfg.shell = if (sh.len > 0) (gpa.dupe(u8, sh) catch null) else null;
         } else if (std.ascii.eqlIgnoreCase(key, "login-shell") or std.ascii.eqlIgnoreCase(key, "login_shell")) {
             if (parseBool(val)) |b| cfg.login_shell = b;
+        } else if (std.ascii.eqlIgnoreCase(key, "session-inherit-cwd") or std.ascii.eqlIgnoreCase(key, "session_inherit_cwd")) {
+            if (parseBool(val)) |b| cfg.session_inherit_cwd = b;
         } else if (std.ascii.eqlIgnoreCase(key, "window-width") or std.ascii.eqlIgnoreCase(key, "window_width")) {
             if (std.fmt.parseInt(u16, trimQuotes(val), 10)) |w| {
                 if (w >= 15 and w <= 1000) cfg.window_width = w;
@@ -514,4 +517,15 @@ test "parse window-width, window-height, and window-size" {
     parse("window-width = 5\nwindow-height = 1000\n", &cfg, std.testing.allocator);
     try std.testing.expectEqual(@as(?u16, 140), cfg.window_width);
     try std.testing.expectEqual(@as(?u16, 40), cfg.window_height);
+}
+
+test "parse session-inherit-cwd" {
+    var cfg = RuntimeConfig{};
+    defer cfg.deinit(std.testing.allocator);
+
+    parse("session-inherit-cwd = true\n", &cfg, std.testing.allocator);
+    try std.testing.expectEqual(@as(?bool, true), cfg.session_inherit_cwd);
+
+    parse("session-inherit-cwd = false\n", &cfg, std.testing.allocator);
+    try std.testing.expectEqual(@as(?bool, false), cfg.session_inherit_cwd);
 }

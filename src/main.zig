@@ -53,11 +53,10 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Default: run the terminal. Opens a Wayland window; the USER runs this.
-    var shared_cwd: [4096:0]u8 = undefined;
     const start_cwd: ?[]const u8 = if (args.len > 2 and std.mem.eql(u8, args[1], "--cwd"))
         args[2]
     else
-        session_mod.read(&shared_cwd);
+        null;
     var app = wayland_mod.App(config_mod.active).open(gpa, io, start_cwd) catch |err| {
         var eb: [256]u8 = undefined;
         var w = std.Io.File.stderr().writer(io, &eb);

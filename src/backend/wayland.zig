@@ -498,8 +498,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         pty_pid: i32 = 0,
         pty_fd: i32 = -1,
-        /// Directory inherited from the last active zinc window.
+        /// Directory inherited from the last active zinc window or set via --cwd.
         startup_cwd: ?[]const u8 = null,
+        shared_cwd: [4096:0]u8 = undefined,
         repeat_rate: i32 = 0,
         repeat_delay: i32 = 0,
         /// Key-repeat timerfd + the pressed key being repeated.
@@ -552,7 +553,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         // -- lifecycle ------------------------------------------------------
 
-        pub fn open(gpa: std.mem.Allocator, io: std.Io, startup_cwd: ?[]const u8) (AppError || std.mem.Allocator.Error)!*Self {
+        pub fn open(gpa: std.mem.Allocator, io: std.Io, cli_cwd: ?[]const u8) (AppError || std.mem.Allocator.Error)!*Self {
             comptime cfg.validate();
             P.linkAll();
 
@@ -613,7 +614,6 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .ascent = ft_face.ascent,
                 .font_size_pt = font_size_pt,
                 .runtime_cfg = runtime_cfg,
-                .startup_cwd = startup_cwd,
                 .pad_x = runtime_cfg.pad_x orelse cfg.pad_x,
                 .pad_y = runtime_cfg.pad_y orelse cfg.pad_y,
                 .alt_pad_x = runtime_cfg.alt_pad_x orelse cfg.alt_pad_x,
@@ -982,6 +982,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.ctx.cell_h_px = @intCast(@max(1, self.cell_h));
 
             // Spawn the shell.
+            if (cli_cwd) |sc| {
+                if (session_mod.validPath(sc) and session_mod.isDir(sc)) {
+                    const n = @min(sc.len, self.shared_cwd.len - 1);
+                    @memcpy(self.shared_cwd[0..n], sc[0..n]);
+                    self.shared_cwd[n] = 0;
+                    self.startup_cwd = self.shared_cwd[0..n :0];
+                }
+            } else if (self.runtime_cfg.session_inherit_cwd orelse cfg.session_inherit_cwd) {
+                self.startup_cwd = session_mod.read(&self.shared_cwd);
+            }
+
             const term = try gpa.dupeSentinel(u8, cfg.term_env, 0);
             defer gpa.free(term);
             const pty_px = self.ptyPixels(self.ctx.grid.cols, self.ctx.grid.rows);

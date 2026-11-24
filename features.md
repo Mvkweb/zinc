@@ -34,7 +34,7 @@ A list of what zinc does.
 
 ## Sessions
 
-* **Shared working directory.** A new window starts its shell in the directory of the last focused zinc window (from the shell's OSC 7 report). The handoff record lives in `$XDG_RUNTIME_DIR/zinc/cwd`, falling back to `~/.cache/zinc/cwd`; records from dead windows or removed directories are ignored. Pass `zinc --cwd /path` to start in an explicit directory instead.
+* **Shared working directory.** When `session-inherit-cwd = true` is enabled in `~/.config/zinc/config`, a new window starts its shell in the directory of the last focused zinc window (from the shell's OSC 7 report or `/proc/<pid>/cwd`). Off by default. The handoff record lives in `$XDG_RUNTIME_DIR/zinc/cwd`, falling back to `~/.cache/zinc/cwd`; records from dead windows or removed directories are ignored. Pass `zinc --cwd /path` to start in an explicit directory instead.
 
 ## Scrollback and reflow
 

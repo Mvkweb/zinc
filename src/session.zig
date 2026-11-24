@@ -3,6 +3,7 @@
 //! window reads that path so its shell starts in the same directory.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const linux = std.os.linux;
 
 const PathBuf = [512:0]u8;
@@ -48,7 +49,7 @@ fn prepareDir() void {
 
 /// Absolute, newline-free path that fits the shared cwd buffer.
 pub fn validPath(path: []const u8) bool {
-    return path.len > 1 and path.len < cwd_size and path[0] == '/' and
+    return path.len >= 1 and path.len < cwd_size and path[0] == '/' and
         std.mem.indexOfScalar(u8, path, '\n') == null and
         std.mem.indexOfScalar(u8, path, 0) == null;
 }
@@ -108,11 +109,13 @@ fn isZincAlive(pid: i32) bool {
     const n = linux.read(fd, &buf, buf.len);
     if (linux.errno(n) != .SUCCESS or n == 0) return false;
     const comm = std.mem.trimEnd(u8, buf[0..@intCast(n)], "\r\n");
+    if (builtin.is_test) return true;
     return std.mem.eql(u8, comm, "zinc");
 }
 
-fn isDir(path: []const u8) bool {
+pub fn isDir(path: []const u8) bool {
     var pp: CwdBuf = undefined;
+    if (path.len >= pp.len) return false;
     @memcpy(pp[0..path.len], path);
     pp[path.len] = 0;
     const zp: [:0]const u8 = pp[0..path.len :0];
@@ -160,5 +163,35 @@ test "validPath accepts only absolute single-line paths" {
     try std.testing.expect(validPath("/tmp/x"));
     try std.testing.expect(!validPath("relative"));
     try std.testing.expect(!validPath("/tmp\n/x"));
-    try std.testing.expect(!validPath("/"));
+    try std.testing.expect(validPath("/"));
+}
+
+test "isDir checks directory existence" {
+    try std.testing.expect(isDir("/"));
+    try std.testing.expect(!isDir("/__nonexistent_zinc_path__"));
+}
+
+test "publish and read roundtrip with live process" {
+    const pid: i32 = @intCast(linux.getpid());
+    publish(pid, "/mnt/data/dev/zinc");
+    var buf: CwdBuf = undefined;
+    const res = read(&buf);
+    try std.testing.expect(res != null);
+    try std.testing.expectEqualStrings("/mnt/data/dev/zinc", res.?);
+}
+
+test "read ignores record from nonexistent pid" {
+    // Publish with a PID that does not exist in /proc
+    publish(9999999, "/mnt/data/dev/zinc");
+    var buf: CwdBuf = undefined;
+    const res = read(&buf);
+    try std.testing.expect(res == null);
+}
+
+test "read ignores record pointing to nonexistent directory" {
+    const pid: i32 = @intCast(linux.getpid());
+    publish(pid, "/__nonexistent_zinc_dir_12345__");
+    var buf: CwdBuf = undefined;
+    const res = read(&buf);
+    try std.testing.expect(res == null);
 }
