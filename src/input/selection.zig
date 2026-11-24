@@ -489,7 +489,9 @@ pub const Selection = struct {
             }
             if (!last) {
                 var nl = true;
-                if (absCell(grid, r, @intCast(cols - 1))) |lc| nl = !lc.wrapped;
+                if (!column_mode) {
+                    if (absCell(grid, r, @intCast(cols - 1))) |lc| nl = !lc.wrapped;
+                }
                 if (nl) try out.append(gpa, '\n');
             }
             if (last) break;
@@ -849,4 +851,31 @@ test "column selection extracts a rectangle" {
     const again = try s.extract(std.testing.allocator, &g) orelse return error.Fail;
     defer std.testing.allocator.free(again);
     try std.testing.expectEqualStrings(text, again);
+}
+
+test "column selection keeps newlines even across wrapped rows" {
+    const grid_mod = @import("../term/grid.zig");
+    const G = grid_mod.Grid(.{});
+    var g = try G.init(std.testing.allocator, 10, 2);
+    defer g.deinit();
+    for ("abcdefghij", 0..) |ch, i| g.at(@intCast(i), 0).setRune(ch);
+    for ("klmnopqrst", 0..) |ch, i| g.at(@intCast(i), 1).setRune(ch);
+    // Mark row 0 as wrapped (e.g. long line continuation)
+    g.at(9, 0).wrapped = true;
+
+    // Normal stream selection joins wrapped lines without newline
+    var normal_sel = Selection{};
+    normal_sel.begin(0, 0);
+    normal_sel.update(4, 1);
+    const normal_text = try normal_sel.extract(std.testing.allocator, &g) orelse return error.Fail;
+    defer std.testing.allocator.free(normal_text);
+    try std.testing.expectEqualStrings("abcdefghijklmno", normal_text);
+
+    // Column selection must preserve newlines between rows of the rectangle
+    var col_sel = Selection{};
+    col_sel.beginColumn(0, 0);
+    col_sel.update(3, 1);
+    const col_text = try col_sel.extract(std.testing.allocator, &g) orelse return error.Fail;
+    defer std.testing.allocator.free(col_text);
+    try std.testing.expectEqualStrings("abcd\nklmn", col_text);
 }
