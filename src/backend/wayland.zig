@@ -190,9 +190,59 @@ extern fn xkb_state_mod_name_is_active(state: ?*XkbState, name: [*:0]const u8, t
 extern fn tcgetpgrp(fd: c_int) c_int;
 extern fn xkb_state_key_get_one_sym(state: ?*XkbState, keycode: u32) u32;
 extern fn xkb_state_key_get_utf8(state: ?*XkbState, keycode: u32, buf: [*]u8, size: usize) c_int;
+const XkbComposeTable = opaque {};
+const XkbComposeState = opaque {};
+extern fn xkb_compose_table_new_from_locale(ctx: ?*XkbContext, locale: [*:0]const u8, flags: c_int) ?*XkbComposeTable;
+extern fn xkb_compose_table_unref(table: ?*XkbComposeTable) void;
+extern fn xkb_compose_state_new(table: ?*XkbComposeTable, flags: c_int) ?*XkbComposeState;
+extern fn xkb_compose_state_unref(state: ?*XkbComposeState) void;
+extern fn xkb_compose_state_feed(state: ?*XkbComposeState, sym: u32) c_int;
+extern fn xkb_compose_state_get_status(state: ?*XkbComposeState) c_int;
+extern fn xkb_compose_state_get_utf8(state: ?*XkbComposeState, buf: [*]u8, size: usize) c_int;
 
 const XKB_KEYMAP_FORMAT_TEXT_V1: c_int = 1;
 const XKB_STATE_MODS_EFFECTIVE: c_int = 8;
+const XKB_COMPOSE_FEED_ACCEPTED: c_int = 1;
+const XKB_COMPOSE_COMPOSING: c_int = 1;
+const XKB_COMPOSE_COMPOSED: c_int = 2;
+const XKB_COMPOSE_CANCELLED: c_int = 3;
+
+/// Standalone spelling of a dead key: emitted when a compose sequence is
+/// cancelled or no compose table is available, so `^` and `~` stay typeable.
+fn deadKeyBase(sym: u32) ?u21 {
+    return switch (sym) {
+        0xfe50 => 0x60, // grave
+        0xfe51 => 0x27, // acute
+        0xfe52 => 0x5e, // circumflex
+        0xfe53 => 0x7e, // tilde
+        0xfe54 => 0xaf, // macron
+        0xfe55 => 0x2d8, // breve
+        0xfe56 => 0x2d9, // abovedot
+        0xfe57 => 0xa8, // diaeresis
+        0xfe58 => 0x2da, // abovering
+        0xfe59 => 0x2dd, // doubleacute
+        0xfe5a => 0x2c7, // caron
+        0xfe5b => 0xb8, // cedilla
+        0xfe5c => 0x2db, // ogonek
+        0xfe60 => 0x327, // belowdot
+        0xfe61 => 0x2c6, // hook
+        0xfe62 => 0x31b, // horn
+        0xfe63 => 0x338, // stroke
+        0xfe64 => 0x313, // abovecomma
+        0xfe65 => 0x314, // abovereversedcomma
+        0xfe66 => 0x2f5, // doublegrave
+        0xfe67 => 0x2da, // belowring
+        0xfe68 => 0x333, // belowmacron
+        0xfe69 => 0x322, // belowcircumflex
+        0xfe6a => 0x32e, // belowtilde
+        0xfe6b => 0x32d, // belowbreve
+        0xfe6c => 0x325, // belowdiaeresis
+        0xfe6d => 0x31c, // invertedbreve
+        0xfe6e => 0x327, // belowcomma
+        0xfe6f => 0xa4, // currency
+        else => null,
+    };
+}
 
 // Relevant keysyms (xkbcommon-keysyms values, stable ABI).
 const K = struct {
@@ -448,6 +498,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
         xkb_ctx: ?*XkbContext = null,
         xkb_map: ?*XkbKeymap = null,
         xkb_state: ?*XkbState = null,
+        xkb_compose_table: ?*XkbComposeTable = null,
+        xkb_compose: ?*XkbComposeState = null,
+        /// Literal bytes of a pending dead key, flushed if composition fails.
+        pending_dead: [4]u8 = undefined,
+        pending_dead_len: u8 = 0,
 
         pool_fd: i32 = -1,
         pool_size: usize = 0,
@@ -847,6 +902,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 };
                 _ = c.wl_proxy_add_listener(@ptrCast(self.keyboard), @ptrCast(&self.kbl), @ptrCast(self));
                 self.xkb_ctx = xkb_context_new(0);
+                self.initCompose();
             }
 
             // IME (optional): text-input manager + one input object for
@@ -1123,6 +1179,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (self.surface) |s| c.wl_proxy_destroy(@ptrCast(s));
             if (self.wm_base) |w| c.wl_proxy_destroy(@ptrCast(w));
             if (self.xkb_state) |s| xkb_state_unref(s);
+            if (self.xkb_compose) |s| xkb_compose_state_unref(s);
+            if (self.xkb_compose_table) |t| xkb_compose_table_unref(t);
             if (self.xkb_map) |m| xkb_keymap_unref(m);
             if (self.xkb_ctx) |x| xkb_context_unref(x);
             self.glyphs.deinit();
@@ -3321,6 +3379,90 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
         }
 
+        fn initCompose(self: *Self) void {
+            if (self.xkb_compose != null) return;
+            var locale: [*:0]const u8 = "C.UTF-8";
+            for ([_][*:0]const u8{ "LC_ALL", "LC_CTYPE", "LANG" }) |name| {
+                if (std.c.getenv(name)) |v| {
+                    if (v[0] != 0) {
+                        locale = v;
+                        break;
+                    }
+                }
+            }
+            const table = xkb_compose_table_new_from_locale(self.xkb_ctx, locale, 0) orelse return;
+            const state = xkb_compose_state_new(table, 0) orelse {
+                xkb_compose_table_unref(table);
+                return;
+            };
+            self.xkb_compose_table = table;
+            self.xkb_compose = state;
+        }
+
+        fn storeDead(self: *Self, sym: u32) void {
+            const cp = deadKeyBase(sym) orelse {
+                self.pending_dead_len = 0;
+                return;
+            };
+            var tmp: [4]u8 = undefined;
+            const n = std.unicode.utf8Encode(cp, &tmp) catch {
+                self.pending_dead_len = 0;
+                return;
+            };
+            @memcpy(self.pending_dead[0..n], tmp[0..n]);
+            self.pending_dead_len = @intCast(n);
+        }
+
+        fn flushPendingDead(self: *Self) void {
+            if (self.pending_dead_len == 0) return;
+            self.sendToPty(self.pending_dead[0..self.pending_dead_len]);
+            self.pending_dead_len = 0;
+        }
+
+        /// Feeds a keysym to XKB compose. Returns true when the key produced
+        /// composed text or is a pending dead key; false for normal dispatch.
+        fn composeSym(self: *Self, sym: u32) bool {
+            const st = self.xkb_compose orelse {
+                if (deadKeyBase(sym)) |cp| {
+                    var tmp: [4]u8 = undefined;
+                    const n = std.unicode.utf8Encode(cp, &tmp) catch return false;
+                    self.sendToPty(tmp[0..n]);
+                    return true;
+                }
+                return false;
+            };
+            if (xkb_compose_state_feed(st, sym) != XKB_COMPOSE_FEED_ACCEPTED) return false;
+            const status = xkb_compose_state_get_status(st);
+            if (status == XKB_COMPOSE_COMPOSING) {
+                self.storeDead(sym);
+                return true;
+            }
+            if (status == XKB_COMPOSE_COMPOSED) {
+                var buf: [8]u8 = undefined;
+                const n = xkb_compose_state_get_utf8(st, &buf, buf.len);
+                if (n > 0) self.sendToPty(buf[0..@intCast(n)]);
+                self.pending_dead_len = 0;
+                return true;
+            }
+            if (status == XKB_COMPOSE_CANCELLED) {
+                self.flushPendingDead();
+                if (xkb_compose_state_feed(st, sym) == XKB_COMPOSE_FEED_ACCEPTED) {
+                    const next = xkb_compose_state_get_status(st);
+                    if (next == XKB_COMPOSE_COMPOSING) {
+                        self.storeDead(sym);
+                        return true;
+                    }
+                    if (next == XKB_COMPOSE_COMPOSED) {
+                        var buf: [8]u8 = undefined;
+                        const n = xkb_compose_state_get_utf8(st, &buf, buf.len);
+                        if (n > 0) self.sendToPty(buf[0..@intCast(n)]);
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
         fn handleSym(self: *Self, sym: u32, keycode: u32) void {
             if (self.xkb_state == null) return;
             const mods = self.currentMods();
@@ -3518,6 +3660,12 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     return;
                 }
             }
+            const composed = if (cfg.find and self.find_active) false else if (!mods.ctrl and !mods.alt and !mods.super)
+                self.composeSym(sym)
+            else blk: {
+                self.flushPendingDead();
+                break :blk false;
+            };
             const key: ?input_kb.Key = switch (sym) {
                 K.Return, K.KP_Enter => .enter,
                 K.Tab => .tab,
@@ -3539,6 +3687,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             };
             var out: [32]u8 = undefined;
             if (key) |k| {
+                if (composed) return;
                 // Foot-style paging: Shift+PgUp/PgDn always scrolls; plain
                 // PgUp/PgDn scrolls unless an app owns the screen (alt).
                 if ((k == .page_up or k == .page_down) and (mods.shift or !self.ctx.alt_active)) {
@@ -3555,9 +3704,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     self.needs_render = true;
                     return;
                 }
-                self.sendToPty(input_kb.encode(k, mods, false, self.ctx.decckm, &out));
+                self.sendToPty(input_kb.encode(k, mods, self.ctx.kitty_kb & 1 != 0, self.ctx.decckm, &out));
                 return;
             }
+            if (composed) return;
             // Ctrl+letter -> control byte (shift folded so Ctrl+Shift+Z
             // works); Ctrl+Space -> NUL. Alt prefixes ESC so the shell
             // sees Meta (word jumps, Alt+letter bindings).
@@ -4779,8 +4929,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.cursor_shape = want_shape;
         }
 
+        fn mouseButtonCode(bit: u8) u8 {
+            return switch (bit) {
+                1 => 0,
+                2 => 2,
+                4 => 1,
+                else => 3,
+            };
+        }
+
         /// Encode one mouse event for the app (DECSET 1000/1002/1003 +
-        /// SGR 1006). `code`: 0/1/2 buttons, 3 release, 64/65 wheel.
+        /// SGR 1006). `code`: 0/1/2 buttons, 3 generic/motion, 64/65 wheel.
         fn reportMouse(self: *Self, code: u8, pressed: bool, motion: bool, col: u16, row: u16) void {
             const mods = self.currentMods();
             var out: [32]u8 = undefined;
@@ -4809,8 +4968,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 const cc = self.ptrCell(self.ptr_sx, self.ptr_sy);
                 var held = self.mouse_buttons;
                 while (held != 0) {
+                    const bit: u8 = @as(u8, 1) << @intCast(@ctz(held));
+                    self.reportMouse(mouseButtonCode(bit), false, false, cc.col, cc.row);
                     held &= held - 1;
-                    self.reportMouse(3, false, false, cc.col, cc.row);
                 }
             }
             self.mouse_buttons = 0;
@@ -4927,6 +5087,15 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.last_serial = serial;
             self.ptr_serial = serial;
             if (!cfg.mouse) return;
+            if (state == 0) {
+                const bit: u8 = switch (button) {
+                    0x110 => 1,
+                    0x111 => 2,
+                    0x112 => 4,
+                    else => 0,
+                };
+                self.mouse_buttons &= ~bit;
+            }
 
             if (self.csd_mode) {
                 const py: i32 = @divFloor(self.ptr_sy, 256);
@@ -5029,7 +5198,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     self.reportMouse(code, true, false, cc.col, cc.row);
                 } else {
                     self.mouse_buttons &= ~bit;
-                    self.reportMouse(3, false, false, cc.col, cc.row);
+                    self.reportMouse(code, false, false, cc.col, cc.row);
                 }
                 return;
             }
@@ -5434,6 +5603,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (self.xkb_map) |old| xkb_keymap_unref(old);
             self.xkb_map = map;
             self.xkb_state = state;
+            self.pending_dead_len = 0;
         }
 
         fn appOnKbEnter(data: ?*anyopaque, kb: ?*P.Keyboard, serial: u32, surface: ?*anyopaque, keys: ?*P.Array) callconv(.c) void {
@@ -5456,6 +5626,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.repeatDisarm();
             self.ctx.setFocus(false);
             publishCwd(self.curCwd());
+            if (self.ctx.mouse_mode != .off and self.mouse_buttons != 0) {
+                const cc = self.ptrCell(self.ptr_sx, self.ptr_sy);
+                var held = self.mouse_buttons;
+                while (held != 0) {
+                    const bit: u8 = @as(u8, 1) << @intCast(@ctz(held));
+                    self.reportMouse(mouseButtonCode(bit), false, false, cc.col, cc.row);
+                    held &= held - 1;
+                }
+                self.mouse_buttons = 0;
+            }
+            self.flushPendingDead();
             // Safety: some compositors skip ti-leave on focus loss.
             if (cfg.ime) self.imeDisable();
             self.needs_render = true;

@@ -27,7 +27,7 @@ pub const Action = union(enum) {
     bs,
     bel,
     esc_dispatch: u8,
-    csi_dispatch: struct { final: u8, params: [16]u16, count: u8, priv: bool, sub: [16]bool },
+    csi_dispatch: struct { final: u8, params: [16]u16, count: u8, priv: bool, marker: u8, sub: [16]bool },
     osc_dispatch: void,
     apc_dispatch: void,
     dcs_dispatch: void,
@@ -42,6 +42,9 @@ pub const Parser = struct {
     /// tertiary DA, SGR mouse, ...) — consumed silently, never dispatched.
     /// '?' alone keeps DEC semantics (DECSET/RM, kitty-kb queries).
     csi_alt: bool = false,
+    /// '<', '=', '>' marker that opened the CSI. Kitty keyboard
+    /// enable/push/pop end in 'u' and must reach the context.
+    marker: u8 = 0,
     /// Parallel to params: true when the entry followed a ':' (sub-param).
     sub: [16]bool = @splat(false),
     osc_len: usize = 0,
@@ -54,6 +57,7 @@ pub const Parser = struct {
         self.param_count = 0;
         self.priv = false;
         self.csi_alt = false;
+        self.marker = 0;
         self.sub = @splat(false);
     }
 
@@ -138,23 +142,23 @@ pub const Parser = struct {
                         return null;
                     },
                     '<', '=', '>' => {
-                        // Non-DEC markers (e.g. modifyOtherKeys CSI > 4 ; 1 m,
-                        // SGR mouse CSI < ... M): swallow the sequence so it
-                        // can never masquerade as SGR/DECSET.
+                        // Non-DEC markers: dispatch kitty CSI ... u only.
                         self.priv = true;
                         self.csi_alt = true;
+                        self.marker = b;
                         return null;
                     },
                     0x20...0x2F => return null, // intermediates: consume
                     0x40...0x7E => {
                         self.state = .ground;
-                        if (self.csi_alt) return null;
+                        if (self.csi_alt and (self.marker == 0 or b != 'u')) return null;
                         const count: u8 = self.param_count + 1;
                         const act = Action{ .csi_dispatch = .{
                             .final = b,
                             .params = self.params,
                             .count = count,
                             .priv = self.priv,
+                            .marker = self.marker,
                             .sub = self.sub,
                         } };
                         self.state = .ground;
