@@ -438,6 +438,8 @@ test {
     _ = @import("config.zig");
     _ = @import("config/parser.zig");
     _ = @import("config/loader.zig");
+    _ = @import("config/writer.zig");
+    _ = @import("config/editors.zig");
     _ = @import("context.zig");
     _ = @import("term/cell.zig");
     _ = @import("term/grid.zig");

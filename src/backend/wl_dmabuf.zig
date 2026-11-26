@@ -105,6 +105,7 @@ pub const SubsurfaceDmabuf = struct {
     win_h: i32 = 0,
     gen: u32 = 1,
     atlas_synced_size: u16 = 0,
+    color_synced_size: u16 = 0,
     frame_seq: u64 = 0,
 
     slots: [ipc.MAX_SLOTS]BufSlot = @splat(.{}),
@@ -471,6 +472,7 @@ pub const SubsurfaceDmabuf = struct {
         self.in_flight = false;
         self.pending_render = false;
         self.atlas_synced_size = 0;
+        self.color_synced_size = 0;
         self.active = true;
         return true;
     }
@@ -680,6 +682,8 @@ pub const SubsurfaceDmabuf = struct {
         layers: []const indium_mod.Layer,
         atlas: *const atlas_mod.Atlas,
         atlas_dirty: *bool,
+        color_atlas: *const atlas_mod.ColorAtlas,
+        color_atlas_dirty: *bool,
         px: i32,
         py: i32,
         cw: i32,
@@ -729,6 +733,21 @@ pub const SubsurfaceDmabuf = struct {
             }
         }
 
+        var send_color_dirty: u16 = 0;
+        var send_color_sz: u16 = 0;
+        if (color_atlas.pixels.len > 0) {
+            const csz = atlas_mod.ColorAtlas.SIZE;
+            const cbytes = @as(usize, csz) * @as(usize, csz) * 4;
+            send_color_sz = csz;
+            if (cbytes <= ipc.COLOR_ATLAS_BYTES and color_atlas.pixels.len * 4 >= cbytes and (color_atlas_dirty.* or self.color_synced_size != csz)) {
+                const src_bytes = std.mem.sliceAsBytes(color_atlas.pixels[0 .. @as(usize, csz) * csz]);
+                @memcpy(shm_slice[ipc.COLOR_ATLAS_OFFSET .. ipc.COLOR_ATLAS_OFFSET + cbytes], src_bytes);
+                self.color_synced_size = csz;
+                color_atlas_dirty.* = false;
+                send_color_dirty = 1;
+            }
+        }
+
         const inst_n = @min(self.instances.items.len, ipc.MAX_INSTANCES);
         if (inst_n > 0) {
             const inst_bytes = std.mem.sliceAsBytes(self.instances.items[0..inst_n]);
@@ -743,6 +762,8 @@ pub const SubsurfaceDmabuf = struct {
             .height = h,
             .atlas_size = atlas.size,
             .atlas_dirty = send_atlas_dirty,
+            .color_atlas_size = send_color_sz,
+            .color_atlas_dirty = send_color_dirty,
             .instance_count = @intCast(inst_n),
             .gen = self.gen,
             .frame_seq = self.frame_seq,

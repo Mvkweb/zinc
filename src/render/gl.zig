@@ -42,11 +42,14 @@ pub const GL_TEXTURE0: GLenum = 0x84C0;
 pub const GL_TEXTURE1: GLenum = 0x84C1;
 pub const GL_R8: GLenum = 0x8229;
 pub const GL_RED: GLenum = 0x1903;
+pub const GL_RGBA8: GLenum = 0x8058;
+pub const GL_RGBA: GLenum = 0x1908;
 pub const GL_TEXTURE_MIN_FILTER: GLenum = 0x2801;
 pub const GL_TEXTURE_MAG_FILTER: GLenum = 0x2800;
 pub const GL_TEXTURE_WRAP_S: GLenum = 0x2802;
 pub const GL_TEXTURE_WRAP_T: GLenum = 0x2803;
 pub const GL_NEAREST: GLint = 0x2600;
+pub const GL_LINEAR: GLint = 0x2601;
 pub const GL_CLAMP_TO_EDGE: GLint = 0x812F;
 pub const GL_UNPACK_ALIGNMENT: GLenum = 0x0CF5;
 pub const GL_RENDERER: GLenum = 0x1F01;
@@ -109,6 +112,8 @@ pub const OpKind = enum(u8) {
     drop_shadow = 7,
     dither_glyph = 8,
     dither_tab_pill = 9,
+    dither_aurora = 10,
+    rgba_quad = 11,
 };
 
 /// 8 x vec4 = 128 bytes per instanced draw primitive.
@@ -196,6 +201,7 @@ const FRAG_SRC: [:0]const u8 =
     \\flat in vec4 v_flags;
     \\
     \\uniform sampler2D u_atlas;
+    \\uniform sampler2D u_color_atlas;
     \\uniform float u_atlas_texel;
     \\out vec4 o_color;
     \\
@@ -206,6 +212,56 @@ const FRAG_SRC: [:0]const u8 =
     \\    15,  7, 13,  5
     \\);
     \\
+    \\const int BAYER8[64] = int[64](
+    \\     0, 32,  8, 40,  2, 34, 10, 42,
+    \\    48, 16, 56, 24, 50, 18, 58, 26,
+    \\    12, 44,  4, 36, 14, 46,  6, 38,
+    \\    60, 28, 52, 20, 62, 30, 54, 22,
+    \\     3, 35, 11, 43,  1, 33,  9, 41,
+    \\    51, 19, 59, 27, 49, 17, 57, 25,
+    \\    15, 47,  7, 39, 13, 45,  5, 37,
+    \\    63, 31, 55, 23, 61, 29, 53, 21
+    \\);
+    \\
+    \\vec3 dither_permute(vec3 x) {
+    \\    return mod(((x * 34.0) + 1.0) * x, 289.0);
+    \\}
+    \\
+    \\float snoise(vec2 v) {
+    \\    const vec4 C = vec4(0.211324865405187, 0.366025403784439, -0.577350269189626, 0.024390243902439);
+    \\    vec2 i = floor(v + dot(v, C.yy));
+    \\    vec2 x0 = v - i + dot(i, C.xx);
+    \\    vec2 i1 = (x0.x > x0.y) ? vec2(1.0, 0.0) : vec2(0.0, 1.0);
+    \\    vec4 x12 = x0.xyxy + C.xxzz;
+    \\    x12.xy -= i1;
+    \\    i = mod(i, 289.0);
+    \\    vec3 p = dither_permute(dither_permute(i.y + vec3(0.0, i1.y, 1.0)) + i.x + vec3(0.0, i1.x, 1.0));
+    \\    vec3 m = max(0.5 - vec3(dot(x0, x0), dot(x12.xy, x12.xy), dot(x12.zw, x12.zw)), 0.0);
+    \\    m = m * m;
+    \\    m = m * m;
+    \\    vec3 x = 2.0 * fract(p * C.www) - 1.0;
+    \\    vec3 h = abs(x) - 0.5;
+    \\    vec3 ox = floor(x + 0.5);
+    \\    vec3 a0 = x - ox;
+    \\    m *= 1.79284291400159 - 0.85373472095314 * (a0 * a0 + h * h);
+    \\    vec3 g;
+    \\    g.x = a0.x * x0.x + h.x * x0.y;
+    \\    g.yz = a0.yz * x12.xz + h.yz * x12.yw;
+    \\    return 130.0 * dot(m, g);
+    \\}
+    \\
+    \\float fbm(vec2 p) {
+    \\    float sum = 0.0;
+    \\    float amp = 0.5;
+    \\    mat2 rotate = mat2(0.8, -0.6, 0.6, 0.8);
+    \\    for (int i = 0; i < 4; i++) {
+    \\        sum += amp * snoise(p);
+    \\        p = rotate * p * 2.02 + vec2(11.3, 4.7);
+    \\        amp *= 0.5;
+    \\    }
+    \\    return clamp(0.5 + 0.5 * sum / 0.9375, 0.0, 1.0);
+    \\}
+    \\
     \\float sdRoundBox(vec2 p, vec2 hs, float r) {
     \\    float rad = min(r, min(hs.x, hs.y));
     \\    vec2 q = abs(p) - (hs - vec2(rad));
@@ -215,6 +271,11 @@ const FRAG_SRC: [:0]const u8 =
     \\int mod4(int v) {
     \\    int m = v - (v >> 2) * 4;
     \\    return m < 0 ? m + 4 : m;
+    \\}
+    \\
+    \\int mod8(int v) {
+    \\    int m = v - (v >> 3) * 8;
+    \\    return m < 0 ? m + 8 : m;
     \\}
     \\
     \\vec4 premul(vec3 rgb, float a) {
@@ -457,6 +518,76 @@ const FRAG_SRC: [:0]const u8 =
     \\            if (1.0 - (v_rect.y + v_rect.w - v_px.y) / cell / dlen > th) chosen = base * 0.52;
     \\        }
     \\        out_col = premul(chosen, cov * v_c0.a);
+    \\    } else if (kind == 10) {
+    \\        // dither_aurora: Polaris/dithercn Bayer-8 5-stop fbm aurora ribbon
+    \\        float acov = clip_cov;
+    \\        if (v_p0.x > 0.0) {
+    \\            vec2 hs = v_rect.zw * 0.5;
+    \\            float d = sdRoundBox(v_px - v_rect.xy - hs, hs, v_p0.x);
+    \\            acov = min(acov, clamp(0.5 - d, 0.0, 1.0));
+    \\            if (acov <= 0.0) discard;
+    \\        }
+    \\        float cell = max(1.0, v_p0.z);
+    \\        float cxf = floor((v_px.x - v_rect.x) / cell);
+    \\        float cyf = floor((v_px.y - v_rect.y) / cell);
+    \\        int bx8 = mod8(int(cxf));
+    \\        int by8 = mod8(int(cyf));
+    \\        float th = (float(BAYER8[by8 * 8 + bx8]) + 0.5) / 64.0;
+    \\        vec2 uv = clamp((vec2(cxf + 0.5, cyf + 0.5) * cell) / max(vec2(1.0), v_rect.zw), 0.0, 1.0);
+    \\        float t = v_p1.x;
+    \\        float intensity = v_p1.y > 0.0 ? v_p1.y : 0.90;
+    \\        float h_base = v_p1.z > 0.0 ? v_p1.z : 0.48;
+    \\        float h_spread = v_p1.w > 0.0 ? v_p1.w : 0.12;
+    \\        float n_curtains = v_flags.y > 0.5 ? v_flags.y : 3.0;
+    \\        float n_rays = v_p0.w > 0.5 ? v_p0.w : 10.0;
+    \\        float glow = v_flags.z > 0.0 ? v_flags.z : 0.90;
+    \\        float aspect = v_rect.z / max(1.0, v_rect.w);
+    \\        float x = (uv.x - 0.5) * aspect + t * 0.25 * 0.04;
+    \\        float light = 0.0;
+    \\        for (int i = 0; i < 4; i++) {
+    \\            float fi = float(i);
+    \\            if (fi >= n_curtains) break;
+    \\            float depth = fi / max(n_curtains - 1.0, 1.0);
+    \\            float edge = h_base + fi * h_spread
+    \\                + 0.10 * snoise(vec2(x * 0.55 + fi * 3.1, t * 0.035 + fi * 1.7))
+    \\                + 0.03 * snoise(vec2(x * 2.1 - fi * 1.3, t * 0.07 + fi));
+    \\            float above = uv.y - edge;
+    \\            float curtain = above > 0.0 ? exp(-above * 9.2 * (1.0 + fi * 0.4)) : exp(above * 42.0);
+    \\            float bend = snoise(vec2(x * 0.8, t * 0.03 + fi)) * 0.60;
+    \\            float rx = (x + bend) * n_rays;
+    \\            float rays = mix(0.22, 1.0, smoothstep(0.25, 0.75, fbm(vec2(rx + fi * 9.0, t * 0.045 + fi))));
+    \\            rays *= 0.75 + 0.25 * snoise(vec2(rx * 3.2, fi * 4.0 + t * 0.02));
+    \\            float patch_w = mix(0.30, 1.0, smoothstep(0.25, 0.70, fbm(vec2(x * 0.45 + fi * 5.0, t * 0.02 + fi * 2.0))));
+    \\            float rim = exp(-abs(above) * 32.0) * glow;
+    \\            float haze = above > 0.0 ? exp(-above * 5.0) * 0.09 : exp(above * 14.0) * 0.05;
+    \\            light += (curtain * rays + rim * (0.5 + 0.5 * rays) + haze) * patch_w * mix(1.0, 0.5, depth);
+    \\        }
+    \\        float ripple = 0.5 + 0.5 * sin(t * 0.8 + x * 4.0 + 2.0 * snoise(vec2(x * 2.5, t * 0.15)));
+    \\        float vmask = smoothstep(0.95, 0.46, uv.y);
+    \\        float tone = clamp((1.0 - exp(-light * 1.25)) * intensity * (1.0 - 0.135 * ripple) * vmask, 0.0, 1.0);
+    \\        float qtone = floor(tone * 7.0 + 0.5) / 7.0;
+    \\        float scaled = qtone * 4.0;
+    \\        int idx0 = clamp(int(floor(scaled)), 0, 3);
+    \\        int picked = min(idx0 + ((scaled - float(idx0)) > th ? 1 : 0), 4);
+    \\        if (picked == 0) discard;
+    \\        vec4 pc = (picked == 1) ? vec4(v_c0.rgb * 0.75, 0.28)
+    \\            : (picked == 2) ? vec4(v_c0.rgb, 0.65)
+    \\            : (picked == 3) ? vec4(mix(v_c0.rgb, v_c1.rgb, 0.42), 0.94)
+    \\            : vec4(mix(v_c1.rgb, vec3(1.0), 0.36), 1.0);
+    \\        out_col = premul(pc.rgb, pc.a * acov * v_c0.a);
+    \\    } else if (kind == 11) {
+    \\        // rgba_quad: full-color PNG app icon from u_color_atlas (ARGB in memory -> bgr swizzle)
+    \\        float icov = clip_cov;
+    \\        if (v_p0.x > 0.0) {
+    \\            vec2 hs = v_rect.zw * 0.5;
+    \\            float d = sdRoundBox(v_px - v_rect.xy - hs, hs, v_p0.x);
+    \\            icov = min(icov, clamp(0.5 - d, 0.0, 1.0));
+    \\            if (icov <= 0.0) discard;
+    \\        }
+    \\        vec4 s = texture(u_color_atlas, v_uv);
+    \\        float a = s.a * icov * v_c0.a;
+    \\        if (a <= 0.0) discard;
+    \\        out_col = premul(s.bgr, a);
     \\    }
     \\
     \\    o_color = out_col * ga;
@@ -472,9 +603,12 @@ pub const Renderer = struct {
     inst_vbo: GLuint = 0,
     atlas_tex: GLuint = 0,
     atlas_size: u16 = 0,
+    color_tex: GLuint = 0,
+    color_atlas_size: u16 = 0,
     u_vp: GLint = -1,
     u_y_sign: GLint = -1,
     u_atlas: GLint = -1,
+    u_color_atlas: GLint = -1,
     u_atlas_texel: GLint = -1,
     flip_y: bool = false,
     instances: std.ArrayList(Instance) = .empty,
@@ -501,6 +635,7 @@ pub const Renderer = struct {
         r.u_vp = gl.getUniformLocation(prog, "u_vp");
         r.u_y_sign = gl.getUniformLocation(prog, "u_y_sign");
         r.u_atlas = gl.getUniformLocation(prog, "u_atlas");
+        r.u_color_atlas = gl.getUniformLocation(prog, "u_color_atlas");
         r.u_atlas_texel = gl.getUniformLocation(prog, "u_atlas_texel");
 
         var vao: GLuint = 0;
@@ -538,12 +673,19 @@ pub const Renderer = struct {
         }
         gl.bindVertexArray(0);
 
-        var tex: GLuint = 0;
-        gl.genTextures(1, @ptrCast(&tex));
-        r.atlas_tex = tex;
-        gl.bindTexture(GL_TEXTURE_2D, tex);
+        var texs: [2]GLuint = undefined;
+        gl.genTextures(2, &texs);
+        r.atlas_tex = texs[0];
+        gl.bindTexture(GL_TEXTURE_2D, texs[0]);
         gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
         gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+        gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
+        gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
+
+        r.color_tex = texs[1];
+        gl.bindTexture(GL_TEXTURE_2D, texs[1]);
+        gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+        gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
         gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
         gl.texParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
         gl.bindTexture(GL_TEXTURE_2D, 0);
@@ -554,6 +696,7 @@ pub const Renderer = struct {
     pub fn deinit(self: *Self) void {
         self.instances.deinit(self.gpa);
         if (self.atlas_tex != 0) self.gl.deleteTextures(1, @ptrCast(&self.atlas_tex));
+        if (self.color_tex != 0) self.gl.deleteTextures(1, @ptrCast(&self.color_tex));
         const vbos = [_]GLuint{ self.quad_vbo, self.inst_vbo };
         if (self.quad_vbo != 0 or self.inst_vbo != 0) self.gl.deleteBuffers(2, &vbos);
         if (self.vao != 0) self.gl.deleteVertexArrays(1, @ptrCast(&self.vao));
@@ -591,6 +734,25 @@ pub const Renderer = struct {
             self.atlas_size = atlas_size;
         } else {
             self.gl.texSubImage2D(GL_TEXTURE_2D, 0, 0, 0, atlas_size, atlas_size, GL_RED, GL_UNSIGNED_BYTE, pixels.ptr);
+        }
+        self.gl.bindTexture(GL_TEXTURE_2D, 0);
+    }
+
+    pub fn syncColorAtlas(self: *Self, ca: *const atlas_mod.ColorAtlas) void {
+        if (ca.pixels.len == 0) return;
+        self.syncColorAtlasPixels(atlas_mod.ColorAtlas.SIZE, ca.pixels);
+    }
+
+    pub fn syncColorAtlasPixels(self: *Self, size: u16, pixels: []const u32) void {
+        const expected = @as(usize, size) * @as(usize, size);
+        if (size == 0 or pixels.len < expected) return;
+        self.gl.bindTexture(GL_TEXTURE_2D, self.color_tex);
+        self.gl.pixelStorei(GL_UNPACK_ALIGNMENT, 4);
+        if (self.color_atlas_size != size) {
+            self.gl.texImage2D(GL_TEXTURE_2D, 0, @intCast(GL_RGBA8), size, size, 0, GL_RGBA, GL_UNSIGNED_BYTE, pixels.ptr);
+            self.color_atlas_size = size;
+        } else {
+            self.gl.texSubImage2D(GL_TEXTURE_2D, 0, 0, 0, size, size, GL_RGBA, GL_UNSIGNED_BYTE, pixels.ptr);
         }
         self.gl.bindTexture(GL_TEXTURE_2D, 0);
     }
@@ -1132,6 +1294,9 @@ pub const Renderer = struct {
         self.gl.activeTexture(GL_TEXTURE0);
         self.gl.bindTexture(GL_TEXTURE_2D, self.atlas_tex);
         self.gl.uniform1i(self.u_atlas, 0);
+        self.gl.activeTexture(GL_TEXTURE1);
+        self.gl.bindTexture(GL_TEXTURE_2D, self.color_tex);
+        self.gl.uniform1i(self.u_color_atlas, 1);
         self.gl.uniform1f(self.u_atlas_texel, if (self.atlas_size > 0) 1.0 / asz else 0.0);
 
         self.gl.bindVertexArray(self.vao);

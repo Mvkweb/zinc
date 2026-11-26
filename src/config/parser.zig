@@ -282,11 +282,17 @@ pub fn parse(content: []const u8, cfg: *RuntimeConfig, gpa: std.mem.Allocator) v
         } else if (std.ascii.eqlIgnoreCase(key, "session-inherit-cwd") or std.ascii.eqlIgnoreCase(key, "session_inherit_cwd")) {
             if (parseBool(val)) |b| cfg.session_inherit_cwd = b;
         } else if (std.ascii.eqlIgnoreCase(key, "window-width") or std.ascii.eqlIgnoreCase(key, "window_width")) {
-            if (std.fmt.parseInt(u16, trimQuotes(val), 10)) |w| {
+            const w_s = trimQuotes(val);
+            if (std.ascii.eqlIgnoreCase(w_s, "auto")) {
+                cfg.window_width = null;
+            } else if (std.fmt.parseInt(u16, w_s, 10)) |w| {
                 if (w >= 15 and w <= 1000) cfg.window_width = w;
             } else |_| {}
         } else if (std.ascii.eqlIgnoreCase(key, "window-height") or std.ascii.eqlIgnoreCase(key, "window_height")) {
-            if (std.fmt.parseInt(u16, trimQuotes(val), 10)) |h| {
+            const h_s = trimQuotes(val);
+            if (std.ascii.eqlIgnoreCase(h_s, "auto")) {
+                cfg.window_height = null;
+            } else if (std.fmt.parseInt(u16, h_s, 10)) |h| {
                 if (h >= 3 and h <= 500) cfg.window_height = h;
             } else |_| {}
         } else if (std.ascii.eqlIgnoreCase(key, "window-size") or std.ascii.eqlIgnoreCase(key, "window_size") or std.ascii.eqlIgnoreCase(key, "initial-window-size") or std.ascii.eqlIgnoreCase(key, "initial_window_size")) {

@@ -1409,6 +1409,138 @@ pub fn drawSwitchPremult(
     fillRoundedRectPremult(buf, stride, height, kx, ky, knob_sz, knob_sz, knob_rad, 0, 0, 0x000000, 145, false, null);
 }
 
+/// CPU fallback for the Polaris-style Bayer-8 5-stop aurora ribbon.
+pub fn fillAuroraRectPremult(
+    buf: []u32,
+    stride: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    w: i32,
+    h: i32,
+    rad: i32,
+    tip_rgb: u32,
+    rim_rgb: u32,
+    cell_px: u8,
+    time_s: f32,
+    intensity: f32,
+) void {
+    if (w <= 0 or h <= 0 or stride == 0 or height == 0) return;
+    const cell: i32 = @max(1, @as(i32, cell_px));
+    const sw: i32 = @intCast(stride);
+    const sh: i32 = @intCast(height);
+    const x0 = @max(0, x);
+    const y0 = @max(0, y);
+    const x1 = @min(sw, x + w);
+    const y1 = @min(sh, y + h);
+    if (x0 >= x1 or y0 >= y1) return;
+
+    const wf: f32 = @floatFromInt(w);
+    const hf: f32 = @floatFromInt(h);
+    const bayer8 = [64]f32{
+        0,  32, 8,  40, 2,  34, 10, 42,
+        48, 16, 56, 24, 50, 18, 58, 26,
+        12, 44, 4,  36, 14, 46, 6,  38,
+        60, 28, 52, 20, 62, 30, 54, 22,
+        3,  35, 11, 43, 1,  33, 9,  41,
+        51, 19, 59, 27, 49, 17, 57, 25,
+        15, 47, 7,  39, 13, 45, 5,  37,
+        63, 31, 55, 23, 61, 29, 53, 21,
+    };
+
+    var py = y0;
+    while (py < y1) : (py += 1) {
+        const cy = @divFloor(py - y, cell);
+        const uy_cell = (@as(f32, @floatFromInt(cy)) + 0.5) * @as(f32, @floatFromInt(cell)) / hf;
+        if (uy_cell > 0.94) continue;
+        const vmask = 1.0 - std.math.clamp((uy_cell - 0.50) / 0.44, 0.0, 1.0);
+        const by: usize = @intCast(@mod(cy, 8));
+        const row = @as(usize, @intCast(py)) * stride;
+        var px = x0;
+        while (px < x1) : (px += 1) {
+            if (rad > 0) {
+                const dx = px - x;
+                const dy = py - y;
+                if (dx < rad and dy < rad) {
+                    const rx = rad - dx;
+                    const ry = rad - dy;
+                    if (rx * rx + ry * ry > rad * rad) continue;
+                } else if (dx >= w - rad and dy < rad) {
+                    const rx = dx - (w - rad - 1);
+                    const ry = rad - dy;
+                    if (rx * rx + ry * ry > rad * rad) continue;
+                }
+            }
+            const cx = @divFloor(px - x, cell);
+            const ux = (@as(f32, @floatFromInt(cx)) + 0.5) * @as(f32, @floatFromInt(cell)) / wf;
+            const drift = time_s * 0.14;
+            const wave0 = 0.46 + 0.08 * @sin(ux * 7.5 + drift) + 0.04 * @sin(ux * 15.2 - drift * 1.4);
+            const wave1 = 0.62 + 0.08 * @sin(ux * 5.8 - drift * 0.9 + 1.5) + 0.03 * @sin(ux * 12.1 + drift);
+            const wave2 = 0.76 + 0.07 * @sin(ux * 6.4 + drift * 0.7 + 3.1);
+            const a0 = wave0 - uy_cell;
+            const a1 = wave1 - uy_cell;
+            const a2 = wave2 - uy_cell;
+            const c0_t = if (a0 > 0) @exp(-a0 * 8.5) else @exp(a0 * 38.0);
+            const c1_t = (if (a1 > 0) @exp(-a1 * 11.0) else @exp(a1 * 38.0)) * 0.72;
+            const c2_t = (if (a2 > 0) @exp(-a2 * 13.5) else @exp(a2 * 38.0)) * 0.50;
+            const rays = 0.55 + 0.45 * @sin(ux * 28.0 + @sin(ux * 6.0 + time_s * 0.28) * 2.2);
+            const raw_tone = std.math.clamp((1.0 - @exp(-(c0_t + c1_t + c2_t) * rays * 1.15)) * vmask * intensity, 0.0, 1.0);
+            const bx: usize = @intCast(@mod(cx, 8));
+            const th = (bayer8[by * 8 + bx] + 0.5) / 64.0;
+            const scaled = raw_tone * 4.0;
+            const idx0: u32 = @min(3, @as(u32, @intFromFloat(@floor(scaled))));
+            const picked: u32 = @min(4, idx0 + @as(u32, if ((scaled - @as(f32, @floatFromInt(idx0))) > th) 1 else 0));
+            const alpha: u8 = switch (picked) {
+                0 => 0,
+                1 => 68,
+                2 => 154,
+                3 => 232,
+                else => 255,
+            };
+            if (alpha == 0) continue;
+            const rgb = if (picked >= 4) 0xFFFFFF else if (picked == 3) rim_rgb else tip_rgb;
+            const d_idx = row + @as(usize, @intCast(px));
+            buf[d_idx] = blendArgb(buf[d_idx], 0xFF000000 | rgb, alpha);
+        }
+    }
+}
+
+/// Blit an ARGB region from ColorAtlas (straight/premult ARGB) onto CPU framebuffer.
+pub fn blitColorAtlasRect(
+    buf: []u32,
+    stride: u32,
+    height: u32,
+    ca_pixels: []const u32,
+    ca_size: u16,
+    sx0: u16,
+    sy0: u16,
+    sw0: u16,
+    sh0: u16,
+    dx: i32,
+    dy: i32,
+) void {
+    if (ca_pixels.len == 0 or sw0 == 0 or sh0 == 0 or ca_size == 0) return;
+    const st: i32 = @intCast(stride);
+    const ht: i32 = @intCast(height);
+    var sy: u16 = 0;
+    while (sy < sh0) : (sy += 1) {
+        const py = dy + @as(i32, sy);
+        if (py < 0 or py >= ht) continue;
+        const srow = @as(usize, sy0 + sy) * ca_size;
+        const drow = @as(usize, @intCast(py)) * stride;
+        var sx: u16 = 0;
+        while (sx < sw0) : (sx += 1) {
+            const px = dx + @as(i32, sx);
+            if (px < 0 or px >= st) continue;
+            const p = ca_pixels[srow + sx0 + sx];
+            const a: u8 = @intCast((p >> 24) & 0xFF);
+            if (a == 0) continue;
+            const dst_idx = drow + @as(usize, @intCast(px));
+            buf[dst_idx] = blendArgb(buf[dst_idx], p, a);
+        }
+    }
+}
+
 test "blitLayerPremult clips, fades, and reports damage" {
     var dst: [16]u32 = @splat(0xFF101010);
     var layer: [4]u32 = @splat(0xFF204080);

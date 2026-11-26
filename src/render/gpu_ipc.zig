@@ -10,8 +10,10 @@ const gl_mod = @import("gl.zig");
 
 pub const SHM_SIZE: usize = 8 * 1024 * 1024;
 pub const ATLAS_OFFSET: usize = 0;
-pub const ATLAS_MAX_BYTES: usize = 4 * 1024 * 1024;
-pub const INSTANCES_OFFSET: usize = ATLAS_MAX_BYTES;
+pub const ATLAS_MAX_BYTES: usize = 3 * 1024 * 1024;
+pub const COLOR_ATLAS_OFFSET: usize = ATLAS_MAX_BYTES;
+pub const COLOR_ATLAS_BYTES: usize = 256 * 256 * 4;
+pub const INSTANCES_OFFSET: usize = COLOR_ATLAS_OFFSET + COLOR_ATLAS_BYTES;
 pub const MAX_INSTANCES: usize = (SHM_SIZE - INSTANCES_OFFSET) / @sizeOf(gl_mod.Instance);
 
 pub const MAX_SLOTS: usize = 3;
@@ -35,6 +37,8 @@ pub const ParentMsg = extern struct {
     height: i32 = 0,
     atlas_size: u32 = 0,
     atlas_dirty: u32 = 0,
+    color_atlas_size: u16 = 0,
+    color_atlas_dirty: u16 = 0,
     instance_count: u32 = 0,
     fourcc: u32 = DRM_FORMAT_ARGB8888,
     gen: u32 = 0,

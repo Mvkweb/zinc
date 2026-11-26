@@ -149,6 +149,7 @@ pub fn probe(gpa: std.mem.Allocator, io: std.Io) !void {
 
 const config_mod = @import("../config.zig");
 const config_loader = @import("../config/loader.zig");
+const config_writer = @import("../config/writer.zig");
 const context_mod = @import("../context.zig");
 const pty_mod = @import("../pty.zig");
 const input_kb = @import("../input/keyboard.zig");
@@ -510,6 +511,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
         indium_gpu_off: bool = false,
         indium_egl_inproc: bool = false,
         atlas_dirty: bool = true,
+        color_atlas_dirty: bool = true,
         atlas_gen: u64 = 0,
         menu: menu_mod.Menu = .{},
         name_subcompositor: u32 = 0,
@@ -1157,7 +1159,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             if (self.xdg_surface) |x| c.wl_proxy_destroy(@ptrCast(x));
             if (cfg.indium) {
-                self.menu.closeMenu();
+                self.menu.closeMenu(self.gpa);
                 self.dmabuf_sub.deinit();
                 self.egl_sub.deinit();
             }
@@ -2066,6 +2068,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 &self.atlas_gen,
                 &self.atlas_dirty,
             );
+            self.menu.ensureEditorIcons(self.gpa, &self.color_atlas, &self.color_atlas_dirty);
         }
 
         fn appendMenuGpuCb(ptr: ?*anyopaque, gpa: std.mem.Allocator, instances: *std.ArrayList(gl_mod.Instance)) anyerror!void {
@@ -2085,14 +2088,55 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     self.needs_render = true;
                     self.refreshCursor();
                 },
+                .write_config => |cw| {
+                    if (std.mem.eql(u8, cw.key, "background")) {
+                        self.ctx.bg = self.menu.snap.bg;
+                        self.ctx.grid.markAllDirty();
+                    } else if (std.mem.eql(u8, cw.key, "foreground")) {
+                        self.ctx.fg = self.menu.snap.fg;
+                        self.ctx.grid.markAllDirty();
+                    } else if (std.mem.eql(u8, cw.key, "cursor-color")) {
+                        self.ctx.cursor_color = self.menu.snap.cursor_color;
+                        self.ctx.grid.markAllDirty();
+                    }
+                    config_writer.applyEdits(self.gpa, &.{.{ .key = cw.key, .value = cw.value() }}) catch {};
+                    if (self.config_fd < 0) self.reloadConfig();
+                    self.needs_render = true;
+                    self.refreshCursor();
+                },
+                .restore_defaults => {
+                    config_writer.restoreDefaults() catch {};
+                    self.ctx.bg = cfg.bg;
+                    self.ctx.fg = cfg.fg;
+                    self.ctx.cursor_color = cfg.cursor_color;
+                    self.ctx.grid.markAllDirty();
+                    if (self.config_fd < 0) self.reloadConfig();
+                    self.needs_render = true;
+                    self.refreshCursor();
+                },
+                .open_config_file => {
+                    var dir_buf: [512:0]u8 = undefined;
+                    if (config_loader.resolveDir(&dir_buf)) |dir_path| {
+                        var file_buf: [512:0]u8 = undefined;
+                        if (std.mem.printSentinel(&file_buf, "{s}/config", .{dir_path}, 0) catch null) |cfg_path| {
+                            self.menu.closeMenu(self.gpa);
+                            self.ctx.grid.markAllDirty();
+                            self.needs_render = true;
+                            self.refreshCursor();
+                            self.openFile(cfg_path, 1, 1);
+                            return;
+                        }
+                    }
+                    self.needs_render = true;
+                },
                 .close => {
-                    self.menu.closeMenu();
+                    self.menu.closeMenu(self.gpa);
                     self.ctx.grid.markAllDirty();
                     self.needs_render = true;
                     self.refreshCursor();
                 },
                 .quit => {
-                    self.menu.closeMenu();
+                    self.menu.closeMenu(self.gpa);
                     self.running = false;
                 },
             }
@@ -3150,7 +3194,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (cfg.indium) {
                 self.renderIndiumLayers(px, py, cw, ch, W, H, full, &indium_redraw, &dmg);
                 if (self.menuCpuActive()) {
-                    self.menu.renderCpu(self.pool_pixels, W, H, &self.atlas, .{
+                    self.menu.renderCpu(self.pool_pixels, W, H, &self.atlas, &self.color_atlas, .{
                         .ptr = @ptrCast(self),
                         .getGlyph = indiumGlyphCb,
                         .cell_w = self.cell_w,
@@ -3291,12 +3335,39 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.config_fd = @intCast(fd);
         }
 
-        /// Drain inotify events and re-read the config. One reload per batch
-        /// is enough: writers emit several events (MODIFY + CLOSE_WRITE).
+        /// Drain inotify events and re-read the config when `config` itself
+        /// changes (ignores transient `config.tmp` / `config.new` events).
         fn drainConfigEvents(self: *Self) void {
             var buf: [4096]u8 align(@alignOf(linux.inotify_event)) = undefined;
-            _ = linux.read(self.config_fd, &buf, buf.len);
-            self.reloadConfig();
+            var should_reload = false;
+            while (true) {
+                const rc = linux.read(self.config_fd, &buf, buf.len);
+                const err = linux.errno(rc);
+                if (err != .SUCCESS or rc == 0) break;
+                var off: usize = 0;
+                while (off + @sizeOf(linux.inotify_event) <= rc) {
+                    const ev: *const linux.inotify_event = @ptrCast(@alignCast(&buf[off]));
+                    off += @sizeOf(linux.inotify_event) + ev.len;
+                    if (ev.getName()) |name| {
+                        if (std.mem.eql(u8, name, "config")) should_reload = true;
+                    } else {
+                        should_reload = true;
+                    }
+                }
+            }
+            if (should_reload) self.reloadConfig();
+        }
+
+        fn applyReloadColors(
+            ctx: anytype,
+            old: *const config_loader.RuntimeConfig,
+            next: *const config_loader.RuntimeConfig,
+        ) void {
+            // Preserve live OSC 10/11/12 overrides (e.g. dynamic wallpaper themes)
+            // unless that color key actually changed in the config file.
+            if (old.bg != next.bg) ctx.bg = next.bg orelse cfg.bg;
+            if (old.fg != next.fg) ctx.fg = next.fg orelse cfg.fg;
+            if (old.cursor_color != next.cursor_color) ctx.cursor_color = next.cursor_color orelse cfg.cursor_color;
         }
 
         /// Re-read the config file and apply settings that need no shell,
@@ -3307,12 +3378,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const geo_changed = old.font_size != next.font_size or
                 old.pad_x != next.pad_x or old.pad_y != next.pad_y or
                 old.alt_pad_x != next.alt_pad_x or old.alt_pad_y != next.alt_pad_y;
+            applyReloadColors(&self.ctx, &old, &next);
             self.runtime_cfg = next;
             old.deinit(self.gpa);
-
-            self.ctx.bg = self.runtime_cfg.bg orelse cfg.bg;
-            self.ctx.fg = self.runtime_cfg.fg orelse cfg.fg;
-            self.ctx.cursor_color = self.runtime_cfg.cursor_color orelse cfg.cursor_color;
             self.bg_opacity = self.runtime_cfg.bg_opacity orelse cfg.bg_opacity;
             self.selection_bg = self.runtime_cfg.selection_bg orelse cfg.selection_bg;
             self.selection_fg = self.runtime_cfg.selection_fg orelse cfg.selection_fg;
@@ -3360,6 +3428,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (geo_changed) {
                 const pt = self.runtime_cfg.font_size orelse cfg.font_default_size;
                 self.setFontSize(pt);
+            }
+            if (cfg.indium and self.menu.open) {
+                self.menu.syncConfig(cfg, &self.runtime_cfg, true);
             }
             self.ctx.grid.markAllDirty();
             self.needs_render = true;
@@ -3535,6 +3606,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             if (cfg.indium and self.menu.open) {
                 self.menu.live_dither = !self.menuCpuActive();
+                self.menu.renderer_label = if (self.menuCpuActive()) "CPU SHM" else if (self.egl_sub.active) "EGL Sub" else "GLES 3.0";
+                self.menu.cell_w = self.cell_w;
                 self.menu.syncTheme(self.ctx.bg, self.ctx.fg, &self.ctx.palette);
                 self.ensureMenuHero();
                 if (self.indium_gpu_off or !self.dmabuf_sub.active or self.dmabuf_sub.ready()) {
@@ -3570,6 +3643,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     self.ctx.indium.layers.items,
                     &self.atlas,
                     &self.atlas_dirty,
+                    &self.color_atlas,
+                    &self.color_atlas_dirty,
                     offsets.x,
                     offsets.y,
                     self.cell_w,
@@ -3591,6 +3666,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     self.ctx.indium.layers.items,
                     &self.atlas,
                     &self.atlas_dirty,
+                    &self.color_atlas,
+                    &self.color_atlas_dirty,
                     offsets.x,
                     offsets.y,
                     self.cell_w,
@@ -4173,7 +4250,19 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
 
             if (cfg.indium and self.menu.open) {
-                self.handleMenuAction(self.menu.onKey(sym, mods.shift));
+                const act = self.menu.onKey(self.gpa, sym, mods.shift);
+                switch (act) {
+                    .none => {
+                        if (self.menu.wantsTextInput() and !mods.ctrl and !mods.alt) {
+                            var kbuf: [16]u8 = undefined;
+                            const kn = xkb_state_key_get_utf8(self.xkb_state, keycode, &kbuf, kbuf.len);
+                            if (kn > 0) {
+                                self.handleMenuAction(self.menu.onTextInput(kbuf[0..@intCast(kn)]));
+                            }
+                        }
+                    },
+                    else => self.handleMenuAction(act),
+                }
                 return;
             }
 
@@ -4351,7 +4440,12 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
             if (cfg.indium and sym == K.Escape and !mods.ctrl and !mods.alt and !mods.shift and !mods.super and !self.ctx.alt_active and self.ctx.indium.layers.items.len == 0) {
                 self.menu.openMenu(context_mod.nowMs());
+                self.menu.cell_w = self.cell_w;
                 self.menu.syncTheme(self.ctx.bg, self.ctx.fg, &self.ctx.palette);
+                self.menu.syncConfig(cfg, &self.runtime_cfg, false);
+                self.menu.renderer_label = if (self.menuCpuActive()) "CPU SHM" else if (self.egl_sub.active) "EGL Sub" else "GLES 3.0";
+                const raw_sh = self.runtime_cfg.shell orelse (if (std.c.getenv("SHELL")) |sp| std.mem.span(sp) else "sh");
+                self.menu.shell_label = if (std.mem.lastIndexOfScalar(u8, raw_sh, '/')) |si| raw_sh[si + 1 ..] else if (raw_sh.len > 0) raw_sh else "sh";
                 self.clearHover();
                 self.refreshCursor();
                 self.needs_render = true;
@@ -5723,6 +5817,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             const mods = self.currentMods();
             if (cfg.indium and self.menu.open) {
+                self.menu.cell_w = self.cell_w;
                 const bx: i32 = @divFloor(sx, 256);
                 const by: i32 = @divFloor(sy, 256);
                 self.handleMenuAction(self.menu.onPointerMove(bx, by, self.width, self.height));
@@ -5905,10 +6000,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             const mods = self.currentMods();
             if (cfg.indium and self.menu.open) {
+                self.menu.cell_w = self.cell_w;
                 if (button == 0x110) {
                     const bx: i32 = @divFloor(self.ptr_sx, 256);
                     const by: i32 = @divFloor(self.ptr_sy, 256);
-                    self.handleMenuAction(self.menu.onPointerButton(bx, by, state == 1, self.width, self.height));
+                    self.handleMenuAction(self.menu.onPointerButton(self.gpa, bx, by, state == 1, self.width, self.height));
                 }
                 return;
             }
@@ -6096,7 +6192,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // legacy path stands down so notches never step twice.
             if (self.axis_has_v120) return;
             const mods = self.currentMods();
-            if (cfg.indium and self.menu.open) return;
+            if (cfg.indium and self.menu.open) {
+                const bx: i32 = @divFloor(self.ptr_sx, 256);
+                const by: i32 = @divFloor(self.ptr_sy, 256);
+                const delta_px: i32 = if (value > 0) 36 else if (value < 0) -36 else 0;
+                self.handleMenuAction(self.menu.onScroll(delta_px, bx, by, self.width, self.height));
+                return;
+            }
             if (cfg.indium and self.ctx.indium.layers.items.len > 0) {
                 const bx: i32 = @divFloor(self.ptr_sx, 256);
                 const by: i32 = @divFloor(self.ptr_sy, 256);
@@ -6181,7 +6283,13 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // so nothing ever steps twice).
             self.axis_has_v120 = true;
             const mods = self.currentMods();
-            if (cfg.indium and self.menu.open) return;
+            if (cfg.indium and self.menu.open) {
+                const bx: i32 = @divFloor(self.ptr_sx, 256);
+                const by: i32 = @divFloor(self.ptr_sy, 256);
+                const delta_px: i32 = @divTrunc(value120 * 36, 120);
+                self.handleMenuAction(self.menu.onScroll(delta_px, bx, by, self.width, self.height));
+                return;
+            }
             if (cfg.indium and self.ctx.indium.layers.items.len > 0) {
                 const bx: i32 = @divFloor(self.ptr_sx, 256);
                 const by: i32 = @divFloor(self.ptr_sy, 256);
@@ -6732,4 +6840,24 @@ test "dnd uri-list formatting" {
         defer gpa.free(formatted);
         try std.testing.expectEqualStrings("'/home/user/it'\\''s cool.txt'", formatted);
     }
+}
+
+test "reloadConfig preserves live OSC colors unless config color changed" {
+    const A = App(config_mod.full);
+    var fake_ctx = struct { bg: u32, fg: u32, cursor_color: u32 }{
+        .bg = 0x201012,
+        .fg = 0xEDE0E0,
+        .cursor_color = 0xFF8899,
+    };
+    const old = config_loader.RuntimeConfig{ .bg = 0x0B0F11, .fg = 0xDCDCCC, .cursor_color = 0xDCDCCC, .font_subpixel = true };
+    const unchanged = config_loader.RuntimeConfig{ .bg = 0x0B0F11, .fg = 0xDCDCCC, .cursor_color = 0xDCDCCC, .font_subpixel = false };
+    A.applyReloadColors(&fake_ctx, &old, &unchanged);
+    try std.testing.expectEqual(@as(u32, 0x201012), fake_ctx.bg);
+    try std.testing.expectEqual(@as(u32, 0xEDE0E0), fake_ctx.fg);
+    try std.testing.expectEqual(@as(u32, 0xFF8899), fake_ctx.cursor_color);
+
+    const edited = config_loader.RuntimeConfig{ .bg = 0x1A1B26, .fg = 0xDCDCCC, .cursor_color = 0xDCDCCC, .font_subpixel = false };
+    A.applyReloadColors(&fake_ctx, &unchanged, &edited);
+    try std.testing.expectEqual(@as(u32, 0x1A1B26), fake_ctx.bg);
+    try std.testing.expectEqual(@as(u32, 0xEDE0E0), fake_ctx.fg);
 }

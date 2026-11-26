@@ -314,6 +314,8 @@ pub const SubsurfaceGl = struct {
         layers: []const indium_mod.Layer,
         atlas: *const atlas_mod.Atlas,
         atlas_dirty: *bool,
+        color_atlas: *const atlas_mod.ColorAtlas,
+        color_atlas_dirty: *bool,
         px: i32,
         py: i32,
         cw: i32,
@@ -337,6 +339,10 @@ pub const SubsurfaceGl = struct {
         if (atlas_dirty.* or ren.atlas_size != atlas.size) {
             ren.syncAtlas(atlas);
             atlas_dirty.* = false;
+        }
+        if (color_atlas.pixels.len > 0 and (color_atlas_dirty.* or ren.color_atlas_size != atlas_mod.ColorAtlas.SIZE)) {
+            ren.syncColorAtlas(color_atlas);
+            color_atlas_dirty.* = false;
         }
         gl_mod.Renderer.buildInstances(ren.gpa, &ren.instances, layers, px, py, cw, ch, w, h, atlas.size, glyphs) catch return;
         if (extra.appendFn) |app_fn| {

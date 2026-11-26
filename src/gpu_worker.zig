@@ -635,6 +635,13 @@ pub fn main(init: std.process.Init) !void {
                 if (atlas_sz > 0 and (msg.atlas_dirty != 0 or w.renderer.atlas_size != atlas_sz)) {
                     w.renderer.syncAtlasPixels(atlas_sz, shm[ipc.ATLAS_OFFSET .. ipc.ATLAS_OFFSET + ipc.ATLAS_MAX_BYTES]);
                 }
+                if (msg.color_atlas_size > 0 and (msg.color_atlas_dirty != 0 or w.renderer.color_atlas_size != msg.color_atlas_size)) {
+                    const cpx: [*]const u32 = @ptrCast(@alignCast(shm.ptr + ipc.COLOR_ATLAS_OFFSET));
+                    const cwords = @as(usize, msg.color_atlas_size) * @as(usize, msg.color_atlas_size);
+                    if (cwords * 4 <= ipc.COLOR_ATLAS_BYTES) {
+                        w.renderer.syncColorAtlasPixels(msg.color_atlas_size, cpx[0..cwords]);
+                    }
+                }
 
                 const inst_n = @min(@as(usize, msg.instance_count), ipc.MAX_INSTANCES);
                 const inst_ptr: [*]const gl_mod.Instance = @ptrCast(@alignCast(shm.ptr + ipc.INSTANCES_OFFSET));
