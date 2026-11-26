@@ -453,6 +453,7 @@ test {
     _ = @import("gfx/image_pool.zig");
     _ = @import("gfx/sixel.zig");
     _ = @import("gfx/kitty.zig");
+    _ = @import("gfx/indium.zig");
     _ = @import("gfx/placeholder.zig");
     _ = @import("font/ttf.zig");
     _ = @import("font/ft.zig");
@@ -463,6 +464,7 @@ test {
     _ = @import("render/scrollbar.zig");
     _ = @import("render/box_drawing.zig");
     _ = @import("render/flow.zig");
+    _ = @import("render/motion.zig");
     _ = @import("backend/wayland.zig");
     _ = @import("backend/wl_proto.zig");
     _ = @import("pty.zig");

@@ -14,6 +14,7 @@ const utf8_mod = @import("util/utf8.zig");
 const pool_mod = @import("gfx/image_pool.zig");
 const sixel_mod = @import("gfx/sixel.zig");
 const kitty_mod = @import("gfx/kitty.zig");
+const indium_mod = @import("gfx/indium.zig");
 const placeholder_mod = @import("gfx/placeholder.zig");
 const png_mod = @import("util/png.zig");
 const inflate_mod = @import("util/inflate.zig");
@@ -87,6 +88,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// DCS payload (sixel data). Phase 4 streams this incrementally.
         dcs_buf: std.ArrayList(u8),
         images: pool_mod.Pool,
+        indium: if (cfg.indium) indium_mod.Registry(cfg) else void,
         sixel: sixel_mod.Sixel = .{},
         scratch: scratch_mod.Scratch,
         scratch_backing: []u8,
@@ -179,6 +181,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                 .dcs_buf = dcs_buf,
                 .links = links,
                 .images = images,
+                .indium = if (cfg.indium) indium_mod.Registry(cfg).init(gpa) else {},
                 .scratch = scratch_mod.Scratch.init(scratch_backing),
                 .scratch_backing = scratch_backing,
                 .palette = pal,
@@ -199,6 +202,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             for (self.links.items) |u| self.gpa.free(u);
             self.links.deinit(self.gpa);
             self.images.deinit();
+            if (cfg.indium) self.indium.deinit();
             std.heap.page_allocator.free(self.scratch_backing);
         }
 
@@ -1032,7 +1036,12 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     self.osc_buf.clearRetainingCapacity();
                 },
                 .apc_dispatch => {
-                    if (cfg.kitty_gfx) self.dispatchKitty();
+                    const buf = self.kitty_b64.items;
+                    if (buf.len >= 2 and buf[0] == 'I') {
+                        if (cfg.indium) _ = self.indium.dispatch(buf);
+                    } else if (cfg.kitty_gfx) {
+                        self.dispatchKitty();
+                    }
                     self.shrinkTransferBuf(&self.kitty_b64);
                 },
                 .dcs_dispatch => {
@@ -2202,6 +2211,9 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             // RIS clears all visible images on both buffers.
             if (cfg.kitty_gfx) {
                 self.images.placements.clearRetainingCapacity();
+            }
+            if (cfg.indium) {
+                self.indium.clear();
             }
             self.grid.clearScreen(blank);
             self.grid.offset = 0;

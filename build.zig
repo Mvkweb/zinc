@@ -124,6 +124,38 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
     check_step.dependOn(&bench_exe.step);
 
+    // Indium TUI library + interactive showcase demo.
+    const indium_module = b.createModule(.{
+        .root_source_file = b.path("indium/root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const indium_demo = b.addExecutable(.{
+        .name = "indium-demo",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("indium/examples/showcase.zig"),
+            .target = target,
+            .optimize = optimize,
+            .imports = &.{
+                .{ .name = "indium", .module = indium_module },
+            },
+        }),
+    });
+    b.installArtifact(indium_demo);
+    const indium_demo_run = b.addRunArtifact(indium_demo);
+    indium_demo_run.step.dependOn(b.getInstallStep());
+    const indium_demo_step = b.step("indium-demo", "Run the Indium UI showcase demo (run inside zinc)");
+    indium_demo_step.dependOn(&indium_demo_run.step);
+
+    const indium_tests = b.addTest(.{
+        .name = "indium-tests",
+        .root_module = indium_module,
+    });
+    const run_indium_tests = b.addRunArtifact(indium_tests);
+    test_step.dependOn(&run_indium_tests.step);
+    check_step.dependOn(&indium_demo.step);
+    check_step.dependOn(&indium_tests.step);
+
     // Desktop integration: `zig build install --prefix ~/.local` (or /usr
     // as root) lays out bin/ + share/applications + share/icons +
     // share/metainfo. Everything is prefix-relative — nothing here touches
@@ -186,6 +218,7 @@ pub fn build(b: *std.Build) void {
 /// temporary dangles across the next call).
 const uninstall_rel_paths = [_][]const u8{
     "bin/zinc",
+    "bin/indium-demo",
     "share/applications/io.github.mvkweb.zinc.desktop",
     "share/metainfo/io.github.mvkweb.zinc.metainfo.xml",
     "share/pixmaps/zinc.png",
