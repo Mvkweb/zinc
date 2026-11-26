@@ -90,7 +90,11 @@ pub const Client = struct {
     pub fn flush(self: *Client) !void {
         if (self.out_buf.items.len == 0) return;
         try self.writeAll(self.out_buf.items);
-        self.out_buf.clearRetainingCapacity();
+        if (self.out_buf.capacity > 16 * 1024) {
+            self.out_buf.clearAndFree(self.gpa);
+        } else {
+            self.out_buf.clearRetainingCapacity();
+        }
     }
 
     pub fn deleteLayer(self: *Client, id: u16, exit_kind: proto.ExitKind, dur_ms: f32) !void {

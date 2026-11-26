@@ -162,6 +162,8 @@ pub const LayerParams = struct {
     delay_ms: f32 = 0,
     capture: Capture = .none,
     tick: bool = false,
+    fx_dur_ms: ?f32 = null,
+    sw_trig: ?u8 = null,
 };
 
 pub fn appendFmt(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, comptime fmt: []const u8, args: anytype) !void {
@@ -214,6 +216,13 @@ pub fn writeSetHeader(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, p: LayerP
         p.capture.wireName(),
         @intFromBool(p.tick),
     });
+    if (p.fx_dur_ms) |fd| try appendFmt(buf, gpa, ";fx={d:.0}", .{fd});
+    if (p.sw_trig) |sw| try appendFmt(buf, gpa, ";sw={d}", .{sw});
+}
+
+/// Lightweight geometry-only position/size update (skips re-parsing ops).
+pub fn writeMove(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, id: u16, dx: i32, dy: i32) !void {
+    try appendFmt(buf, gpa, "\x1b_I;s;id={d};dx={d};dy={d};curve=snap\x1b\\", .{ id, dx, dy });
 }
 
 pub fn writeDelete(buf: *std.ArrayList(u8), gpa: std.mem.Allocator, id: u16, exit_kind: ExitKind, dur_ms: f32) !void {

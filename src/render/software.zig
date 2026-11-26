@@ -691,17 +691,33 @@ pub inline fn premult(rgb: u32, alpha: u8) u32 {
     return (a << 24) | (r << 16) | (g << 8) | b;
 }
 
-/// Signed distance to a rounded rectangle (negative inside, positive outside).
-fn roundedBoxSdf(px: f32, py: f32, w: f32, h: f32, r: f32) f32 {
-    const hw = w * 0.5;
-    const hh = h * 0.5;
-    const rad = @min(r, @min(hw, hh));
-    const qx = @abs(px - hw) - (hw - rad);
-    const qy = @abs(py - hh) - (hh - rad);
-    const ox = @max(qx, 0.0);
-    const oy = @max(qy, 0.0);
-    return @sqrt(ox * ox + oy * oy) + @min(@max(qx, qy), 0.0) - rad;
+/// 4-corner fast-path SDF for rounded rectangles: skips `@sqrt` outside the
+/// 4 `radius x radius` corners (exact match to roundedBoxSdf everywhere).
+inline fn roundedBoxSdf(px: f32, py: f32, w: f32, h: f32, r: f32) f32 {
+    if (r <= 0.0) {
+        return @max(@max(-px, px - w), @max(-py, py - h));
+    }
+    const in_x = px >= r and px <= w - r;
+    const in_y = py >= r and py <= h - r;
+    if (in_x and in_y) {
+        return -@min(@min(px, w - px), @min(py, h - py));
+    }
+    if (in_x) return @max(-py, py - h);
+    if (in_y) return @max(-px, px - w);
+    const cx = if (px < r) r - px else px - (w - r);
+    const cy = if (py < r) r - py else py - (h - r);
+    return @sqrt(cx * cx + cy * cy) - r;
 }
+
+const BLOOM_LUT: [256]f32 = blk: {
+    @setEvalBranchQuota(2000);
+    var lut: [256]f32 = undefined;
+    for (&lut, 0..) |*v, i| {
+        const t = @as(f32, @floatFromInt(i)) / 255.0;
+        v.* = @exp(-3.5 * t * t) * (1.0 - t);
+    }
+    break :blk lut;
+};
 
 /// Optional rounded-rectangle + horizontal-reveal clip mask used by `indium`
 /// (e.g. staggered Bayer switch waves clipped inside a pill track).
@@ -1139,16 +1155,22 @@ pub fn drawBloomPremult(
     while (yy < y1) : (yy += 1) {
         const ly: f32 = @as(f32, @floatFromInt(yy - ry)) + 0.5;
         const row_off = @as(usize, @intCast(yy)) * stride;
-        var xx = x0;
+        const skip_mid = yy >= ry + @as(i32, @intFromFloat(@ceil(r_eff))) and
+            yy < ry + rh - @as(i32, @intFromFloat(@ceil(r_eff)));
+        const mid_l: i32 = rx + 1;
+        const mid_r: i32 = rx + rw - 1;
+        var xx: i32 = x0;
         while (xx < x1) : (xx += 1) {
+            if (skip_mid and mid_l < mid_r and xx >= mid_l and xx < mid_r) {
+                xx = mid_r - 1;
+                continue;
+            }
             const lx: f32 = @as(f32, @floatFromInt(xx - rx)) + 0.5;
             const d = roundedBoxSdf(lx, ly, fw, fh, r_eff);
             if (d >= sp_f) continue;
-            const t = @max(0.0, d) / sp_f;
-            // Smooth Gaussian-like falloff tapered cleanly to 0 at t == 1.
-            const edge_fade = 1.0 - t;
-            const gauss = @exp(-3.5 * t * t) * edge_fade;
-            const a: u8 = @intFromFloat(@round(op_f * gauss));
+            const t = std.math.clamp(@max(0.0, d) / sp_f, 0.0, 1.0);
+            const lut_idx: usize = @intFromFloat(t * 255.0);
+            const a: u8 = @intFromFloat(@round(op_f * BLOOM_LUT[lut_idx]));
             if (a == 0) continue;
             const idx = row_off + @as(usize, @intCast(xx));
             buf[idx] = blendPremult(buf[idx], premult(rgb, a));
@@ -1246,8 +1268,16 @@ pub fn drawDropShadowPremult(
     while (yy < y1) : (yy += 1) {
         const ly: f32 = @as(f32, @floatFromInt(yy - (ry + 4))) + 0.5;
         const row_off = @as(usize, @intCast(yy)) * stride;
-        var xx = x0;
+        const r_i: i32 = @intFromFloat(@ceil(r_eff));
+        const skip_mid = yy >= ry + 4 + r_i and yy < ry + 4 + rh - r_i;
+        const mid_l: i32 = rx + r_i;
+        const mid_r: i32 = rx + rw - r_i;
+        var xx: i32 = x0;
         while (xx < x1) : (xx += 1) {
+            if (skip_mid and mid_l < mid_r and xx >= mid_l and xx < mid_r) {
+                xx = mid_r - 1;
+                continue;
+            }
             const lx: f32 = @as(f32, @floatFromInt(xx - rx)) + 0.5;
             const d = roundedBoxSdf(lx, ly, fw, fh, r_eff);
             if (d <= 0.0 or d >= 9.0) continue;
@@ -1259,6 +1289,124 @@ pub fn drawDropShadowPremult(
         }
     }
     if (dmg) |d| d.add(x0, y0, x1 - x0, y1 - y0);
+}
+
+/// CSS `cubic-bezier(0.23, 1, 0.32, 1)` ease-out matching dither-switch.tsx.
+pub fn cubicBezierOut(u_in: f32) f32 {
+    const u = std.math.clamp(u_in, 0.0, 1.0);
+    if (u <= 0.0) return 0.0;
+    if (u >= 1.0) return 1.0;
+    var lo: f32 = 0.0;
+    var hi: f32 = 1.0;
+    var i: usize = 0;
+    while (i < 10) : (i += 1) {
+        const s = (lo + hi) * 0.5;
+        const omp = 1.0 - s;
+        const bx = 3.0 * 0.23 * s * omp * omp + 3.0 * 0.32 * s * s * omp + s * s * s;
+        if (bx < u) lo = s else hi = s;
+    }
+    const s = (lo + hi) * 0.5;
+    const omp = 1.0 - s;
+    return 1.0 - omp * omp * omp;
+}
+
+inline fn quantizeCells(p: f32, steps: i32, cell: i32) i32 {
+    const s = @min(steps, @as(i32, @intFromFloat(@round(std.math.clamp(p, 0.0, 1.0) * @as(f32, @floatFromInt(steps))))));
+    return @max(0, s) * cell;
+}
+
+/// 1:1 dither-sdk `DitherSwitch` (`elapsed_ms` in 0..260, `checked` = target direction).
+pub fn drawSwitchPremult(
+    buf: []u32,
+    stride: u32,
+    height: u32,
+    tx: i32,
+    ty: i32,
+    tw: i32,
+    th: i32,
+    rad: u8,
+    cell_px: u8,
+    ink_rgb: u32,
+    light_rgb: u32,
+    dark_rgb: u32,
+    hovered: bool,
+    checked: bool,
+    elapsed_ms: f32,
+) void {
+    const cell: i32 = @max(1, @as(i32, cell_px));
+    const pad: i32 = @max(cell, @divTrunc(if (th >= 28) @as(i32, 4) else @as(i32, 2), cell) * cell);
+    const knob_sz: i32 = @max(cell * 2, th - pad * 2);
+    const knob_rad: u8 = @intCast(@max(2, @as(i32, rad) - pad));
+    const track_steps: i32 = @max(1, @divTrunc(tw, cell));
+    const travel_steps: i32 = @max(1, @divTrunc(@max(0, tw - knob_sz - pad * 2), cell));
+    const dur_ms: f32 = 180.0;
+    const stagger_ms: f32 = 20.0;
+
+    const full_clip = LayerClip{
+        .mask_x = tx,
+        .mask_y = ty,
+        .mask_w = tw,
+        .mask_h = th,
+        .mask_r = rad,
+        .vis_x = tx,
+        .vis_w = tw,
+    };
+
+    // 1. Off-state track clipped strictly inside rounded track silhouette.
+    fillRoundedRectPremult(buf, stride, height, tx, ty, tw, th, rad, 0x151518, 255, 0, 0, false, full_clip);
+    fillDitherRectPremult(buf, stride, height, tx, ty + @divTrunc(th, 3), tw, th - @divTrunc(th, 3), 0, 0x151518, 0, 0x7A7A86, if (hovered) 170 else 120, false, true, cell_px, 0, full_clip);
+    fillRoundedRectPremult(buf, stride, height, tx, ty, tw, th, rad, 0, 0, 0x3C3C44, 255, false, null);
+
+    // 2. Subtle active bloom (`bloom="low"`).
+    const base_u = std.math.clamp(elapsed_ms / dur_ms, 0.0, 1.0);
+    const lit_frac = if (checked) cubicBezierOut(base_u) else 1.0 - cubicBezierOut(base_u);
+    if (lit_frac > 0.05) {
+        const b_op: u8 = @intFromFloat(@round(lit_frac * (if (hovered) @as(f32, 62.0) else @as(f32, 44.0))));
+        drawBloomPremult(buf, stride, height, tx, ty, tw, th, rad, ink_rgb, b_op, 10);
+    }
+
+    // 3. Staggered 4-wave Bayer sweep [3/16, 6/16, 9/16, 12/16] + full lit surface.
+    const patterns = [_]u8{ 5, 6, 7, 8 };
+    for (patterns, 0..) |pat, wi| {
+        const delay: f32 = if (checked)
+            @as(f32, @floatFromInt(wi)) * stagger_ms
+        else
+            @as(f32, @floatFromInt(4 - wi)) * stagger_ms;
+        const u = std.math.clamp((elapsed_ms - delay) / dur_ms, 0.0, 1.0);
+        const p = if (checked) cubicBezierOut(u) else 1.0 - cubicBezierOut(u);
+        const vis_w = quantizeCells(p, track_steps, cell);
+        if (vis_w > 0) {
+            const wclip = LayerClip{ .mask_x = tx, .mask_y = ty, .mask_w = tw, .mask_h = th, .mask_r = rad, .vis_x = tx, .vis_w = vis_w };
+            fillDitherRectPremult(buf, stride, height, tx, ty, tw, th, 0, ink_rgb, 255, 0x000000, 0, true, true, cell_px, pat, wclip);
+        }
+    }
+
+    const delay_lit: f32 = if (checked) 4.0 * stagger_ms else 0.0;
+    const u_lit = std.math.clamp((elapsed_ms - delay_lit) / dur_ms, 0.0, 1.0);
+    const p_lit = if (checked) cubicBezierOut(u_lit) else 1.0 - cubicBezierOut(u_lit);
+    const vis_lit = quantizeCells(p_lit, track_steps, cell);
+    if (vis_lit > 0) {
+        const lclip = LayerClip{ .mask_x = tx, .mask_y = ty, .mask_w = tw, .mask_h = th, .mask_r = rad, .vis_x = tx, .vis_w = vis_lit };
+        fillRoundedRectPremult(buf, stride, height, tx, ty, tw, th, rad, ink_rgb, 255, 0, 0, false, lclip);
+        const sh_h = @min(th, cell * 8);
+        const hi_h = if (hovered) @min(th, cell * 9) else @min(th, cell * 4);
+        fillDitherRectPremult(buf, stride, height, tx, ty + th - sh_h, tw, sh_h, 0, ink_rgb, 0, dark_rgb, 225, false, true, cell_px, 0, lclip);
+        fillDitherRectPremult(buf, stride, height, tx, ty, tw, hi_h, 0, light_rgb, if (hovered) 245 else 185, ink_rgb, 0, false, true, cell_px, 0, lclip);
+        fillRoundedRectPremult(buf, stride, height, tx, ty, tw, th, rad, 0, 0, dark_rgb, 255, false, lclip);
+    }
+
+    // 4. Knob: checkerboard drop shadow + beveled knob + border LAST.
+    const p_k = if (checked) cubicBezierOut(base_u) else 1.0 - cubicBezierOut(base_u);
+    const kx: i32 = tx + pad + quantizeCells(p_k, travel_steps, cell);
+    const ky: i32 = ty + pad;
+
+    fillDitherRectPremult(buf, stride, height, kx, ky + cell, knob_sz, knob_sz, knob_rad, 0x000000, 115, 0x000000, 0, false, true, cell_px, 3, null);
+    const kclip = LayerClip{ .mask_x = kx, .mask_y = ky, .mask_w = knob_sz, .mask_h = knob_sz, .mask_r = knob_rad, .vis_x = kx, .vis_w = knob_sz };
+    fillRoundedRectPremult(buf, stride, height, kx, ky, knob_sz, knob_sz, knob_rad, 0xECECF0, 255, 0, 0, false, kclip);
+    fillDitherRectPremult(buf, stride, height, kx, ky + knob_sz - @min(knob_sz, cell * 4), knob_sz, @min(knob_sz, cell * 4), 0, 0xECECF0, 0, 0xB2B3BC, 235, false, true, cell_px, 0, kclip);
+    const khi_h = if (hovered) @min(knob_sz, cell * 7) else @min(knob_sz, cell * 3);
+    fillDitherRectPremult(buf, stride, height, kx, ky, knob_sz, khi_h, 0, 0xFFFFFF, if (hovered) 245 else 210, 0xECECF0, 0, false, true, cell_px, 0, kclip);
+    fillRoundedRectPremult(buf, stride, height, kx, ky, knob_sz, knob_sz, knob_rad, 0, 0, 0x000000, 145, false, null);
 }
 
 test "blitLayerPremult clips, fades, and reports damage" {

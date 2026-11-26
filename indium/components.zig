@@ -52,28 +52,17 @@ pub const Button = struct {
     hovered: bool = false,
     pressed: bool = false,
     focused: bool = false,
-    sweep_t: f32 = 1.0,
-    ripple_t: f32 = 1.0,
+    fx_mode: u8 = 0, // 0=none, 1=sweep, 2=ripple
     press_x: i32 = 0,
     press_y: i32 = 0,
 
-    pub fn stepAnim(self: *Button, dt_ms: f32) bool {
-        var any = false;
-        const dt = @min(dt_ms, 32.0);
-        if (self.sweep_t < 1.0) {
-            self.sweep_t = @min(1.0, self.sweep_t + dt / 620.0);
-            any = true;
-        }
-        if (self.ripple_t < 1.0) {
-            self.ripple_t = @min(1.0, self.ripple_t + dt / 560.0);
-            any = true;
-        }
-        return any;
+    pub fn render(self: *const Button, dl: *draw_mod.DrawList, client: *term_mod.Client) !void {
+        return self.renderWithTrigger(dl, client, null);
     }
 
-    pub fn render(self: *const Button, dl: *draw_mod.DrawList, client: *term_mod.Client) !void {
+    fn renderWithTrigger(self: *const Button, dl: *draw_mod.DrawList, client: *term_mod.Client, fx_dur_ms: ?f32) !void {
         const is_pri = self.variant == .primary;
-        // 1:1 dither-sdk DitherButton surface + DitherFx sweep/ripple clipped cleanly inside rounded corners.
+        // 1:1 dither-sdk DitherButton surface + local zinc-ticked DitherFx sweep/ripple.
         const ink: u32 = 0x7E8AFF;
         const ink_light: u32 = 0xC2C8FF;
         const ink_dark: u32 = 0x3A4085;
@@ -109,7 +98,7 @@ pub const Button = struct {
             .stiffness = 560,
             .damping = 30,
             .capture = .pointer,
-            .tick = self.sweep_t < 1.0 or self.ripple_t < 1.0,
+            .fx_dur_ms = fx_dur_ms,
         });
 
         const bw: i32 = @intCast(self.w);
@@ -131,15 +120,13 @@ pub const Button = struct {
                 const hi_h: i32 = if (self.hovered) top_h + 4 else top_h;
                 try dl.ditherRectEx(inner_x, inner_y, bw, hi_h, 0, ink_light, hi_op, ink, 0, .vertical, true, 2, .gradient);
             }
-            if (self.sweep_t < 1.0) {
-                try dl.ditherFx(inner_x, inner_y, bw, bh, 9, 2, 0xFFFFFF, .sweep, self.sweep_t, 0, 0, 0.7);
-            }
-            if (self.ripple_t < 1.0) {
-                try dl.ditherFx(inner_x, inner_y, bw, bh, 9, 2, 0xFFFFFF, .ripple, self.ripple_t, inner_x + self.press_x, inner_y + self.press_y, 0.75);
+            if (self.fx_mode == 1) {
+                try dl.ditherFx(inner_x, inner_y, bw, bh, 9, 2, 0xFFFFFF, .sweep, -1.0, 0, 0, 0.7);
+            } else if (self.fx_mode == 2) {
+                try dl.ditherFx(inner_x, inner_y, bw, bh, 9, 2, 0xFFFFFF, .ripple, -1.0, inner_x + self.press_x, inner_y + self.press_y, 0.75);
             }
             try dl.line(inner_x + 1, inner_y + 1, bw - 2, 1, ink_edge_lip, if (self.pressed) 90 else 200);
             try dl.popClip();
-            // Outer border drawn LAST above bevel fills.
             try dl.roundRect(inner_x, inner_y, bw, bh, 9, 0, 0, ink_edge_filled, 255, false);
         } else {
             try dl.pushClip(inner_x, inner_y, bw, bh, 9, inner_x, bw);
@@ -147,11 +134,10 @@ pub const Button = struct {
             const bot_h: i32 = @max(6, @divTrunc(bh * 34, 100));
             const ramp_op: u8 = if (self.pressed) 170 else if (self.hovered) 205 else 135;
             try dl.ditherRectEx(inner_x, inner_y + bh - bot_h, bw, bot_h, 0, outline_bg, 0, ink, ramp_op, .vertical, true, 2, .gradient);
-            if (self.sweep_t < 1.0) {
-                try dl.ditherFx(inner_x, inner_y, bw, bh, 9, 2, ink, .sweep, self.sweep_t, 0, 0, 0.7);
-            }
-            if (self.ripple_t < 1.0) {
-                try dl.ditherFx(inner_x, inner_y, bw, bh, 9, 2, ink, .ripple, self.ripple_t, inner_x + self.press_x, inner_y + self.press_y, 0.75);
+            if (self.fx_mode == 1) {
+                try dl.ditherFx(inner_x, inner_y, bw, bh, 9, 2, ink, .sweep, -1.0, 0, 0, 0.7);
+            } else if (self.fx_mode == 2) {
+                try dl.ditherFx(inner_x, inner_y, bw, bh, 9, 2, ink, .ripple, -1.0, inner_x + self.press_x, inner_y + self.press_y, 0.75);
             }
             try dl.popClip();
             try dl.roundRect(inner_x, inner_y, bw, bh, 9, 0, 0, outline_bd, 255, false);
@@ -172,27 +158,27 @@ pub const Button = struct {
         switch (ev.kind) {
             .enter => {
                 self.hovered = true;
-                if (self.sweep_t >= 1.0) self.sweep_t = 0.0;
-                try self.render(dl, client);
+                self.fx_mode = 1;
+                try self.renderWithTrigger(dl, client, 620.0);
             },
             .leave => {
                 self.hovered = false;
                 self.pressed = false;
-                try self.render(dl, client);
+                try self.renderWithTrigger(dl, client, null);
             },
             .down => {
                 if (ev.btn == 1) {
                     self.pressed = true;
+                    self.fx_mode = 2;
                     self.press_x = ev.x - pad;
                     self.press_y = ev.y - pad;
-                    self.ripple_t = 0.0;
-                    try self.render(dl, client);
+                    try self.renderWithTrigger(dl, client, 560.0);
                 }
             },
             .up => {
                 const was_pressed = self.pressed;
                 self.pressed = false;
-                try self.render(dl, client);
+                try self.renderWithTrigger(dl, client, null);
                 if (was_pressed and ev.btn == 1) return true;
             },
             else => {},
@@ -202,15 +188,12 @@ pub const Button = struct {
 };
 
 /// 1:1 dither-sdk SwitchCard: neutral-black card containing stacked toggle rows
-/// (`Auto-deploy` / `Preview comments`) using exact `dither-switch.tsx` wave & cellSteps physics.
+/// (`Auto-deploy` / `Preview comments`), driven natively by zinc at 144Hz.
 pub const SwitchItem = struct {
     title: []const u8,
     subtitle: []const u8,
     checked: bool = false,
     hovered: bool = false,
-    elapsed_ms: f32 = 260.0,
-    animating: bool = false,
-    ripple_t: f32 = 1.0,
 };
 
 pub const SwitchCard = struct {
@@ -222,136 +205,24 @@ pub const SwitchCard = struct {
     items: [2]SwitchItem,
     row_h: u16 = 74,
 
-    // Exact dither-switch.tsx size="lg" (width=54, height=30, pad=4, thumb=22, travel=24, radius=10, thumbRadius=6, cell=2)
+    // Exact dither-switch.tsx size="lg" (width=54, height=30, pad=4, radius=10, cell=2)
     const TRACK_W: i32 = 54;
     const TRACK_H: i32 = 30;
     const TRACK_RAD: u8 = 10;
-    const PAD: i32 = 4;
-    const KNOB_SZ: i32 = 22;
-    const KNOB_RAD: u8 = 6;
-    const CELL: i32 = 2;
-    const TRACK_STEPS: i32 = 27; // TRACK_W / CELL
-    const TRAVEL_STEPS: i32 = 12; // (TRACK_W - KNOB_SZ - PAD * 2) / CELL
-    const DURATION_MS: f32 = 180.0;
-    const STAGGER_MS: f32 = 20.0;
-    const TOTAL_MS: f32 = DURATION_MS + 4.0 * STAGGER_MS; // 260ms
 
     pub fn cardHeight(self: *const SwitchCard) u16 {
         return self.row_h * 2;
     }
 
     pub fn initStates(self: *SwitchCard) void {
-        for (&self.items) |*it| {
-            it.elapsed_ms = TOTAL_MS;
-            it.animating = false;
-            it.ripple_t = 1.0;
-        }
-    }
-
-    pub fn stepAnim(self: *SwitchCard, dt_ms: f32) bool {
-        var any = false;
-        const dt = @min(dt_ms, 32.0);
-        for (&self.items) |*it| {
-            if (it.animating) {
-                it.elapsed_ms = @min(TOTAL_MS, it.elapsed_ms + dt);
-                if (it.elapsed_ms >= TOTAL_MS) {
-                    it.elapsed_ms = TOTAL_MS;
-                    it.animating = false;
-                }
-                any = true;
-            }
-            if (it.ripple_t < 1.0) {
-                it.ripple_t = @min(1.0, it.ripple_t + dt / 560.0);
-                any = true;
-            }
-        }
-        return any;
-    }
-
-    fn anyAnimating(self: *const SwitchCard) bool {
-        for (self.items) |it| if (it.animating or it.ripple_t < 1.0) return true;
-        return false;
-    }
-
-    fn drawSwitchAt(dl: *draw_mod.DrawList, tx: i32, ty: i32, it: SwitchItem) !void {
-        const ink: u32 = Theme.accent_indigo;
-        const ink_light: u32 = 0xC6CCFF;
-        const ink_dark: u32 = 0x3A4085;
-        const grey: u32 = 0x7A7A86;
-
-        // 1. Off-state track clipped strictly inside the rounded track silhouette.
-        try dl.pushClip(tx, ty, TRACK_W, TRACK_H, TRACK_RAD, tx, TRACK_W);
-        try dl.roundRect(tx, ty, TRACK_W, TRACK_H, TRACK_RAD, 0x151518, 255, 0, 0, false);
-        try dl.ditherRectEx(tx, ty + 10, TRACK_W, 20, 0, 0x151518, 0, grey, if (it.hovered) 170 else 120, .vertical, true, 2, .gradient);
-        try dl.popClip();
-        try dl.roundRect(tx, ty, TRACK_W, TRACK_H, TRACK_RAD, 0, 0, 0x3C3C44, 255, false);
-
-        // 2. Active subtle bloom (`bloom="low"` matching dither-switch-controls.ts)
-        const base_u = std.math.clamp(it.elapsed_ms / DURATION_MS, 0.0, 1.0);
-        const lit_frac = if (it.checked) cubicBezierOut(base_u) else 1.0 - cubicBezierOut(base_u);
-        if (lit_frac > 0.05) {
-            const b_op: u8 = @intFromFloat(@round(lit_frac * (if (it.hovered) @as(f32, 62.0) else @as(f32, 44.0))));
-            try dl.bloom(tx, ty, TRACK_W, TRACK_H, TRACK_RAD, ink, b_op, 10);
-        }
-
-        // 3. Staggered 4-stage Bayer wave [3/16, 6/16, 9/16, 12/16] + full lit surface:
-        //    - Turning ON:  sparse 3/16 starts at 0ms -> 6/16 (20ms) -> 9/16 (40ms) -> 12/16 (60ms) -> full surface (80ms)
-        //    - Turning OFF: full surface pulls back FIRST at 0ms -> 12/16 (20ms) -> 9/16 (40ms) -> 6/16 (60ms) -> 3/16 (80ms)
-        const patterns = [_]draw_mod.DitherPattern{ .bayer3, .bayer6, .bayer9, .bayer12 };
-        for (patterns, 0..) |pat, wi| {
-            const delay: f32 = if (it.checked)
-                @as(f32, @floatFromInt(wi)) * STAGGER_MS
-            else
-                @as(f32, @floatFromInt(4 - wi)) * STAGGER_MS;
-            const u = std.math.clamp((it.elapsed_ms - delay) / DURATION_MS, 0.0, 1.0);
-            const p = if (it.checked) cubicBezierOut(u) else 1.0 - cubicBezierOut(u);
-            const vis_w = quantizeCells(p, TRACK_STEPS, CELL);
-            if (vis_w > 0) {
-                try dl.pushClip(tx, ty, TRACK_W, TRACK_H, TRACK_RAD, tx, vis_w);
-                try dl.ditherRectEx(tx, ty, TRACK_W, TRACK_H, 0, ink, 255, 0x000000, 0, .horizontal, true, 2, pat);
-                try dl.popClip();
-            }
-        }
-
-        // Layer 4: full lit surface (highlight dithered from top + shade dithered from bottom + edge)
-        const delay_lit: f32 = if (it.checked) 4.0 * STAGGER_MS else 0.0;
-        const u_lit = std.math.clamp((it.elapsed_ms - delay_lit) / DURATION_MS, 0.0, 1.0);
-        const p_lit = if (it.checked) cubicBezierOut(u_lit) else 1.0 - cubicBezierOut(u_lit);
-        const vis_lit = quantizeCells(p_lit, TRACK_STEPS, CELL);
-        if (vis_lit > 0) {
-            try dl.pushClip(tx, ty, TRACK_W, TRACK_H, TRACK_RAD, tx, vis_lit);
-            try dl.roundRect(tx, ty, TRACK_W, TRACK_H, TRACK_RAD, ink, 255, 0, 0, false);
-            try dl.ditherRectEx(tx, ty + TRACK_H - 16, TRACK_W, 16, 0, ink, 0, ink_dark, 225, .vertical, true, 2, .gradient);
-            try dl.ditherRectEx(tx, ty, TRACK_W, if (it.hovered) 18 else 8, 0, ink_light, if (it.hovered) 245 else 185, ink, 0, .vertical, true, 2, .gradient);
-            try dl.line(tx + 1, ty + 1, TRACK_W - 2, 1, 0xCED4FF, 165);
-            try dl.roundRect(tx, ty, TRACK_W, TRACK_H, TRACK_RAD, 0, 0, 0x4E57B5, 255, false);
-            try dl.popClip();
-        }
-
-        // Optional DitherFx press ripple inside track
-        if (it.ripple_t < 1.0) {
-            try dl.ditherFx(tx, ty, TRACK_W, TRACK_H, TRACK_RAD, 2, ink, .ripple, it.ripple_t, tx + @divTrunc(TRACK_W, 2), ty + @divTrunc(TRACK_H, 2), 0.7);
-        }
-
-        // 4. Knob (`size="lg"` -> 22x22): staircase cubic-bezier movement snapped to 2px cells!
-        const p_k = if (it.checked) cubicBezierOut(base_u) else 1.0 - cubicBezierOut(base_u);
-        const snap_kx = quantizeCells(p_k, TRAVEL_STEPS, CELL);
-        const kx: i32 = tx + PAD + snap_kx;
-        const ky: i32 = ty + PAD;
-
-        // 50% checkerboard drop shadow 2px (1 cell) beneath knob
-        try dl.ditherRectEx(kx, ky + 2, KNOB_SZ, KNOB_SZ, KNOB_RAD, 0x000000, 115, 0x000000, 0, .vertical, true, 2, .checker);
-
-        // Clip all interior knob fills cleanly inside KNOB_RAD, then draw 1px border LAST!
-        try dl.pushClip(kx, ky, KNOB_SZ, KNOB_SZ, KNOB_RAD, kx, KNOB_SZ);
-        try dl.roundRect(kx, ky, KNOB_SZ, KNOB_SZ, KNOB_RAD, 0xECECF0, 255, 0, 0, false);
-        try dl.ditherRectEx(kx, ky + KNOB_SZ - 8, KNOB_SZ, 8, 0, 0xECECF0, 0, 0xB2B3BC, 235, .vertical, true, 2, .gradient);
-        try dl.ditherRectEx(kx, ky, KNOB_SZ, if (it.hovered) 14 else 6, 0, 0xFFFFFF, if (it.hovered) 245 else 210, 0xECECF0, 0, .vertical, true, 2, .gradient);
-        try dl.popClip();
-        try dl.roundRect(kx, ky, KNOB_SZ, KNOB_SZ, KNOB_RAD, 0, 0, 0x000000, 145, false);
+        _ = self;
     }
 
     pub fn render(self: *const SwitchCard, dl: *draw_mod.DrawList, client: *term_mod.Client) !void {
+        return self.renderWithTrigger(dl, client, null);
+    }
+
+    fn renderWithTrigger(self: *const SwitchCard, dl: *draw_mod.DrawList, client: *term_mod.Client, toggled_row: ?u8) !void {
         const cw = @max(1, client.info.cw);
         const ch = @max(1, client.info.ch);
         const card_h = self.cardHeight();
@@ -370,7 +241,8 @@ pub const SwitchCard = struct {
             .shadow = false,
             .sheen = true,
             .capture = .pointer,
-            .tick = self.anyAnimating(),
+            .fx_dur_ms = if (toggled_row != null) @as(f32, 560.0) else null,
+            .sw_trig = toggled_row,
         });
 
         try dl.line(1, @intCast(self.row_h), @as(i32, self.w) - 2, 1, Theme.card_border, 255);
@@ -384,7 +256,6 @@ pub const SwitchCard = struct {
                 try dl.roundRect(4, ry + 4, @as(i32, self.w) - 8, @as(i32, self.row_h) - 8, 8, 0x111115, 180, 0, 0, false);
             }
 
-            // Word-wrap subtitle cleanly inside [18 .. tx - 16] so text never hits the switch!
             if (it.subtitle.len <= max_chars) {
                 const title_y = ry + @divTrunc(@as(i32, self.row_h) - ch * 2 - 4, 2);
                 try dl.text(18, title_y, Theme.text_primary, .{ .bold = true }, it.title);
@@ -406,7 +277,8 @@ pub const SwitchCard = struct {
             }
 
             const ty: i32 = ry + @divTrunc(@as(i32, self.row_h) - TRACK_H, 2);
-            try drawSwitchAt(dl, tx, ty, it);
+            try dl.ditherFx(tx, ty, TRACK_W, TRACK_H, TRACK_RAD, 2, Theme.accent_indigo, .ripple, -1.0, tx + @divTrunc(TRACK_W, 2), ty + @divTrunc(TRACK_H, 2), 0.7);
+            try dl.switchToggle(tx, ty, TRACK_W, TRACK_H, TRACK_RAD, 2, Theme.accent_indigo, 0xC6CCFF, 0x3A4085, it.hovered, it.checked, @intCast(idx));
         }
         try client.queueBytes(try dl.finishLayer());
     }
@@ -425,7 +297,7 @@ pub const SwitchCard = struct {
                         dirty = true;
                     }
                 }
-                if (dirty) try self.render(dl, client);
+                if (dirty) try self.renderWithTrigger(dl, client, null);
             },
             .leave => {
                 var dirty = false;
@@ -435,15 +307,12 @@ pub const SwitchCard = struct {
                         dirty = true;
                     }
                 }
-                if (dirty) try self.render(dl, client);
+                if (dirty) try self.renderWithTrigger(dl, client, null);
             },
             .down => if (ev.btn == 1) {
                 const row_idx: usize = if (ev.y >= @as(i32, self.row_h)) 1 else 0;
                 self.items[row_idx].checked = !self.items[row_idx].checked;
-                self.items[row_idx].elapsed_ms = 0.0;
-                self.items[row_idx].animating = true;
-                self.items[row_idx].ripple_t = 0.0;
-                try self.render(dl, client);
+                try self.renderWithTrigger(dl, client, @intCast(row_idx));
                 return row_idx;
             },
             else => {},

@@ -264,6 +264,42 @@ pub const DrawList = struct {
         );
     }
 
+    pub fn switchToggle(
+        self: *DrawList,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        radius: u8,
+        cell: u8,
+        ink_rgb: u32,
+        light_rgb: u32,
+        dark_rgb: u32,
+        hovered: bool,
+        checked: bool,
+        slot: u8,
+    ) !void {
+        try proto.appendFmt(
+            &self.buf,
+            self.gpa,
+            "|W,{d},{d},{d},{d},{d},{d},{x:0>6},{x:0>6},{x:0>6},{d},{d},{d}",
+            .{
+                x,
+                y,
+                w,
+                h,
+                radius,
+                cell,
+                ink_rgb & 0xFFFFFF,
+                light_rgb & 0xFFFFFF,
+                dark_rgb & 0xFFFFFF,
+                @intFromBool(hovered),
+                @intFromBool(checked),
+                slot,
+            },
+        );
+    }
+
     pub fn text(self: *DrawList, x: i32, y: i32, fg_rgb: u32, style: TextStyle, msg: []const u8) !void {
         if (msg.len == 0) return;
         const fl: u8 = @as(u8, @intFromBool(style.bold)) |

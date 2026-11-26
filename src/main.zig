@@ -465,8 +465,13 @@ test {
     _ = @import("render/box_drawing.zig");
     _ = @import("render/flow.zig");
     _ = @import("render/motion.zig");
+    _ = @import("render/gl.zig");
+    _ = @import("render/gpu_ipc.zig");
     _ = @import("backend/wayland.zig");
     _ = @import("backend/wl_proto.zig");
+    _ = @import("backend/wl_egl.zig");
+    _ = @import("backend/wl_dmabuf.zig");
+    _ = @import("ui/menu.zig");
     _ = @import("pty.zig");
     _ = @import("session.zig");
     _ = @import("input/keyboard.zig");

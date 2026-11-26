@@ -1277,6 +1277,7 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         /// Back to the main screen, restoring the saved cursor.
         fn exitAlt(self: *Self) void {
             if (!self.alt_active) return;
+            if (cfg.indium) self.indium.clear();
             self.grid.swapAlt();
             self.alt_active = false;
             self.cursor_col = @min(self.alt_saved_col, self.grid.cols -| 1);

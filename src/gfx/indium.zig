@@ -133,6 +133,21 @@ pub const DrawOp = union(enum) {
         py: i32 = 0,
         strength: f32 = 0.7,
     },
+    /// 1:1 dither-sdk animated switch row rendered locally at monitor vsync.
+    switch_toggle: struct {
+        x: i32,
+        y: i32,
+        w: i32 = 54,
+        h: i32 = 30,
+        radius: u8 = 10,
+        cell: u8 = 2,
+        ink_rgb: u32 = 0x828EFF,
+        light_rgb: u32 = 0xC6CCFF,
+        dark_rgb: u32 = 0x3A4085,
+        hovered: bool = false,
+        checked: bool = false,
+        slot: u8 = 0,
+    },
 };
 
 pub const LayerSpec = struct {
@@ -173,6 +188,8 @@ pub const LayerSpec = struct {
     delay_ms: f32 = 0,
     capture: CaptureMode = .none,
     tick: bool = false,
+    fx_dur_ms: ?f32 = null,
+    sw_trig: ?u8 = null,
     has_ops: bool = false,
 };
 
@@ -199,6 +216,14 @@ pub const Layer = struct {
     exiting: bool = false,
     unclipped_w: bool = true,
     unclipped_h: bool = true,
+
+    /// Local GPU/vsync-driven animation timers (eliminates 144Hz PTY traffic).
+    fx_active: bool = false,
+    fx_dur_ms: f32 = 600.0,
+    fx_elapsed_ms: f32 = 0.0,
+    fx_t: f32 = 0.0,
+    sw_active: [4]bool = @splat(false),
+    sw_elapsed_ms: [4]f32 = @splat(260.0),
 
     motion: motion_mod.LayerMotion = .{},
     ops: std.ArrayList(DrawOp) = .empty,
@@ -269,6 +294,8 @@ pub fn Registry(comptime cfg: config_mod.Config) type {
         finished_exits: std.ArrayList(u16) = .empty,
         query_pending: bool = false,
         dirty: bool = false,
+        cleared_seq: u64 = 0,
+        last_step_ms: i64 = 0,
 
         const Self = @This();
 
@@ -295,14 +322,17 @@ pub fn Registry(comptime cfg: config_mod.Config) type {
                 }
                 l.deinit(self.gpa);
             }
-            self.layers.clearRetainingCapacity();
+            self.layers.clearAndFree(self.gpa);
+            self.finished_exits.clearAndFree(self.gpa);
+            self.cleared_seq +%= 1;
             self.dirty = true;
         }
 
         pub fn settled(self: *const Self) bool {
             if (self.vacated.items.len > 0 or self.dirty) return false;
             for (self.layers.items) |*l| {
-                if (l.bitmap_dirty or l.exiting or !l.motion.settled()) return false;
+                if (l.bitmap_dirty or l.exiting or !l.motion.settled() or l.fx_active) return false;
+                for (l.sw_active) |act| if (act) return false;
             }
             return true;
         }
@@ -324,10 +354,34 @@ pub fn Registry(comptime cfg: config_mod.Config) type {
         /// Step all layer animations to `now_ms`. Any layer finishing its
         /// exit animation is queued in `finished_exits` and removed.
         pub fn step(self: *Self, now_ms: i64) void {
+            const dt_ms: f32 = if (self.last_step_ms > 0 and now_ms > self.last_step_ms)
+                @floatFromInt(@min(32, now_ms - self.last_step_ms))
+            else
+                8.0;
+            self.last_step_ms = now_ms;
+
             var i: usize = 0;
             while (i < self.layers.items.len) {
                 var l = &self.layers.items[i];
                 l.motion.step(now_ms);
+                if (l.fx_active) {
+                    l.fx_elapsed_ms += dt_ms;
+                    const dur = @max(1.0, l.fx_dur_ms);
+                    l.fx_t = std.math.clamp(l.fx_elapsed_ms / dur, 0.0, 1.0);
+                    l.bitmap_dirty = true;
+                    if (l.fx_elapsed_ms >= dur) {
+                        l.fx_active = false;
+                        l.fx_t = 1.0;
+                    }
+                }
+                for (&l.sw_active, 0..) |*act, si| {
+                    if (!act.*) continue;
+                    l.sw_elapsed_ms[si] = @min(260.0, l.sw_elapsed_ms[si] + dt_ms);
+                    l.bitmap_dirty = true;
+                    if (l.sw_elapsed_ms[si] >= 260.0) {
+                        act.* = false;
+                    }
+                }
                 if (l.exiting and l.motion.settled()) {
                     if (l.last_drawn) {
                         self.vacated.append(self.gpa, .{
@@ -521,6 +575,10 @@ pub fn Registry(comptime cfg: config_mod.Config) type {
                         }
                     } else if (std.mem.eql(u8, k, "tick")) {
                         spec.tick = !std.mem.eql(u8, v, "0");
+                    } else if (std.mem.eql(u8, k, "fx")) {
+                        spec.fx_dur_ms = std.fmt.parseFloat(f32, v) catch null;
+                    } else if (std.mem.eql(u8, k, "sw")) {
+                        spec.sw_trig = std.fmt.parseInt(u8, v, 10) catch null;
                     }
                 }
                 if (!has_id) return false;
@@ -691,6 +749,23 @@ pub fn Registry(comptime cfg: config_mod.Config) type {
                 }
             }
 
+            if (spec.fx_dur_ms) |fd| {
+                if (fd > 0) {
+                    l.fx_active = true;
+                    l.fx_dur_ms = fd;
+                    l.fx_elapsed_ms = 0.0;
+                    l.fx_t = 0.0;
+                    l.bitmap_dirty = true;
+                }
+            }
+            if (spec.sw_trig) |sw_idx| {
+                if (sw_idx < l.sw_active.len) {
+                    l.sw_active[sw_idx] = true;
+                    l.sw_elapsed_ms[sw_idx] = 0.0;
+                    l.bitmap_dirty = true;
+                }
+            }
+
             if (spec.has_ops) {
                 self.parseOps(l, ops_raw);
                 l.bitmap_dirty = true;
@@ -720,6 +795,7 @@ pub fn Registry(comptime cfg: config_mod.Config) type {
                     'T' => self.parseTextOp(l, op_str[2..]),
                     'K' => if (parseClipSet(op_str[2..])) |op| l.ops.append(self.gpa, op) catch {},
                     'F' => if (parseDitherFx(op_str[2..])) |op| l.ops.append(self.gpa, op) catch {},
+                    'W' => if (parseSwitchToggle(op_str[2..])) |op| l.ops.append(self.gpa, op) catch {},
                     else => {},
                 }
             }
@@ -932,6 +1008,37 @@ fn parseDitherFx(rest: []const u8) ?DrawOp {
         .px = px,
         .py = py,
         .strength = str,
+    } };
+}
+
+fn parseSwitchToggle(rest: []const u8) ?DrawOp {
+    // W,x,y,w,h,r,cell,ink_hex,light_hex,dark_hex,hovered,checked,slot
+    var it = std.mem.splitScalar(u8, rest, ',');
+    const x = std.fmt.parseInt(i32, it.next() orelse return null, 10) catch return null;
+    const y = std.fmt.parseInt(i32, it.next() orelse return null, 10) catch return null;
+    const w = std.fmt.parseInt(i32, it.next() orelse "54", 10) catch 54;
+    const h = std.fmt.parseInt(i32, it.next() orelse "30", 10) catch 30;
+    const rad = std.fmt.parseInt(u8, it.next() orelse "10", 10) catch 10;
+    const cell = std.fmt.parseInt(u8, it.next() orelse "2", 10) catch 2;
+    const ink = std.fmt.parseInt(u32, it.next() orelse "828EFF", 16) catch 0x828EFF;
+    const light = std.fmt.parseInt(u32, it.next() orelse "C6CCFF", 16) catch 0xC6CCFF;
+    const dark = std.fmt.parseInt(u32, it.next() orelse "3A4085", 16) catch 0x3A4085;
+    const hov = std.fmt.parseInt(u8, it.next() orelse "0", 10) catch 0;
+    const chk = std.fmt.parseInt(u8, it.next() orelse "0", 10) catch 0;
+    const slot = std.fmt.parseInt(u8, it.next() orelse "0", 10) catch 0;
+    return .{ .switch_toggle = .{
+        .x = x,
+        .y = y,
+        .w = w,
+        .h = h,
+        .radius = rad,
+        .cell = @max(1, @min(8, cell)),
+        .ink_rgb = ink,
+        .light_rgb = light,
+        .dark_rgb = dark,
+        .hovered = hov != 0,
+        .checked = chk != 0,
+        .slot = @min(3, slot),
     } };
 }
 

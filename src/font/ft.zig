@@ -345,6 +345,25 @@ pub const fc = struct {
 /// Candidate load order: ZINC_FONT env > config path > well-known monos.
 /// Each entry is tried via FT_New_Face until one loads; nothing is probed
 /// through the filesystem API.
+pub const HeroGlyph = struct {
+    ax: u16 = 0,
+    ay: u16 = 0,
+    bw: u16 = 0,
+    bh: u16 = 0,
+    xoff: i16 = 0,
+    yoff: i16 = 0,
+    adv: i16 = 0,
+};
+
+pub const HeroLayout = struct {
+    /// Indices: 0='z', 1='i', 2='n', 3='c' (hero word), 4='3', 5='0' (atomic no).
+    glyphs: [6]HeroGlyph = @splat(.{}),
+    word_ascent: i16 = 0,
+    num_ascent: i16 = 0,
+    word_px: u16 = 0,
+    num_px: u16 = 0,
+};
+
 pub const Face = struct {
     lib: c.FT_Library,
     face: c.FT_Face,
@@ -1244,6 +1263,75 @@ pub const Face = struct {
         if (self.emoji_face) |f| _ = c.FT_Done_Face(f);
         _ = c.FT_Done_Face(self.face);
         _ = c.FT_Done_FreeType(self.lib);
+    }
+
+    /// Rasterize high-res R8 glyphs ("zinc" + "30") directly into the shared
+    /// glyph atlas, then restore the terminal pixel size immediately. Returns
+    /// `error.AtlasFull` if the current atlas has no room left.
+    pub fn bakeHeroIntoAtlas(self: *Face, atlas: *atlas_mod.Atlas, word_px: u16, num_px: u16) Error!HeroLayout {
+        const face = self.ensureBold() orelse self.face;
+        c.FT_Set_Transform(face, null, null);
+        defer _ = c.FT_Set_Pixel_Sizes(face, 0, @intCast(@max(self.px, 1)));
+
+        var out = HeroLayout{
+            .word_px = word_px,
+            .num_px = num_px,
+        };
+        const specs = [_]struct { cp: u21, px: u16 }{
+            .{ .cp = 'z', .px = word_px },
+            .{ .cp = 'i', .px = word_px },
+            .{ .cp = 'n', .px = word_px },
+            .{ .cp = 'c', .px = word_px },
+            .{ .cp = '3', .px = num_px },
+            .{ .cp = '0', .px = num_px },
+        };
+        var cur_px: u16 = 0;
+        for (specs, 0..) |sp, gi| {
+            if (cur_px != sp.px) {
+                if (c.FT_Set_Pixel_Sizes(face, 0, @intCast(sp.px)) != 0) return error.SizeFailed;
+                cur_px = sp.px;
+                const asc: i16 = @intCast(@divTrunc(face.*.size.*.metrics.ascender, 64));
+                if (gi == 0) out.word_ascent = asc else out.num_ascent = asc;
+            }
+            const gidx = c.FT_Get_Char_Index(face, @intCast(sp.cp));
+            if (gidx == 0) continue;
+            if (c.FT_Load_Glyph(face, gidx, c.FT_LOAD_RENDER) != 0) continue;
+            const slot = face.*.glyph;
+            const bmp = slot.*.bitmap;
+            const bw: u16 = @intCast(@min(bmp.width, 200));
+            const bh: u16 = @intCast(@min(bmp.rows, 160));
+            var ax: u16 = 0;
+            var ay: u16 = 0;
+            if (bw > 0 and bh > 0) {
+                const pos = atlas.pack(bw, bh) orelse return error.AtlasFull;
+                ax = pos.x;
+                ay = pos.y;
+                if (bmp.buffer != null) {
+                    const pitch: i32 = bmp.pitch;
+                    const src: [*]const u8 = @ptrCast(bmp.buffer);
+                    const stride: usize = atlas.size;
+                    var ry: u16 = 0;
+                    while (ry < bh) : (ry += 1) {
+                        const s_off: usize = if (pitch >= 0)
+                            @as(usize, ry) * @as(usize, @intCast(pitch))
+                        else
+                            @as(usize, bh - 1 - ry) * @as(usize, @intCast(-pitch));
+                        const d_off: usize = (@as(usize, ay + ry) * stride) + @as(usize, ax);
+                        @memcpy(atlas.pixels[d_off .. d_off + bw], src[s_off .. s_off + bw]);
+                    }
+                }
+            }
+            out.glyphs[gi] = .{
+                .ax = ax,
+                .ay = ay,
+                .bw = bw,
+                .bh = bh,
+                .xoff = @intCast(@max(-256, @min(256, slot.*.bitmap_left))),
+                .yoff = @intCast(@max(-256, @min(256, slot.*.bitmap_top))),
+                .adv = @intCast(@max(0, @min(slot.*.advance.x >> 6, 256))),
+            };
+        }
+        return out;
     }
 
     /// Glyph classes whose members must share one face. Mixed faces give

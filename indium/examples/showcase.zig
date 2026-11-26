@@ -275,6 +275,7 @@ pub fn main(init: std.process.Init) !void {
     try client.flush();
 
     var last_tick_ms: i64 = indium.terminal.nowMs();
+    var was_reflowing = false;
     var running = true;
 
     while (running) {
@@ -341,13 +342,24 @@ pub fn main(init: std.process.Init) !void {
                 if (te.win_w > 0) cur_w = te.win_w;
                 if (te.win_h > 0) cur_h = te.win_h;
 
-                if (sidebar.stepReflow(dt)) {
+                const now_reflowing = sidebar.stepReflow(dt);
+                if (now_reflowing) {
+                    was_reflowing = true;
                     LayoutHelper.syncLayout(&sidebar, &sidebar_btn, &dropdown, &deploy_btn, &logs_btn, &bar_chart, &donut_chart, &switch_card, &heatmap, &progress, &uptime_bar, cur_w);
                     try sidebar.render(&dl, &client, false);
-                    try sidebar_btn.render(&dl, &client);
-                    try dropdown.renderTrigger(&dl, &client);
-                    try deploy_btn.render(&dl, &client);
-                    try logs_btn.render(&dl, &client);
+                    try indium.protocol.writeMove(&client.out_buf, gpa, sidebar_btn.id, sidebar_btn.x, sidebar_btn.y);
+                    try indium.protocol.writeMove(&client.out_buf, gpa, dropdown.trigger_id, dropdown.x, dropdown.y);
+                    try indium.protocol.writeMove(&client.out_buf, gpa, deploy_btn.id, deploy_btn.x - 14, deploy_btn.y - 14);
+                    try indium.protocol.writeMove(&client.out_buf, gpa, logs_btn.id, logs_btn.x, logs_btn.y);
+                    try indium.protocol.writeMove(&client.out_buf, gpa, bar_chart.id, bar_chart.x, bar_chart.y);
+                    try indium.protocol.writeMove(&client.out_buf, gpa, donut_chart.id, donut_chart.x, donut_chart.y);
+                    try indium.protocol.writeMove(&client.out_buf, gpa, switch_card.id, switch_card.x, switch_card.y);
+                    try indium.protocol.writeMove(&client.out_buf, gpa, heatmap.id, heatmap.x, heatmap.y);
+                    try indium.protocol.writeMove(&client.out_buf, gpa, progress.id, progress.x, progress.y);
+                    try indium.protocol.writeMove(&client.out_buf, gpa, uptime_bar.id, uptime_bar.x, uptime_bar.y);
+                } else if (was_reflowing) {
+                    was_reflowing = false;
+                    LayoutHelper.syncLayout(&sidebar, &sidebar_btn, &dropdown, &deploy_btn, &logs_btn, &bar_chart, &donut_chart, &switch_card, &heatmap, &progress, &uptime_bar, cur_w);
                     try bar_chart.render(&dl, &client);
                     try donut_chart.render(&dl, &client);
                     try switch_card.render(&dl, &client);
@@ -357,18 +369,6 @@ pub fn main(init: std.process.Init) !void {
                     if (toast_open) {
                         try LayoutHelper.renderToast(&dl, &client, true, env_items[dropdown.selected].label, cur_w, cur_h);
                     }
-                }
-                if (sidebar_btn.stepAnim(dt)) {
-                    try sidebar_btn.render(&dl, &client);
-                }
-                if (deploy_btn.stepAnim(dt)) {
-                    try deploy_btn.render(&dl, &client);
-                }
-                if (logs_btn.stepAnim(dt)) {
-                    try logs_btn.render(&dl, &client);
-                }
-                if (switch_card.stepAnim(dt)) {
-                    try switch_card.render(&dl, &client);
                 }
                 if (progress.running) {
                     progress.progress += dt * 0.00045;

@@ -53,6 +53,17 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(exe);
 
+    const gpu_worker = b.addExecutable(.{
+        .name = "zinc-gpu",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/gpu_worker.zig"),
+            .target = target,
+            .optimize = optimize,
+            .link_libc = true,
+        }),
+    });
+    b.installArtifact(gpu_worker);
+
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
     // Build.args (trailing CLI args) was removed in Zig 0.17; keep the
@@ -90,12 +101,17 @@ pub fn build(b: *std.Build) void {
         .name = "zinc-check",
         .root_module = root_module,
     });
+    const check_gpu = b.addExecutable(.{
+        .name = "zinc-gpu-check",
+        .root_module = gpu_worker.root_module,
+    });
     const check_tests = b.addTest(.{
         .name = "check-tests",
         .root_module = test_module,
     });
     const check_step = b.step("check", "Compile check only (no install, no run)");
     check_step.dependOn(&check_exe.step);
+    check_step.dependOn(&check_gpu.step);
     check_step.dependOn(&check_tests.step);
 
     // Headless render benchmark (always ReleaseFast): real blitters +
@@ -218,6 +234,7 @@ pub fn build(b: *std.Build) void {
 /// temporary dangles across the next call).
 const uninstall_rel_paths = [_][]const u8{
     "bin/zinc",
+    "bin/zinc-gpu",
     "bin/indium-demo",
     "share/applications/io.github.mvkweb.zinc.desktop",
     "share/metainfo/io.github.mvkweb.zinc.metainfo.xml",
