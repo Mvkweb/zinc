@@ -122,6 +122,12 @@ pub const Config = struct {
     linear_blending: bool = false,
     font_zoom: bool = true,
 
+    // Indium retained overlay compositor (120-144Hz animated UI layers).
+    indium: bool = true,
+    indium_max_layers: u16 = 32,
+    indium_max_ops: u16 = 512,
+    indium_max_payload: u32 = 512 * 1024,
+
     // Cursor / underline.
     cursor_blink: bool = true,
     cursor_blink_rate_ms: u32 = 500,
@@ -243,6 +249,7 @@ pub const minimal: Config = .{
     .copy_mode = false,
     .ime = false,
     .scrollbar = false,
+    .indium = false,
 };
 
 /// Active profile selected by `-Dminimal` / `-Dascii-only`.

@@ -149,6 +149,7 @@ pub fn probe(gpa: std.mem.Allocator, io: std.Io) !void {
 
 const config_mod = @import("../config.zig");
 const config_loader = @import("../config/loader.zig");
+const config_writer = @import("../config/writer.zig");
 const context_mod = @import("../context.zig");
 const pty_mod = @import("../pty.zig");
 const input_kb = @import("../input/keyboard.zig");
@@ -164,6 +165,7 @@ const flow_mod = @import("../render/flow.zig");
 const scrollbar_mod = @import("../render/scrollbar.zig");
 const placeholder_mod = @import("../gfx/placeholder.zig");
 const kitty_mod = @import("../gfx/kitty.zig");
+const indium_mod = @import("../gfx/indium.zig");
 const pool_mod = @import("../gfx/image_pool.zig");
 const search_mod = @import("../term/search.zig");
 const filelink_mod = @import("../term/filelink.zig");
@@ -173,6 +175,10 @@ const utf8_mod = @import("../util/utf8.zig");
 const linux = std.os.linux;
 
 const P = @import("wl_proto.zig");
+const wl_egl_mod = @import("wl_egl.zig");
+const wl_dmabuf_mod = @import("wl_dmabuf.zig");
+const gl_mod = @import("../render/gl.zig");
+const menu_mod = @import("../ui/menu.zig");
 
 // xkbcommon, manual externs (no headers needed).
 const XkbContext = opaque {};
@@ -498,6 +504,22 @@ pub fn App(comptime cfg: config_mod.Config) type {
 
         pty_pid: i32 = 0,
         pty_fd: i32 = -1,
+        pty_out_q: std.ArrayList(u8) = .empty,
+        pty_out_off: usize = 0,
+        indium_hover_id: ?u16 = null,
+        last_indium_clear_seq: u64 = 0,
+        indium_gpu_off: bool = false,
+        indium_egl_inproc: bool = false,
+        atlas_dirty: bool = true,
+        color_atlas_dirty: bool = true,
+        atlas_gen: u64 = 0,
+        menu: menu_mod.Menu = .{},
+        name_subcompositor: u32 = 0,
+        subcompositor: ?*P.Subcompositor = null,
+        name_dmabuf: u32 = 0,
+        want_dmabuf_v: u32 = 0,
+        dmabuf_sub: wl_dmabuf_mod.SubsurfaceDmabuf = .{},
+        egl_sub: wl_egl_mod.SubsurfaceGl = .{},
         /// Directory inherited from the last active zinc window or set via --cwd.
         startup_cwd: ?[]const u8 = null,
         shared_cwd: [4096:0]u8 = undefined,
@@ -608,6 +630,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 .color_atlas = color_atlas,
                 .trace_on = std.c.getenv("ZINC_TRACE") != null,
                 .profile_on = std.c.getenv("ZINC_PROFILE") != null,
+                .indium_gpu_off = std.c.getenv("ZINC_INDIUM_CPU") != null,
+                .indium_egl_inproc = std.c.getenv("ZINC_INDIUM_EGL") != null,
                 .glyphs = std.AutoHashMap(u32, atlas_mod.Baked).init(gpa),
                 .cell_w = ft_face.cell_w,
                 .cell_h = ft_face.cell_h,
@@ -796,6 +820,20 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         c.wl_proxy_marshal(@ptrCast(td), P.decoration.TOPLEVEL_DECORATION_SET_MODE, mode);
                     }
                 }
+            }
+            if (cfg.indium and self.name_subcompositor != 0) {
+                self.subcompositor = @ptrCast(c.wl_proxy_marshal_constructor(
+                    @ptrCast(reg),
+                    P.core.REGISTRY_BIND,
+                    P.core.subcompositor,
+                    self.name_subcompositor,
+                    P.core.subcompositor.*.name,
+                    @as(u32, 1),
+                    @as(?*anyopaque, null),
+                ));
+            }
+            if (cfg.indium and !self.indium_gpu_off and !self.indium_egl_inproc and self.name_dmabuf != 0 and self.want_dmabuf_v >= 3) {
+                self.dmabuf_sub.initGlobal(@ptrCast(reg), self.name_dmabuf, self.want_dmabuf_v);
             }
 
             c.wl_proxy_marshal(@ptrCast(tl), P.xdg_toplevel.SET_TITLE, @as([*:0]const u8, "zinc"));
@@ -1120,6 +1158,15 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.deco_manager = null;
             }
             if (self.xdg_surface) |x| c.wl_proxy_destroy(@ptrCast(x));
+            if (cfg.indium) {
+                self.menu.closeMenu(self.gpa);
+                self.dmabuf_sub.deinit();
+                self.egl_sub.deinit();
+            }
+            if (self.subcompositor) |sc| {
+                c.wl_proxy_marshal(@ptrCast(sc), P.core.SUBCOMPOSITOR_DESTROY);
+                c.wl_proxy_destroy(@ptrCast(sc));
+            }
             if (self.surface) |s| c.wl_proxy_destroy(@ptrCast(s));
             if (self.wm_base) |w| c.wl_proxy_destroy(@ptrCast(w));
             if (self.xkb_state) |s| xkb_state_unref(s);
@@ -1131,6 +1178,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.ft_face.deinit();
             self.runtime_cfg.deinit(self.gpa);
             if (self.display) |d| _ = c.wl_display_disconnect(d);
+            self.pty_out_q.deinit(self.gpa);
             self.ctx.deinit();
         }
 
@@ -1257,11 +1305,18 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.atlas.clear();
                 self.color_atlas.clear();
                 self.glyphs.clearRetainingCapacity();
+                self.atlas_gen +%= 1;
                 self.ctx.grid.markAllDirty();
                 break :blk self.ft_face.bake(&self.atlas, ca, cp, style) catch return null;
             };
             self.glyphs.put(key, baked) catch {};
+            self.atlas_dirty = true;
             return baked;
+        }
+
+        fn indiumGlyphCb(ptr: ?*anyopaque, cp: u21, style: ft_mod.Style) ?atlas_mod.Baked {
+            const self: *Self = @ptrCast(@alignCast(ptr orelse return null));
+            return self.glyphFor(cp, style);
         }
 
         fn cellOffsets(self: *Self) struct { x: i32, y: i32 } {
@@ -1400,9 +1455,23 @@ pub fn App(comptime cfg: config_mod.Config) type {
         /// tinted by fg. A set color flag implies a live color atlas entry
         /// (the bake path only returns color with a store to put it in).
         fn blitCellGlyph(self: *Self, g: atlas_mod.Baked, x: u32, y: u32, fg: u32, W: u32, H: u32, dmg: *software.Damage) void {
+            self.blitCellGlyphTo(self.pool_pixels, W, H, g, @intCast(x), @intCast(y), fg, dmg);
+        }
+
+        fn blitCellGlyphTo(
+            self: *Self,
+            dst_pixels: []u32,
+            W: u32,
+            H: u32,
+            g: atlas_mod.Baked,
+            x: i32,
+            y: i32,
+            fg: u32,
+            dmg: ?*software.Damage,
+        ) void {
             if (g.color) {
                 const gdmg = software.blitColorGlyph(
-                    self.pool_pixels,
+                    dst_pixels,
                     W,
                     H,
                     self.color_atlas.pixels,
@@ -1413,15 +1482,15 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     g.h,
                     g.xoff,
                     g.yoff,
-                    @intCast(x),
-                    @as(i32, @intCast(y)) + self.ascent,
+                    x,
+                    y + self.ascent,
                 );
-                dmgMerge(dmg, gdmg);
+                if (dmg) |d| dmgMerge(d, gdmg);
                 return;
             }
             const gdmg = if (g.lcd)
                 software.blitLcdGlyph(
-                    self.pool_pixels,
+                    dst_pixels,
                     W,
                     H,
                     self.atlas.pixels,
@@ -1432,14 +1501,14 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     g.h,
                     g.xoff,
                     g.yoff,
-                    @intCast(x),
-                    @as(i32, @intCast(y)) + self.ascent,
+                    x,
+                    y + self.ascent,
                     fg,
                     self.gammaCache(),
                 )
             else
                 software.blitGlyph(
-                    self.pool_pixels,
+                    dst_pixels,
                     W,
                     H,
                     self.atlas.pixels,
@@ -1450,12 +1519,692 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     g.h,
                     g.xoff,
                     g.yoff,
-                    @intCast(x),
-                    @as(i32, @intCast(y)) + self.ascent,
+                    x,
+                    y + self.ascent,
                     fg,
                     self.gammaCache(),
                 );
-            dmgMerge(dmg, gdmg);
+            if (dmg) |d| dmgMerge(d, gdmg);
+        }
+
+        // -- Indium retained overlay layers ---------------------------------
+
+        const IndiumRect = struct {
+            x: i32,
+            y: i32,
+            w: i32,
+            h: i32,
+            cw: i32,
+            ch: i32,
+            op: u8,
+            /// Bounding rect including shadow margin (for damage & clearing).
+            bx: i32,
+            by: i32,
+            bw: i32,
+            bh: i32,
+        };
+
+        fn indiumScreenRect(self: *const Self, l: *const indium_mod.Layer, px: i32, py: i32, cw: i32, ch: i32) IndiumRect {
+            _ = self;
+            const x: i32 = px + l.ax * cw + @as(i32, @intFromFloat(@round(l.motion.x.value)));
+            const y: i32 = py + l.ay * ch + @as(i32, @intFromFloat(@round(l.motion.y.value)));
+            const clip_w: i32 = @min(@as(i32, l.pw), @max(0, @as(i32, @intFromFloat(@round(l.motion.clip_w.value)))));
+            const clip_h: i32 = @min(@as(i32, l.ph), @max(0, @as(i32, @intFromFloat(@round(l.motion.clip_h.value)))));
+            const op: u8 = @intFromFloat(std.math.clamp(@round(l.motion.opacity.value), 0.0, 255.0));
+            const spad: i32 = if (l.shadow) 9 else 0;
+            const sbot: i32 = if (l.shadow) 13 else 0;
+            return .{
+                .x = x,
+                .y = y,
+                .w = l.pw,
+                .h = l.ph,
+                .cw = clip_w,
+                .ch = clip_h,
+                .op = op,
+                .bx = x - spad,
+                .by = y - spad,
+                .bw = clip_w + spad * 2,
+                .bh = clip_h + spad + sbot,
+            };
+        }
+
+        fn rasterizeIndiumLayer(self: *Self, l: *indium_mod.Layer) void {
+            if (l.pw == 0 or l.ph == 0) {
+                l.bitmap_dirty = false;
+                return;
+            }
+            l.ensureBitmap(self.gpa) catch return;
+            @memset(l.bitmap, 0);
+            const W: u32 = l.pw;
+            const H: u32 = l.ph;
+
+            if (l.bg_op > 0 or l.bd_op > 0) {
+                software.fillRoundedRectPremult(
+                    l.bitmap,
+                    W,
+                    H,
+                    0,
+                    0,
+                    l.pw,
+                    l.ph,
+                    l.radius,
+                    l.bg_rgb,
+                    l.bg_op,
+                    l.bd_rgb,
+                    l.bd_op,
+                    l.sheen,
+                    null,
+                );
+            }
+
+            // Animated hover/selection pill sits behind text and ops.
+            const pill_op: u8 = @intFromFloat(std.math.clamp(@round(l.motion.pill_op.value), 0.0, 255.0));
+            const pill_h: i32 = @intFromFloat(@round(l.motion.pill_h.value));
+            const pill_w: i32 = @intFromFloat(@round(l.pill_w));
+            if (pill_op > 0 and pill_h > 0 and pill_w > 0) {
+                software.fillRoundedRectPremult(
+                    l.bitmap,
+                    W,
+                    H,
+                    @intFromFloat(@round(l.pill_x)),
+                    @intFromFloat(@round(l.motion.pill_y.value)),
+                    pill_w,
+                    pill_h,
+                    l.pill_rad,
+                    l.pill_rgb,
+                    pill_op,
+                    0,
+                    0,
+                    false,
+                    null,
+                );
+            }
+
+            var clip: ?software.LayerClip = null;
+            for (l.ops.items) |op| {
+                switch (op) {
+                    .clip_set => |cm| clip = .{
+                        .mask_x = cm.x,
+                        .mask_y = cm.y,
+                        .mask_w = cm.w,
+                        .mask_h = cm.h,
+                        .mask_r = cm.radius,
+                        .vis_x = cm.vis_x,
+                        .vis_w = cm.vis_w,
+                    },
+                    .clip_clear => clip = null,
+                    .round_rect => |r| software.fillRoundedRectPremult(
+                        l.bitmap,
+                        W,
+                        H,
+                        r.x,
+                        r.y,
+                        r.w,
+                        r.h,
+                        r.radius,
+                        r.fill_rgb,
+                        r.fill_op,
+                        r.border_rgb,
+                        r.border_op,
+                        r.sheen,
+                        clip,
+                    ),
+                    .dither_rect => |d| software.fillDitherRectPremult(
+                        l.bitmap,
+                        W,
+                        H,
+                        d.x,
+                        d.y,
+                        d.w,
+                        d.h,
+                        d.radius,
+                        d.c0_rgb,
+                        d.c0_op,
+                        d.c1_rgb,
+                        d.c1_op,
+                        d.dir == .horizontal,
+                        d.dither,
+                        d.cell,
+                        d.pattern,
+                        clip,
+                    ),
+                    .dither_fx => |f| {
+                        const eff_t = if (f.t < 0.0) (if (l.fx_active) l.fx_t else 1.0) else f.t;
+                        software.drawDitherFxPremult(
+                            l.bitmap,
+                            W,
+                            H,
+                            f.x,
+                            f.y,
+                            f.w,
+                            f.h,
+                            f.radius,
+                            f.cell,
+                            f.rgb,
+                            f.kind,
+                            eff_t,
+                            f.px,
+                            f.py,
+                            f.strength,
+                            clip,
+                        );
+                    },
+                    .switch_toggle => |sw| {
+                        const el = if (sw.slot < l.sw_elapsed_ms.len and l.sw_active[sw.slot])
+                            l.sw_elapsed_ms[sw.slot]
+                        else
+                            260.0;
+                        software.drawSwitchPremult(
+                            l.bitmap,
+                            W,
+                            H,
+                            sw.x,
+                            sw.y,
+                            sw.w,
+                            sw.h,
+                            sw.radius,
+                            sw.cell,
+                            sw.ink_rgb,
+                            sw.light_rgb,
+                            sw.dark_rgb,
+                            sw.hovered,
+                            sw.checked,
+                            el,
+                        );
+                    },
+                    .dither_arc => |a| software.fillDitherArcPremult(
+                        l.bitmap,
+                        W,
+                        H,
+                        a.cx,
+                        a.cy,
+                        a.r_inner,
+                        a.r_outer,
+                        a.a0_deg,
+                        a.a1_deg,
+                        a.c0_rgb,
+                        a.c0_op,
+                        a.c1_rgb,
+                        a.c1_op,
+                        a.dither,
+                        a.cell,
+                    ),
+                    .bloom => |b| software.drawBloomPremult(
+                        l.bitmap,
+                        W,
+                        H,
+                        b.x,
+                        b.y,
+                        b.w,
+                        b.h,
+                        b.radius,
+                        b.rgb,
+                        b.op,
+                        b.spread,
+                    ),
+                    .line => |ln| {
+                        if (ln.w > 0 and ln.h > 0 and ln.op > 0) {
+                            var x0 = @max(ln.x, 0);
+                            var y0 = @max(ln.y, 0);
+                            var x1 = @min(ln.x + ln.w, @as(i32, @intCast(W)));
+                            var y1 = @min(ln.y + ln.h, @as(i32, @intCast(H)));
+                            if (clip) |cm| {
+                                x0 = @max(x0, @max(cm.mask_x, cm.vis_x));
+                                y0 = @max(y0, cm.mask_y);
+                                x1 = @min(x1, @min(cm.mask_x + cm.mask_w, cm.vis_x + cm.vis_w));
+                                y1 = @min(y1, cm.mask_y + cm.mask_h);
+                            }
+                            if (x0 < x1 and y0 < y1) {
+                                var yy = y0;
+                                while (yy < y1) : (yy += 1) {
+                                    const row_off = @as(usize, @intCast(yy)) * W;
+                                    var xx = x0;
+                                    while (xx < x1) : (xx += 1) {
+                                        const cov = software.clipCov(clip, xx, yy);
+                                        if (cov <= 0.0) continue;
+                                        const a: u8 = @intFromFloat(@round(@as(f32, @floatFromInt(ln.op)) * cov));
+                                        if (a == 0) continue;
+                                        l.bitmap[row_off + @as(usize, @intCast(xx))] = software.blendPremult(l.bitmap[row_off + @as(usize, @intCast(xx))], software.premult(ln.rgb, a));
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    .text => |t| {
+                        const bytes = l.textSlice(t.text_off, t.text_len);
+                        if (bytes.len == 0) continue;
+                        const style: ft_mod.Style = if (t.bold and t.italic)
+                            .bold_italic
+                        else if (t.bold)
+                            .bold
+                        else if (t.italic)
+                            .italic
+                        else
+                            .regular;
+                        var fg: u32 = 0xFF000000 | (t.fg_rgb & 0xFFFFFF);
+                        if (t.dim) {
+                            const rr = ((fg >> 16) & 0xFF) * 2 / 3;
+                            const gg = ((fg >> 8) & 0xFF) * 2 / 3;
+                            const bb = (fg & 0xFF) * 2 / 3;
+                            fg = 0xFF000000 | (rr << 16) | (gg << 8) | bb;
+                        }
+                        var cx: i32 = t.x;
+                        var idx: usize = 0;
+                        while (idx < bytes.len) {
+                            const cp = utf8_mod.decode(bytes, &idx);
+                            const w_cells: i32 = if (utf8_mod.isWide(cp)) 2 else 1;
+                            if (cp != ' ' and cp != 0) {
+                                if (self.glyphFor(cp, style)) |g| {
+                                    self.blitCellGlyphTo(l.bitmap, W, H, g, cx, t.y, fg, null);
+                                }
+                            }
+                            cx += w_cells * self.cell_w;
+                        }
+                    },
+                }
+            }
+            l.bitmap_dirty = false;
+        }
+
+        fn clearRectArea(self: *Self, rx: i32, ry: i32, rw: i32, rh: i32, W: u32, H: u32, bg_all: u32, dmg: *software.Damage) void {
+            if (rw <= 0 or rh <= 0) return;
+            const x0 = @max(rx, 0);
+            const y0 = @max(ry, 0);
+            const x1 = @min(rx + rw, @as(i32, @intCast(W)));
+            const y1 = @min(ry + rh, @as(i32, @intCast(H)));
+            if (x0 >= x1 or y0 >= y1) return;
+            software.fillRect(self.pool_pixels, W, H, @intCast(x0), @intCast(y0), @intCast(x1 - x0), @intCast(y1 - y0), bg_all, dmg);
+        }
+
+        fn prepareIndiumDamage(
+            self: *Self,
+            px: i32,
+            py: i32,
+            cw: i32,
+            ch: i32,
+            W: u32,
+            H: u32,
+            full: bool,
+            bg_all: u32,
+            row_end: u16,
+            visible_cols: u16,
+            dmg: *software.Damage,
+            redraw: *[64]bool,
+        ) void {
+            redraw.* = @splat(false);
+            if (!cfg.indium) return;
+            if (self.indiumGpuActive()) {
+                self.ctx.indium.vacated.clearRetainingCapacity();
+                self.ctx.indium.dirty = false;
+                return;
+            }
+            if (self.ctx.indium.layers.items.len == 0 and self.ctx.indium.vacated.items.len == 0) {
+                self.ctx.indium.dirty = false;
+                if (self.pty_out_q.capacity > 4096 and self.pty_out_off >= self.pty_out_q.items.len) {
+                    self.pty_out_q.clearAndFree(self.gpa);
+                    self.pty_out_off = 0;
+                }
+                return;
+            }
+            for (self.ctx.indium.vacated.items) |v| {
+                if (!full) {
+                    self.clearRectArea(v.x, v.y, v.w, v.h, W, H, bg_all, dmg);
+                    self.markRectRowsDirty(.{ .x = v.x, .y = v.y, .w = v.w, .h = v.h }, py, ch);
+                }
+                dmg.add(v.x, v.y, v.w, v.h);
+            }
+            self.ctx.indium.vacated.clearRetainingCapacity();
+
+            // Seed dmg with any terminal grid rows already dirty so layers
+            // overlapping those rows are cleared & re-composited together.
+            if (!full and cw > 0 and ch > 0 and visible_cols > 0) {
+                var r_i: u16 = 0;
+                while (r_i < row_end) : (r_i += 1) {
+                    if (self.rowDirty(r_i)) {
+                        const sy = py + @as(i32, r_i) * ch;
+                        dmg.add(px, sy, @as(i32, visible_cols) * cw, ch);
+                    }
+                }
+            }
+
+            const layers = self.ctx.indium.layers.items;
+            const n = @min(layers.len, redraw.len);
+
+            for (layers[0..n], 0..) |*l, idx| {
+                const r = self.indiumScreenRect(l, px, py, cw, ch);
+                const pill_moving = l.motion.pill_y.moving or l.motion.pill_h.moving or l.motion.pill_op.moving;
+                const changed = full or l.bitmap_dirty or pill_moving or !l.motion.settled() or
+                    !l.last_drawn or
+                    l.last_x != r.bx or l.last_y != r.by or l.last_w != r.bw or l.last_h != r.bh;
+                if (!changed) continue;
+                redraw[idx] = true;
+                if (!full) {
+                    if (l.last_drawn) {
+                        self.clearRectArea(l.last_x, l.last_y, l.last_w, l.last_h, W, H, bg_all, dmg);
+                        self.markRectRowsDirty(.{ .x = l.last_x, .y = l.last_y, .w = l.last_w, .h = l.last_h }, py, ch);
+                    }
+                    self.clearRectArea(r.bx, r.by, r.bw, r.bh, W, H, bg_all, dmg);
+                    self.markRectRowsDirty(.{ .x = r.bx, .y = r.by, .w = r.bw, .h = r.bh }, py, ch);
+                }
+                dmg.add(r.bx, r.by, r.bw, r.bh);
+            }
+
+            // Fixed-point expansion: include full Pass-1 row span (0..W for any
+            // dirty row) AND any stationary layer intersecting dmg, guaranteeing
+            // every layer drawn in Pass 3 has its entire rect cleared first.
+            if (!full and !dmg.empty) {
+                var added = true;
+                while (added) {
+                    added = false;
+                    // Pass 1 will wipe [px .. px + visible_cols*cw] on any dirty row.
+                    if (cw > 0 and ch > 0 and visible_cols > 0) {
+                        const row_w: i32 = @as(i32, visible_cols) * cw;
+                        var r_i: u16 = 0;
+                        while (r_i < row_end) : (r_i += 1) {
+                            if (self.rowDirty(r_i)) {
+                                const sy = py + @as(i32, r_i) * ch;
+                                const before_x = dmg.x;
+                                const before_y = dmg.y;
+                                const before_w = dmg.w;
+                                const before_h = dmg.h;
+                                dmg.add(px, sy, row_w, ch);
+                                if (dmg.x != before_x or dmg.y != before_y or dmg.w != before_w or dmg.h != before_h) {
+                                    added = true;
+                                }
+                            }
+                        }
+                    }
+                    for (layers[0..n], 0..) |*l, idx| {
+                        if (redraw[idx]) continue;
+                        const r = self.indiumScreenRect(l, px, py, cw, ch);
+                        const hit_new = r.op > 0 and r.cw > 0 and r.ch > 0 and
+                            (r.bx < dmg.x + dmg.w and r.bx + r.bw > dmg.x and
+                                r.by < dmg.y + dmg.h and r.by + r.bh > dmg.y);
+                        const hit_old = l.last_drawn and
+                            (l.last_x < dmg.x + dmg.w and l.last_x + l.last_w > dmg.x and
+                                l.last_y < dmg.y + dmg.h and l.last_y + l.last_h > dmg.y);
+                        if (hit_new or hit_old) {
+                            redraw[idx] = true;
+                            added = true;
+                            if (l.last_drawn) {
+                                self.clearRectArea(l.last_x, l.last_y, l.last_w, l.last_h, W, H, bg_all, dmg);
+                                self.markRectRowsDirty(.{ .x = l.last_x, .y = l.last_y, .w = l.last_w, .h = l.last_h }, py, ch);
+                            }
+                            self.clearRectArea(r.bx, r.by, r.bw, r.bh, W, H, bg_all, dmg);
+                            self.markRectRowsDirty(.{ .x = r.bx, .y = r.by, .w = r.bw, .h = r.bh }, py, ch);
+                            dmg.add(r.bx, r.by, r.bw, r.bh);
+                        }
+                    }
+                }
+            }
+            self.ctx.indium.dirty = false;
+        }
+
+        fn renderIndiumLayers(self: *Self, px: i32, py: i32, cw: i32, ch: i32, W: u32, H: u32, full: bool, redraw: *const [64]bool, dmg: *software.Damage) void {
+            if (!cfg.indium or self.indiumGpuActive()) return;
+            const layers = self.ctx.indium.layers.items;
+            if (layers.len == 0) return;
+
+            var order: [64]usize = undefined;
+            const n = @min(layers.len, order.len);
+            for (0..n) |i| order[i] = i;
+            // Insertion sort by z ascending (layers <= 32).
+            var i: usize = 1;
+            while (i < n) : (i += 1) {
+                const key = order[i];
+                var j: usize = i;
+                while (j > 0 and layers[order[j - 1]].z > layers[key].z) : (j -= 1) {
+                    order[j] = order[j - 1];
+                }
+                order[j] = key;
+            }
+
+            for (order[0..n]) |idx| {
+                if (!full and !redraw[idx]) continue;
+                var l = &layers[idx];
+                const pill_moving = l.motion.pill_y.moving or l.motion.pill_h.moving or l.motion.pill_op.moving;
+                if (l.bitmap_dirty or pill_moving) {
+                    self.rasterizeIndiumLayer(l);
+                }
+                const r = self.indiumScreenRect(l, px, py, cw, ch);
+                l.last_drawn = true;
+                l.last_x = r.bx;
+                l.last_y = r.by;
+                l.last_w = r.bw;
+                l.last_h = r.bh;
+                if (r.op == 0 or r.cw <= 0 or r.ch <= 0 or l.bitmap.len == 0) continue;
+
+                if (l.shadow) {
+                    software.drawDropShadowPremult(self.pool_pixels, W, H, r.x, r.y, r.cw, r.ch, l.radius, r.op, dmg);
+                }
+                const ldmg = software.blitLayerPremult(
+                    self.pool_pixels,
+                    W,
+                    H,
+                    l.bitmap,
+                    l.pw,
+                    l.ph,
+                    r.x,
+                    r.y,
+                    r.cw,
+                    r.ch,
+                    r.op,
+                );
+                dmgMerge(dmg, ldmg);
+            }
+        }
+
+        const IndiumHit = struct {
+            id: u16,
+            lx: i32,
+            ly: i32,
+        };
+
+        fn indiumHitTest(self: *Self, bx: i32, by: i32) ?IndiumHit {
+            if (!cfg.indium) return null;
+            const layers = self.ctx.indium.layers.items;
+            if (layers.len == 0) return null;
+            const offsets = self.cellOffsets();
+            var best_z: i16 = std.math.minInt(i16);
+            var best: ?IndiumHit = null;
+            for (layers) |*l| {
+                if (l.exiting or l.capture == .none) continue;
+                const r = self.indiumScreenRect(l, offsets.x, offsets.y, self.cell_w, self.cell_h);
+                if (r.op == 0 or r.cw <= 0 or r.ch <= 0) continue;
+                if (bx >= r.x and bx < r.x + r.cw and by >= r.y and by < r.y + r.ch) {
+                    if (best == null or l.z >= best_z) {
+                        best_z = l.z;
+                        best = .{ .id = l.id, .lx = bx - r.x, .ly = by - r.y };
+                    }
+                }
+            }
+            return best;
+        }
+
+        fn indiumModalId(self: *const Self) ?u16 {
+            if (!cfg.indium) return null;
+            var best_z: i16 = std.math.minInt(i16);
+            var best_id: ?u16 = null;
+            for (self.ctx.indium.layers.items) |*l| {
+                if (l.exiting or l.capture != .modal) continue;
+                if (best_id == null or l.z >= best_z) {
+                    best_z = l.z;
+                    best_id = l.id;
+                }
+            }
+            return best_id;
+        }
+
+        fn indiumModMask(self: *Self) u8 {
+            const m = self.currentMods();
+            var mask: u8 = 0;
+            if (m.shift) mask |= 1;
+            if (m.alt) mask |= 2;
+            if (m.ctrl) mask |= 4;
+            return mask;
+        }
+
+        fn indiumGpuActive(self: *const Self) bool {
+            if (!cfg.indium) return false;
+            return (self.dmabuf_sub.active and self.dmabuf_sub.ready()) or self.egl_sub.active;
+        }
+
+        fn indiumOrMenuActive(self: *const Self) bool {
+            return cfg.indium and (self.ctx.indium.layers.items.len > 0 or self.menu.open);
+        }
+
+        fn menuCpuActive(self: *const Self) bool {
+            return cfg.indium and self.menu.open and !self.dmabuf_sub.active and !self.egl_sub.active;
+        }
+
+        fn ensureMenuHero(self: *Self) void {
+            if (!cfg.indium or !self.menu.open) return;
+            self.menu.ensureHero(
+                &self.ft_face,
+                &self.atlas,
+                &self.color_atlas,
+                &self.glyphs,
+                &self.ctx.grid,
+                &self.atlas_gen,
+                &self.atlas_dirty,
+            );
+            self.menu.ensureEditorIcons(self.gpa, &self.color_atlas, &self.color_atlas_dirty);
+        }
+
+        fn appendMenuGpuCb(ptr: ?*anyopaque, gpa: std.mem.Allocator, instances: *std.ArrayList(gl_mod.Instance)) anyerror!void {
+            const self: *Self = @ptrCast(@alignCast(ptr orelse return));
+            try self.menu.appendGpuInstances(gpa, instances, self.width, self.height, self.atlas.size, .{
+                .ptr = @ptrCast(self),
+                .getGlyph = indiumGlyphCb,
+                .cell_w = self.cell_w,
+                .ascent = self.ascent,
+            });
+        }
+
+        fn handleMenuAction(self: *Self, act: menu_mod.MenuAction) void {
+            switch (act) {
+                .none => {},
+                .redraw => {
+                    self.needs_render = true;
+                    self.refreshCursor();
+                },
+                .write_config => |cw| {
+                    if (std.mem.eql(u8, cw.key, "background")) {
+                        self.ctx.bg = self.menu.snap.bg;
+                        self.ctx.grid.markAllDirty();
+                    } else if (std.mem.eql(u8, cw.key, "foreground")) {
+                        self.ctx.fg = self.menu.snap.fg;
+                        self.ctx.grid.markAllDirty();
+                    } else if (std.mem.eql(u8, cw.key, "cursor-color")) {
+                        self.ctx.cursor_color = self.menu.snap.cursor_color;
+                        self.ctx.grid.markAllDirty();
+                    }
+                    config_writer.applyEdits(self.gpa, &.{.{ .key = cw.key, .value = cw.value() }}) catch {};
+                    if (self.config_fd < 0) self.reloadConfig();
+                    self.needs_render = true;
+                    self.refreshCursor();
+                },
+                .restore_defaults => {
+                    config_writer.restoreDefaults() catch {};
+                    self.ctx.bg = cfg.bg;
+                    self.ctx.fg = cfg.fg;
+                    self.ctx.cursor_color = cfg.cursor_color;
+                    self.ctx.grid.markAllDirty();
+                    if (self.config_fd < 0) self.reloadConfig();
+                    self.needs_render = true;
+                    self.refreshCursor();
+                },
+                .open_config_file => {
+                    var dir_buf: [512:0]u8 = undefined;
+                    if (config_loader.resolveDir(&dir_buf)) |dir_path| {
+                        var file_buf: [512:0]u8 = undefined;
+                        if (std.mem.printSentinel(&file_buf, "{s}/config", .{dir_path}, 0) catch null) |cfg_path| {
+                            self.menu.closeMenu(self.gpa);
+                            self.ctx.grid.markAllDirty();
+                            self.needs_render = true;
+                            self.refreshCursor();
+                            self.openFile(cfg_path, 1, 1);
+                            return;
+                        }
+                    }
+                    self.needs_render = true;
+                },
+                .close => {
+                    self.menu.closeMenu(self.gpa);
+                    self.ctx.grid.markAllDirty();
+                    self.needs_render = true;
+                    self.refreshCursor();
+                },
+                .quit => {
+                    self.menu.closeMenu(self.gpa);
+                    self.running = false;
+                },
+            }
+        }
+
+        fn syncIndiumClearState(self: *Self) void {
+            if (!cfg.indium) return;
+            const seq = self.ctx.indium.cleared_seq;
+            if (seq != self.last_indium_clear_seq) {
+                self.last_indium_clear_seq = seq;
+                if (self.indium_hover_id != null) {
+                    self.indium_hover_id = null;
+                    self.refreshCursor();
+                }
+                if (self.pty_out_q.items.len > 0 or self.pty_out_q.capacity > 4096) {
+                    self.pty_out_q.clearAndFree(self.gpa);
+                }
+                self.pty_out_off = 0;
+                if (!self.indiumOrMenuActive() and self.dmabuf_sub.active) {
+                    self.dmabuf_sub.deactivate(self.display, self.surface);
+                    self.ctx.grid.markAllDirty();
+                }
+            }
+        }
+
+        fn queuePtyOut(self: *Self, data: []const u8) void {
+            if (self.pty_fd < 0 or data.len == 0) return;
+            var slice = data;
+            if (self.pty_out_off >= self.pty_out_q.items.len) {
+                self.pty_out_q.clearRetainingCapacity();
+                self.pty_out_off = 0;
+                const rc = linux.write(self.pty_fd, slice.ptr, slice.len);
+                const err = linux.errno(rc);
+                if (err == .SUCCESS) {
+                    if (rc >= slice.len) return;
+                    slice = slice[rc..];
+                } else if (err != .AGAIN and err != .INTR) {
+                    return;
+                }
+            }
+            const remaining = self.pty_out_q.items.len - self.pty_out_off;
+            if (remaining + slice.len > 64 * 1024) return;
+            self.pty_out_q.appendSlice(self.gpa, slice) catch {};
+        }
+
+        fn flushPtyOut(self: *Self) void {
+            if (self.pty_fd < 0) return;
+            while (self.pty_out_off < self.pty_out_q.items.len) {
+                const rem = self.pty_out_q.items[self.pty_out_off..];
+                const rc = linux.write(self.pty_fd, rem.ptr, rem.len);
+                const err = linux.errno(rc);
+                if (err == .SUCCESS) {
+                    if (rc == 0) break;
+                    self.pty_out_off += rc;
+                } else if (err == .INTR) {
+                    continue;
+                } else if (err == .AGAIN) {
+                    break;
+                } else {
+                    self.pty_out_q.clearRetainingCapacity();
+                    self.pty_out_off = 0;
+                    return;
+                }
+            }
+            if (self.pty_out_off >= self.pty_out_q.items.len) {
+                self.pty_out_q.clearRetainingCapacity();
+                self.pty_out_off = 0;
+            }
         }
 
         fn drawBarText(self: *Self, text: []const u8, fg: u32, x0: i32, y: u32, cw: i32, ch: i32, W: u32, H: u32, dmg: *software.Damage) void {
@@ -2036,6 +2785,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 (self.trail_ms > 0 and self.flow.trail_n > 0) or
                 (cfg.ime and self.ime.focused and self.ime.preedit_len > 0) or
                 (cfg.scrollbar and (self.sb_show or self.sb_alpha > 0)) or
+                self.menuCpuActive() or
                 (cfg.kitty_gfx and (self.ctx.images.placements.items.len > 0 or self.last_placements_len > 0));
             if (cfg.kitty_gfx) {
                 self.last_placements_len = self.ctx.images.placements.items.len;
@@ -2076,6 +2826,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 if (cur_rect) |r| self.markRectRowsDirty(r, py, ch);
             }
             self.last_cur_rect = cur_rect;
+            var indium_redraw: [64]bool = @splat(false);
+            if (cfg.indium) self.prepareIndiumDamage(px, py, cw, ch, W, H, full, bg_all, row_end, visible_cols, &dmg, &indium_redraw);
             // Tier 0 images (below cell backgrounds).
             self.blitImageTier(0, W, H, px, py, cw, ch, visible_cols, visible_rows, &dmg);
 
@@ -2439,6 +3191,17 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     self.csd_sig = sig;
                 }
             }
+            if (cfg.indium) {
+                self.renderIndiumLayers(px, py, cw, ch, W, H, full, &indium_redraw, &dmg);
+                if (self.menuCpuActive()) {
+                    self.menu.renderCpu(self.pool_pixels, W, H, &self.atlas, &self.color_atlas, .{
+                        .ptr = @ptrCast(self),
+                        .getGlyph = indiumGlyphCb,
+                        .cell_w = self.cell_w,
+                        .ascent = self.ascent,
+                    }, &dmg);
+                }
+            }
             // Full repaint painted everything: clear all flags so later
             // dirty-row frames stay truthful. (Dirty path clears rows as
             // it paints them, above.) Skipped mid-glide: fractional frames
@@ -2489,6 +3252,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const cols: u16 = @intCast(@max(15, @divFloor(self.width - 2 * @as(i32, @intCast(pad_x)), self.cell_w)));
             const rows: u16 = @intCast(@max(3, @divFloor(self.height - 2 * @as(i32, @intCast(pad_y)) - hh, self.cell_h)));
             if (cols == self.ctx.grid.cols and rows == self.ctx.grid.rows) {
+                if (cfg.indium and self.ctx.indium.layers.items.len > 0) {
+                    var rbuf: [96]u8 = undefined;
+                    self.queuePtyOut(indium_mod.formatEventResize(&rbuf, self.width, self.height, self.cell_w, self.cell_h));
+                }
                 self.ctx.grid.markAllDirty();
                 self.needs_render = true;
                 return;
@@ -2497,6 +3264,10 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (self.pty_fd >= 0) {
                 const pty_px = self.ptyPixels(cols, rows);
                 pty_mod.resizePty(self.pty_fd, cols, rows, pty_px.w, pty_px.h);
+            }
+            if (cfg.indium and self.ctx.indium.layers.items.len > 0) {
+                var rbuf: [96]u8 = undefined;
+                self.queuePtyOut(indium_mod.formatEventResize(&rbuf, self.width, self.height, self.cell_w, self.cell_h));
             }
             if (cfg.find and self.find_active) self.researchFind();
             self.ctx.grid.markAllDirty();
@@ -2564,12 +3335,39 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.config_fd = @intCast(fd);
         }
 
-        /// Drain inotify events and re-read the config. One reload per batch
-        /// is enough: writers emit several events (MODIFY + CLOSE_WRITE).
+        /// Drain inotify events and re-read the config when `config` itself
+        /// changes (ignores transient `config.tmp` / `config.new` events).
         fn drainConfigEvents(self: *Self) void {
             var buf: [4096]u8 align(@alignOf(linux.inotify_event)) = undefined;
-            _ = linux.read(self.config_fd, &buf, buf.len);
-            self.reloadConfig();
+            var should_reload = false;
+            while (true) {
+                const rc = linux.read(self.config_fd, &buf, buf.len);
+                const err = linux.errno(rc);
+                if (err != .SUCCESS or rc == 0) break;
+                var off: usize = 0;
+                while (off + @sizeOf(linux.inotify_event) <= rc) {
+                    const ev: *const linux.inotify_event = @ptrCast(@alignCast(&buf[off]));
+                    off += @sizeOf(linux.inotify_event) + ev.len;
+                    if (ev.getName()) |name| {
+                        if (std.mem.eql(u8, name, "config")) should_reload = true;
+                    } else {
+                        should_reload = true;
+                    }
+                }
+            }
+            if (should_reload) self.reloadConfig();
+        }
+
+        fn applyReloadColors(
+            ctx: anytype,
+            old: *const config_loader.RuntimeConfig,
+            next: *const config_loader.RuntimeConfig,
+        ) void {
+            // Preserve live OSC 10/11/12 overrides (e.g. dynamic wallpaper themes)
+            // unless that color key actually changed in the config file.
+            if (old.bg != next.bg) ctx.bg = next.bg orelse cfg.bg;
+            if (old.fg != next.fg) ctx.fg = next.fg orelse cfg.fg;
+            if (old.cursor_color != next.cursor_color) ctx.cursor_color = next.cursor_color orelse cfg.cursor_color;
         }
 
         /// Re-read the config file and apply settings that need no shell,
@@ -2580,12 +3378,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
             const geo_changed = old.font_size != next.font_size or
                 old.pad_x != next.pad_x or old.pad_y != next.pad_y or
                 old.alt_pad_x != next.alt_pad_x or old.alt_pad_y != next.alt_pad_y;
+            applyReloadColors(&self.ctx, &old, &next);
             self.runtime_cfg = next;
             old.deinit(self.gpa);
-
-            self.ctx.bg = self.runtime_cfg.bg orelse cfg.bg;
-            self.ctx.fg = self.runtime_cfg.fg orelse cfg.fg;
-            self.ctx.cursor_color = self.runtime_cfg.cursor_color orelse cfg.cursor_color;
             self.bg_opacity = self.runtime_cfg.bg_opacity orelse cfg.bg_opacity;
             self.selection_bg = self.runtime_cfg.selection_bg orelse cfg.selection_bg;
             self.selection_fg = self.runtime_cfg.selection_fg orelse cfg.selection_fg;
@@ -2619,6 +3414,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.ft_face.subpixel = subpixel;
                 self.atlas.clear();
                 self.glyphs.clearRetainingCapacity();
+                self.atlas_gen +%= 1;
             }
 
             const nerd_symbols = self.runtime_cfg.font_nerd_symbols orelse cfg.font_nerd_symbols;
@@ -2626,11 +3422,15 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.ft_face.nerd_symbols = nerd_symbols;
                 self.atlas.clear();
                 self.glyphs.clearRetainingCapacity();
+                self.atlas_gen +%= 1;
             }
 
             if (geo_changed) {
                 const pt = self.runtime_cfg.font_size orelse cfg.font_default_size;
                 self.setFontSize(pt);
+            }
+            if (cfg.indium and self.menu.open) {
+                self.menu.syncConfig(cfg, &self.runtime_cfg, true);
             }
             self.ctx.grid.markAllDirty();
             self.needs_render = true;
@@ -2664,6 +3464,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             self.atlas.clear();
             self.color_atlas.clear();
             self.glyphs.clearRetainingCapacity();
+            self.atlas_gen +%= 1;
 
             const pad_x = self.currentPadX();
             const pad_y = self.currentPadY();
@@ -2703,6 +3504,24 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // spend frames animating nothing anyone can see.
             const flow_snap = !view_live or !self.ctx.show_cursor;
             self.flow.step(flow_now, self.ctx.cursor_col, self.ctx.cursor_row, voff, flow_visible, flow_snap, self.cell_w, self.cell_h, self.glide, self.glide_ms, self.cursor_overshoot, self.trail_ms, self.smooth_scroll, self.smooth_scroll_ms);
+            if (cfg.indium) {
+                if (self.ctx.indium.query_pending) {
+                    self.ctx.indium.query_pending = false;
+                    var qbuf: [128]u8 = undefined;
+                    self.queuePtyOut(indium_mod.formatQueryReply(&qbuf, self.cell_w, self.cell_h, self.width, self.height, cfg.indium_max_layers));
+                }
+                self.ctx.indium.step(flow_now);
+                for (self.ctx.indium.finished_exits.items) |eid| {
+                    var ebuf: [64]u8 = undefined;
+                    self.queuePtyOut(indium_mod.formatEventDone(&ebuf, eid));
+                    if (self.indium_hover_id == eid) self.indium_hover_id = null;
+                }
+                self.ctx.indium.finished_exits.clearRetainingCapacity();
+                if (self.ctx.indium.anyTicking()) {
+                    var tbuf: [96]u8 = undefined;
+                    self.queuePtyOut(indium_mod.formatEventTick(&tbuf, flow_now, self.width, self.height));
+                }
+            }
             // Drag-extend rides the INTERPOLATED viewport: extending on
             // the scroll event jumped the highlight ahead of the glide.
             // Whole travelled rows are consumed per frame (the fraction
@@ -2773,7 +3592,35 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             const is_prof = self.profile_on;
             const t0: i64 = if (is_prof) context_mod.nowMs() else 0;
+            if (cfg.indium and !self.indium_gpu_off) {
+                if (self.indium_egl_inproc) {
+                    if (self.indiumOrMenuActive() or self.egl_sub.has_drawn) {
+                        _ = self.egl_sub.ensureInit(self.gpa, self.display, self.compositor, self.subcompositor, self.surface, self.width, self.height);
+                    }
+                } else if (self.indiumOrMenuActive()) {
+                    _ = self.dmabuf_sub.ensureActive(self.gpa, self.compositor, self.subcompositor, self.surface, self.width, self.height);
+                } else if (self.dmabuf_sub.active) {
+                    self.dmabuf_sub.deactivate(self.display, self.surface);
+                    self.ctx.grid.markAllDirty();
+                }
+            }
+            if (cfg.indium and self.menu.open) {
+                self.menu.live_dither = !self.menuCpuActive();
+                self.menu.renderer_label = if (self.menuCpuActive()) "CPU SHM" else if (self.egl_sub.active) "EGL Sub" else "GLES 3.0";
+                self.menu.cell_w = self.cell_w;
+                self.menu.syncTheme(self.ctx.bg, self.ctx.fg, &self.ctx.palette);
+                self.ensureMenuHero();
+                if (self.indium_gpu_off or !self.dmabuf_sub.active or self.dmabuf_sub.ready()) {
+                    self.menu.armClock(flow_now);
+                    _ = self.menu.step(flow_now);
+                }
+            }
             const dmg = self.renderCells();
+            // If renderCells() overflowed the atlas and cleared it, re-pack hero
+            // glyphs into the fresh atlas before submitting GPU instances.
+            if (cfg.indium and self.menu.open) {
+                self.ensureMenuHero();
+            }
             const t1: i64 = if (is_prof) context_mod.nowMs() else 0;
             if (is_prof) {
                 prof_frames += 1;
@@ -2784,18 +3631,70 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     prof_last_sec = now;
                 }
             }
-            // Nothing painted (mode toggles, queries, title-only output,
-            // hidden-cursor blink landings): the buffer is unchanged, so
-            // skip the commit instead of damaging the whole surface.
-            if (dmg.empty and self.resize_settle_ms == 0 and self.flow.settled()) {
+            const menu_extra: gl_mod.ExtraDrawCtx = if (cfg.indium and self.menu.open) .{
+                .ptr = @ptrCast(self),
+                .appendFn = appendMenuGpuCb,
+            } else .{};
+            const indium_settled = if (cfg.indium) self.ctx.indium.settled() and !self.ctx.indium.anyTicking() and self.menu.settled() else true;
+            if (cfg.indium and self.dmabuf_sub.active) {
+                const offsets = self.cellOffsets();
+                self.dmabuf_sub.resize(self.width, self.height, self.resize_settle_ms > 0);
+                self.dmabuf_sub.render(
+                    self.ctx.indium.layers.items,
+                    &self.atlas,
+                    &self.atlas_dirty,
+                    &self.color_atlas,
+                    &self.color_atlas_dirty,
+                    offsets.x,
+                    offsets.y,
+                    self.cell_w,
+                    self.cell_h,
+                    self.width,
+                    self.height,
+                    .{
+                        .ptr = @ptrCast(self),
+                        .getGlyph = indiumGlyphCb,
+                        .cell_w = self.cell_w,
+                        .ascent = self.ascent,
+                    },
+                    menu_extra,
+                );
+            } else if (cfg.indium and self.egl_sub.active) {
+                const offsets = self.cellOffsets();
+                self.egl_sub.resize(self.width, self.height, self.resize_settle_ms > 0);
+                self.egl_sub.render(
+                    self.ctx.indium.layers.items,
+                    &self.atlas,
+                    &self.atlas_dirty,
+                    &self.color_atlas,
+                    &self.color_atlas_dirty,
+                    offsets.x,
+                    offsets.y,
+                    self.cell_w,
+                    self.cell_h,
+                    self.width,
+                    self.height,
+                    .{
+                        .ptr = @ptrCast(self),
+                        .getGlyph = indiumGlyphCb,
+                        .cell_w = self.cell_w,
+                        .ascent = self.ascent,
+                    },
+                    menu_extra,
+                );
+            }
+            // Nothing painted on CPU SHM AND nothing animating on Indium: skip commit.
+            if (dmg.empty and self.resize_settle_ms == 0 and self.flow.settled() and indium_settled) {
                 self.needs_render = false;
                 return;
             }
-            c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_ATTACH, self.buffer, @as(i32, 0), @as(i32, 0));
-            if (dmg.empty or self.resize_settle_ms > 0) {
-                c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_DAMAGE_BUFFER, @as(i32, 0), @as(i32, 0), self.width, self.height);
-            } else {
-                c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_DAMAGE_BUFFER, dmg.x, dmg.y, dmg.w, dmg.h);
+            if (!dmg.empty or self.resize_settle_ms > 0 or !self.flow.settled() or !self.indiumGpuActive()) {
+                c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_ATTACH, self.buffer, @as(i32, 0), @as(i32, 0));
+                if (dmg.empty or self.resize_settle_ms > 0) {
+                    c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_DAMAGE_BUFFER, @as(i32, 0), @as(i32, 0), self.width, self.height);
+                } else {
+                    c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_DAMAGE_BUFFER, dmg.x, dmg.y, dmg.w, dmg.h);
+                }
             }
             if (self.frame_cb) |old| {
                 c.wl_proxy_destroy(@ptrCast(old));
@@ -2813,7 +3712,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
             c.wl_proxy_marshal(@ptrCast(self.surface), P.core.SURFACE_COMMIT);
             _ = c.wl_display_flush(self.display);
             self.frame_pending = true;
-            self.needs_render = !self.flow.settled();
+            self.needs_render = !self.flow.settled() or !indium_settled;
         }
 
         // -- main loop ------------------------------------------------------
@@ -2844,13 +3743,19 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         break;
                     }
                 }
+                const worker_fd: i32 = if (cfg.indium) self.dmabuf_sub.sockFd() else -1;
                 var fds = [_]linux.pollfd{
                     .{ .fd = wl_fd, .events = linux.POLL.IN, .revents = 0 },
-                    .{ .fd = self.pty_fd, .events = linux.POLL.IN, .revents = 0 },
+                    .{
+                        .fd = self.pty_fd,
+                        .events = linux.POLL.IN | @as(i16, if (self.pty_out_off < self.pty_out_q.items.len) linux.POLL.OUT else 0),
+                        .revents = 0,
+                    },
                     .{ .fd = self.repeat_fd, .events = linux.POLL.IN, .revents = 0 },
                     .{ .fd = self.config_fd, .events = linux.POLL.IN, .revents = 0 },
+                    .{ .fd = worker_fd, .events = linux.POLL.IN, .revents = 0 },
                 };
-                const nfds: usize = 4;
+                const nfds: usize = 5;
                 var poll_timeout: i32 = self.ctx.getTimeoutMs();
                 // A pending frame callback arrives on wl_fd (polled): no
                 // timer wake can present before it (present is gated on
@@ -2890,6 +3795,15 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     self.settleResize();
                 }
 
+                if (cfg.indium and worker_fd >= 0 and (fds[4].revents & (linux.POLL.IN | linux.POLL.HUP | linux.POLL.ERR)) != 0) {
+                    const out = self.dmabuf_sub.pollWorker(self.display, self.surface);
+                    if (out.attached_first) {
+                        self.ctx.grid.markAllDirty();
+                        self.needs_render = true;
+                    }
+                    if (out.need_render) self.needs_render = true;
+                }
+
                 // Shell gone with nothing left to read: Linux reports HUP
                 // without IN, so the read path below never sees EIO and
                 // poll() returns instantly forever (100% CPU, window stuck
@@ -2898,6 +3812,9 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 if ((pty_rev & linux.POLL.IN) == 0 and (pty_rev & (linux.POLL.HUP | linux.POLL.ERR | linux.POLL.NVAL)) != 0) {
                     self.running = false;
                     break;
+                }
+                if ((pty_rev & linux.POLL.OUT) != 0) {
+                    self.flushPtyOut();
                 }
                 if ((pty_rev & linux.POLL.IN) != 0) {
                     self.markActivity();
@@ -2921,6 +3838,7 @@ pub fn App(comptime cfg: config_mod.Config) type {
                         const prev_alt = self.ctx.alt_active;
                         const prev_title_len = self.ctx.title_len;
                         self.ctx.parse(pty_buf[0..rrc]);
+                        self.syncIndiumClearState();
                         self.ctx.answerQueries(pty_buf[0..rrc]);
                         if (self.ctx.title_len != prev_title_len and self.toplevel != null) {
                             var zbuf: [257:0]u8 = undefined;
@@ -3321,6 +4239,20 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
         }
 
+        fn openMenuUi(self: *Self) void {
+            if (!cfg.indium) return;
+            self.menu.openMenu(context_mod.nowMs());
+            self.menu.cell_w = self.cell_w;
+            self.menu.syncTheme(self.ctx.bg, self.ctx.fg, &self.ctx.palette);
+            self.menu.syncConfig(cfg, &self.runtime_cfg, false);
+            self.menu.renderer_label = if (self.menuCpuActive()) "CPU SHM" else if (self.egl_sub.active) "EGL Sub" else "GLES 3.0";
+            const raw_sh = self.runtime_cfg.shell orelse (if (std.c.getenv("SHELL")) |sp| std.mem.span(sp) else "sh");
+            self.menu.shell_label = if (std.mem.lastIndexOfScalar(u8, raw_sh, '/')) |si| raw_sh[si + 1 ..] else if (raw_sh.len > 0) raw_sh else "sh";
+            self.clearHover();
+            self.refreshCursor();
+            self.needs_render = true;
+        }
+
         fn handleSym(self: *Self, sym: u32, keycode: u32) void {
             if (self.xkb_state == null) return;
             const mods = self.currentMods();
@@ -3328,6 +4260,36 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Modifier-only press: hover-underline visibility may change.
             if (sym >= 0xFFE1 and sym <= 0xFFEE) {
                 if (cfg.hyperlinks and (sym == K.Control_L or sym == K.Control_R)) self.needs_render = true;
+                return;
+            }
+
+            // Ctrl+, (and Ctrl+Shift+,) always toggles Settings from any mode/app.
+            if (cfg.indium and mods.ctrl and !mods.alt and !mods.super and (sym == ',' or (mods.shift and sym == '<'))) {
+                if (self.menu.open) {
+                    self.menu.closeMenu(self.gpa);
+                    self.ctx.grid.markAllDirty();
+                    self.refreshCursor();
+                    self.needs_render = true;
+                } else {
+                    self.openMenuUi();
+                }
+                return;
+            }
+
+            if (cfg.indium and self.menu.open) {
+                const act = self.menu.onKey(self.gpa, sym, mods.shift);
+                switch (act) {
+                    .none => {
+                        if (self.menu.wantsTextInput() and !mods.ctrl and !mods.alt) {
+                            var kbuf: [16]u8 = undefined;
+                            const kn = xkb_state_key_get_utf8(self.xkb_state, keycode, &kbuf, kbuf.len);
+                            if (kn > 0) {
+                                self.handleMenuAction(self.menu.onTextInput(kbuf[0..@intCast(kn)]));
+                            }
+                        }
+                    },
+                    else => self.handleMenuAction(act),
+                }
                 return;
             }
 
@@ -3501,6 +4463,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
                     return;
                 }
                 self.closeFind();
+            }
+
+            if (cfg.indium and sym == K.Escape and !mods.ctrl and !mods.alt and !mods.shift and !mods.super and self.ctx.canOpenMenuOnBareEscape()) {
+                self.openMenuUi();
+                return;
             }
 
             // Font zoom shortcuts: Ctrl + '+'/'='/'KP_Add', Ctrl + '-'/'KP_Subtract', Ctrl + '0'/'KP_0'.
@@ -4746,6 +5713,12 @@ pub fn App(comptime cfg: config_mod.Config) type {
             if (cfg.scrollbar and self.sb_dragging) {
                 return P.cursor_shape.SHAPE_GRABBING;
             }
+            if (cfg.indium and self.menu.open) {
+                return if (self.menu.pointerCursorActive()) P.cursor_shape.SHAPE_POINTER else P.cursor_shape.SHAPE_DEFAULT;
+            }
+            if (cfg.indium and self.indium_hover_id != null) {
+                return P.cursor_shape.SHAPE_POINTER;
+            }
             if (cfg.hyperlinks and self.hover_active and mods.ctrl) {
                 return P.cursor_shape.SHAPE_POINTER;
             }
@@ -4815,6 +5788,15 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
             self.mouse_buttons = 0;
             self.clearHover();
+            if (cfg.indium) {
+                if (self.indium_hover_id) |hid| {
+                    if (self.ctx.indium.layers.items.len > 0) {
+                        var ebuf: [64]u8 = undefined;
+                        self.queuePtyOut(indium_mod.formatEventPointer(&ebuf, hid, "leave", 0, 0, 0, 0));
+                    }
+                    self.indium_hover_id = null;
+                }
+            }
         }
 
         fn appOnPointerMotion(data: ?*anyopaque, pointer: ?*P.Pointer, time: u32, sx: i32, sy: i32) callconv(.c) void {
@@ -4852,6 +5834,46 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 }
             }
             const mods = self.currentMods();
+            if (cfg.indium and self.menu.open) {
+                self.menu.cell_w = self.cell_w;
+                const bx: i32 = @divFloor(sx, 256);
+                const by: i32 = @divFloor(sy, 256);
+                self.handleMenuAction(self.menu.onPointerMove(bx, by, self.width, self.height));
+                return;
+            }
+            if (cfg.indium) {
+                if (self.ctx.indium.layers.items.len == 0) {
+                    if (self.indium_hover_id != null) {
+                        self.indium_hover_id = null;
+                        self.refreshCursor();
+                    }
+                } else {
+                    const bx: i32 = @divFloor(sx, 256);
+                    const by: i32 = @divFloor(sy, 256);
+                    if (self.indiumHitTest(bx, by)) |hit| {
+                        self.clearHover();
+                        if (self.indium_hover_id != hit.id) {
+                            if (self.indium_hover_id) |old_id| {
+                                var lbuf: [64]u8 = undefined;
+                                self.queuePtyOut(indium_mod.formatEventPointer(&lbuf, old_id, "leave", 0, 0, 0, self.indiumModMask()));
+                            }
+                            var ebuf: [64]u8 = undefined;
+                            self.queuePtyOut(indium_mod.formatEventPointer(&ebuf, hit.id, "enter", hit.lx, hit.ly, self.mouse_buttons, self.indiumModMask()));
+                            self.indium_hover_id = hit.id;
+                            self.refreshCursor();
+                        }
+                        var mbuf: [64]u8 = undefined;
+                        self.queuePtyOut(indium_mod.formatEventPointer(&mbuf, hit.id, "move", hit.lx, hit.ly, self.mouse_buttons, self.indiumModMask()));
+                        return;
+                    } else if (self.indium_hover_id) |old_id| {
+                        var lbuf: [64]u8 = undefined;
+                        self.queuePtyOut(indium_mod.formatEventPointer(&lbuf, old_id, "leave", 0, 0, 0, self.indiumModMask()));
+                        self.indium_hover_id = null;
+                        self.refreshCursor();
+                    }
+                    if (self.indiumModalId() != null) return;
+                }
+            }
             // Scrollbar hover tracks the strip (grab cursor) while the bar
             // is latched or fading; a faded strip keeps the text beam.
             if (cfg.scrollbar) {
@@ -4995,6 +6017,39 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 }
             }
             const mods = self.currentMods();
+            if (cfg.indium and self.menu.open) {
+                self.menu.cell_w = self.cell_w;
+                if (button == 0x110) {
+                    const bx: i32 = @divFloor(self.ptr_sx, 256);
+                    const by: i32 = @divFloor(self.ptr_sy, 256);
+                    self.handleMenuAction(self.menu.onPointerButton(self.gpa, bx, by, state == 1, self.width, self.height));
+                }
+                return;
+            }
+            if (cfg.indium and self.ctx.indium.layers.items.len > 0) {
+                const bx: i32 = @divFloor(self.ptr_sx, 256);
+                const by: i32 = @divFloor(self.ptr_sy, 256);
+                const btn: u8 = switch (button) {
+                    0x110 => 1,
+                    0x111 => 2,
+                    0x112 => 3,
+                    else => 0,
+                };
+                if (btn != 0) {
+                    if (self.indiumHitTest(bx, by)) |hit| {
+                        var bbuf: [64]u8 = undefined;
+                        self.queuePtyOut(indium_mod.formatEventPointer(&bbuf, hit.id, if (state == 1) "down" else "up", hit.lx, hit.ly, btn, self.indiumModMask()));
+                        return;
+                    }
+                    if (state == 1) {
+                        if (self.indiumModalId()) |mid| {
+                            var dbuf: [64]u8 = undefined;
+                            self.queuePtyOut(indium_mod.formatEventDismiss(&dbuf, mid));
+                            return;
+                        }
+                    }
+                }
+            }
             // Scrollbar drag release lands here even if a mouse app
             // grabbed the screen mid-drag (never strand the capture).
             if (cfg.scrollbar and self.sb_dragging and button == 0x110 and state == 0) {
@@ -5155,6 +6210,23 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // legacy path stands down so notches never step twice.
             if (self.axis_has_v120) return;
             const mods = self.currentMods();
+            if (cfg.indium and self.menu.open) {
+                const bx: i32 = @divFloor(self.ptr_sx, 256);
+                const by: i32 = @divFloor(self.ptr_sy, 256);
+                const delta_px: i32 = if (value > 0) 36 else if (value < 0) -36 else 0;
+                self.handleMenuAction(self.menu.onScroll(delta_px, bx, by, self.width, self.height));
+                return;
+            }
+            if (cfg.indium and self.ctx.indium.layers.items.len > 0) {
+                const bx: i32 = @divFloor(self.ptr_sx, 256);
+                const by: i32 = @divFloor(self.ptr_sy, 256);
+                if (self.indiumHitTest(bx, by)) |hit| {
+                    var wbuf: [64]u8 = undefined;
+                    const dir: i32 = if (value > 0) 1 else -1;
+                    self.queuePtyOut(indium_mod.formatEventWheel(&wbuf, hit.id, hit.lx, hit.ly, dir, self.indiumModMask()));
+                    return;
+                }
+            }
             // Ctrl+Wheel zoom: up (<0) zooms in, down (>0) zooms out.
             if (cfg.font_zoom and mods.ctrl and !mods.alt) {
                 if (value < 0) {
@@ -5229,6 +6301,26 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // so nothing ever steps twice).
             self.axis_has_v120 = true;
             const mods = self.currentMods();
+            if (cfg.indium and self.menu.open) {
+                const bx: i32 = @divFloor(self.ptr_sx, 256);
+                const by: i32 = @divFloor(self.ptr_sy, 256);
+                const delta_px: i32 = @divTrunc(value120 * 36, 120);
+                self.handleMenuAction(self.menu.onScroll(delta_px, bx, by, self.width, self.height));
+                return;
+            }
+            if (cfg.indium and self.ctx.indium.layers.items.len > 0) {
+                const bx: i32 = @divFloor(self.ptr_sx, 256);
+                const by: i32 = @divFloor(self.ptr_sy, 256);
+                if (self.indiumHitTest(bx, by)) |hit| {
+                    const step_i: u32 = @max(1, self.wheel_step);
+                    const rows_i = scrollbar_mod.consume120(&self.axis_accum, value120, step_i);
+                    if (rows_i != 0) {
+                        var wbuf: [64]u8 = undefined;
+                        self.queuePtyOut(indium_mod.formatEventWheel(&wbuf, hit.id, hit.lx, hit.ly, rows_i, self.indiumModMask()));
+                    }
+                    return;
+                }
+            }
             const step: u32 = @max(1, self.wheel_step);
             const rows = scrollbar_mod.consume120(&self.axis_accum, value120, step);
             if (rows == 0) return; // sub-notch: still accumulating
@@ -5304,6 +6396,11 @@ pub fn App(comptime cfg: config_mod.Config) type {
             } else if (std.mem.eql(u8, iname, "zxdg_decoration_manager_v1")) {
                 self.name_decoration = name;
                 self.want_decoration_v = @min(version, 1);
+            } else if (std.mem.eql(u8, iname, "wl_subcompositor")) {
+                self.name_subcompositor = name;
+            } else if (std.mem.eql(u8, iname, "zwp_linux_dmabuf_v1")) {
+                self.name_dmabuf = name;
+                self.want_dmabuf_v = @min(version, 4);
             }
         }
 
@@ -5761,4 +6858,24 @@ test "dnd uri-list formatting" {
         defer gpa.free(formatted);
         try std.testing.expectEqualStrings("'/home/user/it'\\''s cool.txt'", formatted);
     }
+}
+
+test "reloadConfig preserves live OSC colors unless config color changed" {
+    const A = App(config_mod.full);
+    var fake_ctx = struct { bg: u32, fg: u32, cursor_color: u32 }{
+        .bg = 0x201012,
+        .fg = 0xEDE0E0,
+        .cursor_color = 0xFF8899,
+    };
+    const old = config_loader.RuntimeConfig{ .bg = 0x0B0F11, .fg = 0xDCDCCC, .cursor_color = 0xDCDCCC, .font_subpixel = true };
+    const unchanged = config_loader.RuntimeConfig{ .bg = 0x0B0F11, .fg = 0xDCDCCC, .cursor_color = 0xDCDCCC, .font_subpixel = false };
+    A.applyReloadColors(&fake_ctx, &old, &unchanged);
+    try std.testing.expectEqual(@as(u32, 0x201012), fake_ctx.bg);
+    try std.testing.expectEqual(@as(u32, 0xEDE0E0), fake_ctx.fg);
+    try std.testing.expectEqual(@as(u32, 0xFF8899), fake_ctx.cursor_color);
+
+    const edited = config_loader.RuntimeConfig{ .bg = 0x1A1B26, .fg = 0xDCDCCC, .cursor_color = 0xDCDCCC, .font_subpixel = false };
+    A.applyReloadColors(&fake_ctx, &unchanged, &edited);
+    try std.testing.expectEqual(@as(u32, 0x1A1B26), fake_ctx.bg);
+    try std.testing.expectEqual(@as(u32, 0xEDE0E0), fake_ctx.fg);
 }

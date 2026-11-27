@@ -19,6 +19,9 @@ extern const wl_pointer_interface: c.wl_interface;
 extern const wl_data_device_manager_interface: c.wl_interface;
 extern const wl_data_device_interface: c.wl_interface;
 extern const wl_data_source_interface: c.wl_interface;
+extern const wl_region_interface: c.wl_interface;
+extern const wl_subcompositor_interface: c.wl_interface;
+extern const wl_subsurface_interface: c.wl_interface;
 
 pub const core = struct {
     pub const registry: *const c.wl_interface = &wl_registry_interface;
@@ -34,19 +37,35 @@ pub const core = struct {
     pub const data_device_manager: *const c.wl_interface = &wl_data_device_manager_interface;
     pub const data_device: *const c.wl_interface = &wl_data_device_interface;
     pub const data_source: *const c.wl_interface = &wl_data_source_interface;
+    pub const region: *const c.wl_interface = &wl_region_interface;
+    pub const subcompositor: *const c.wl_interface = &wl_subcompositor_interface;
+    pub const subsurface: *const c.wl_interface = &wl_subsurface_interface;
 
     // Core request opcodes (stable ABI).
     pub const DISPLAY_SYNC: u32 = 0;
     pub const DISPLAY_GET_REGISTRY: u32 = 1;
     pub const REGISTRY_BIND: u32 = 0;
     pub const COMPOSITOR_CREATE_SURFACE: u32 = 0;
+    pub const COMPOSITOR_CREATE_REGION: u32 = 1;
+    pub const REGION_DESTROY: u32 = 0;
     pub const SHM_CREATE_POOL: u32 = 0;
     pub const POOL_CREATE_BUFFER: u32 = 0;
     pub const POOL_DESTROY: u32 = 1;
+    pub const SURFACE_DESTROY: u32 = 0;
     pub const SURFACE_ATTACH: u32 = 1;
     pub const SURFACE_FRAME: u32 = 3;
+    pub const SURFACE_SET_OPAQUE_REGION: u32 = 4;
+    pub const SURFACE_SET_INPUT_REGION: u32 = 5;
     pub const SURFACE_COMMIT: u32 = 6;
     pub const SURFACE_DAMAGE_BUFFER: u32 = 9;
+    pub const SUBCOMPOSITOR_DESTROY: u32 = 0;
+    pub const SUBCOMPOSITOR_GET_SUBSURFACE: u32 = 1;
+    pub const SUBSURFACE_DESTROY: u32 = 0;
+    pub const SUBSURFACE_SET_POSITION: u32 = 1;
+    pub const SUBSURFACE_PLACE_ABOVE: u32 = 2;
+    pub const SUBSURFACE_PLACE_BELOW: u32 = 3;
+    pub const SUBSURFACE_SET_SYNC: u32 = 4;
+    pub const SUBSURFACE_SET_DESYNC: u32 = 5;
     pub const SEAT_GET_KEYBOARD: u32 = 1;
     pub const SEAT_GET_POINTER: u32 = 0;
 
@@ -99,6 +118,12 @@ pub const PrimarySelectionDeviceManager = opaque {};
 pub const PrimarySelectionDevice = opaque {};
 pub const PrimarySelectionOffer = opaque {};
 pub const PrimarySelectionSource = opaque {};
+pub const Region = opaque {};
+pub const Subcompositor = opaque {};
+pub const Subsurface = opaque {};
+pub const LinuxDmabuf = opaque {};
+pub const LinuxBufferParams = opaque {};
+pub const LinuxDmabufFeedback = opaque {};
 
 /// wl_array mirror (wayland-util). Only size/data are read.
 pub const Array = extern struct {
@@ -237,6 +262,7 @@ pub fn linkAll() void {
     text_input.link(core.seat, core.surface);
     decoration.link(&xdg_toplevel.interface);
     primary_selection.link(core.seat);
+    linux_dmabuf.link(core.surface, core.buffer);
 }
 
 // ---------------------------------------------------------------------------
@@ -554,6 +580,103 @@ pub const primary_selection = struct {
     }
 };
 
+// ---------------------------------------------------------------------------
+// linux-dmabuf-unstable-v1 (version 4):
+//   zwp_linux_dmabuf_v1: destroy=0, create_params=1, get_default_feedback=2, get_surface_feedback=3
+//   zwp_linux_buffer_params_v1: destroy=0, add=1, create=2, create_immed=3
+//   zwp_linux_dmabuf_feedback_v1: destroy=0
+// ---------------------------------------------------------------------------
+
+pub const linux_dmabuf = struct {
+    pub const version: c_int = 4;
+
+    pub const DESTROY: u32 = 0;
+    pub const CREATE_PARAMS: u32 = 1;
+    pub const GET_DEFAULT_FEEDBACK: u32 = 2;
+    pub const GET_SURFACE_FEEDBACK: u32 = 3;
+
+    pub const PARAMS_DESTROY: u32 = 0;
+    pub const PARAMS_ADD: u32 = 1;
+    pub const PARAMS_CREATE: u32 = 2;
+    pub const PARAMS_CREATE_IMMED: u32 = 3;
+
+    pub const FEEDBACK_DESTROY: u32 = 0;
+
+    var types_create_params = [_]?*const c.wl_interface{null};
+    var types_get_default_feedback = [_]?*const c.wl_interface{null};
+    var types_get_surface_feedback = [_]?*const c.wl_interface{ null, null };
+
+    var dmabuf_methods = [_]c.wl_message{
+        .{ .name = "destroy", .signature = "", .types = null },
+        .{ .name = "create_params", .signature = "n", .types = &types_create_params },
+        .{ .name = "get_default_feedback", .signature = "4n", .types = &types_get_default_feedback },
+        .{ .name = "get_surface_feedback", .signature = "4no", .types = &types_get_surface_feedback },
+    };
+    var dmabuf_events = [_]c.wl_message{
+        .{ .name = "format", .signature = "u", .types = null },
+        .{ .name = "modifier", .signature = "3uuu", .types = null },
+    };
+    pub var dmabuf_interface: c.wl_interface = .{
+        .name = "zwp_linux_dmabuf_v1",
+        .version = version,
+        .method_count = 4,
+        .methods = &dmabuf_methods,
+        .event_count = 2,
+        .events = &dmabuf_events,
+    };
+
+    var types_create_immed = [_]?*const c.wl_interface{ null, null, null, null, null };
+    var params_methods = [_]c.wl_message{
+        .{ .name = "destroy", .signature = "", .types = null },
+        .{ .name = "add", .signature = "huuuuu", .types = null },
+        .{ .name = "create", .signature = "iiuu", .types = null },
+        .{ .name = "create_immed", .signature = "2niiuu", .types = &types_create_immed },
+    };
+    var types_params_created = [_]?*const c.wl_interface{null};
+    var params_events = [_]c.wl_message{
+        .{ .name = "created", .signature = "n", .types = &types_params_created },
+        .{ .name = "failed", .signature = "", .types = null },
+    };
+    pub var params_interface: c.wl_interface = .{
+        .name = "zwp_linux_buffer_params_v1",
+        .version = version,
+        .method_count = 4,
+        .methods = &params_methods,
+        .event_count = 2,
+        .events = &params_events,
+    };
+
+    var feedback_methods = [_]c.wl_message{
+        .{ .name = "destroy", .signature = "", .types = null },
+    };
+    var feedback_events = [_]c.wl_message{
+        .{ .name = "done", .signature = "", .types = null },
+        .{ .name = "format_table", .signature = "hu", .types = null },
+        .{ .name = "main_device", .signature = "a", .types = null },
+        .{ .name = "tranche_done", .signature = "", .types = null },
+        .{ .name = "tranche_target_device", .signature = "a", .types = null },
+        .{ .name = "tranche_formats", .signature = "a", .types = null },
+        .{ .name = "tranche_flags", .signature = "u", .types = null },
+    };
+    pub var feedback_interface: c.wl_interface = .{
+        .name = "zwp_linux_dmabuf_feedback_v1",
+        .version = version,
+        .method_count = 1,
+        .methods = &feedback_methods,
+        .event_count = 7,
+        .events = &feedback_events,
+    };
+
+    pub fn link(surface_iface: *const c.wl_interface, buffer_iface: *const c.wl_interface) void {
+        types_create_params[0] = @ptrCast(&params_interface);
+        types_get_default_feedback[0] = @ptrCast(&feedback_interface);
+        types_get_surface_feedback[0] = @ptrCast(&feedback_interface);
+        types_get_surface_feedback[1] = @ptrCast(surface_iface);
+        types_create_immed[0] = @ptrCast(buffer_iface);
+        types_params_created[0] = @ptrCast(buffer_iface);
+    }
+};
+
 const std = @import("std");
 
 fn cstr(p: [*c]const u8) ?[]const u8 {
@@ -685,4 +808,20 @@ test "xdg tables sane + linked" {
     try std.testing.expectEqual(@as(u32, 1), primary_selection.OFFER_DESTROY);
     try std.testing.expectEqual(@as(u32, 0), primary_selection.SOURCE_OFFER);
     try std.testing.expectEqual(@as(u32, 1), primary_selection.SOURCE_DESTROY);
+    // linux-dmabuf-unstable-v1 (v4): names, counts, linkage, opcodes.
+    try expectName(&linux_dmabuf.dmabuf_interface, "zwp_linux_dmabuf_v1");
+    try expectName(&linux_dmabuf.params_interface, "zwp_linux_buffer_params_v1");
+    try expectName(&linux_dmabuf.feedback_interface, "zwp_linux_dmabuf_feedback_v1");
+    try std.testing.expectEqual(@as(c_int, 4), linux_dmabuf.dmabuf_interface.method_count);
+    try std.testing.expectEqual(@as(c_int, 2), linux_dmabuf.dmabuf_interface.event_count);
+    try std.testing.expectEqual(@as(c_int, 4), linux_dmabuf.params_interface.method_count);
+    try std.testing.expectEqual(@as(c_int, 2), linux_dmabuf.params_interface.event_count);
+    try std.testing.expectEqual(@as(c_int, 1), linux_dmabuf.feedback_interface.method_count);
+    try std.testing.expectEqual(@as(c_int, 7), linux_dmabuf.feedback_interface.event_count);
+    try std.testing.expect(linux_dmabuf.types_create_params[0] != null);
+    try expectName(linux_dmabuf.types_create_params[0].?, "zwp_linux_buffer_params_v1");
+    try std.testing.expect(linux_dmabuf.types_get_default_feedback[0] != null);
+    try expectName(linux_dmabuf.types_get_default_feedback[0].?, "zwp_linux_dmabuf_feedback_v1");
+    try std.testing.expect(linux_dmabuf.types_create_immed[0] != null);
+    try expectName(linux_dmabuf.types_create_immed[0].?, "wl_buffer");
 }
