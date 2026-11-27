@@ -3454,7 +3454,7 @@ pub const Menu = struct {
             .uv = .{ 0, 0, 0, 0 },
         });
         try appendTextGpu(gpa, instances, glyphs, card_vis, "Zinc 0.2.1", ban.x + 18, ban.y + 72 + y_off_i, th.hero_word, .bold, atlas_size, ga);
-        try appendTextGpu(gpa, instances, glyphs, card_vis, "Dithered GPU terminal · Linux Wayland", ban.x + 18, ban.y + 96 + y_off_i, th.tab_fg, .regular, atlas_size, ga);
+        try appendTextGpu(gpa, instances, glyphs, card_vis, "Wayland terminal · Linux", ban.x + 18, ban.y + 96 + y_off_i, th.tab_fg, .regular, atlas_size, ga);
 
         const cfg_lbl = "config v9";
         const cfg_lw = textWidthPx(cfg_lbl, glyphs.cell_w);
@@ -3592,8 +3592,8 @@ pub const Menu = struct {
         const mit_lbl = "MIT";
         const mit_w = textWidthPx(mit_lbl, glyphs.cell_w);
         try appendTextGpu(gpa, instances, glyphs, card_vis, mit_lbl, cr.x + cr.w - mit_w - 18, centerTextY(cr.y, cr.h, glyphs.ascent), th.muted_fg, .regular, atlas_size, ga);
-        try appendTextBoundGpu(gpa, instances, glyphs, card_vis, "Indium GPU & dithercn", cr.x + 58, cr.y + 13, cr.w - mit_w - 92, th.title_fg, .bold, atlas_size, ga);
-        try appendTextBoundGpu(gpa, instances, glyphs, card_vis, "Bayer 8x8 shaders · fontconfig · FreeType", cr.x + 58, cr.y + 35, cr.w - mit_w - 92, th.muted_fg, .regular, atlas_size, ga);
+        try appendTextBoundGpu(gpa, instances, glyphs, card_vis, "Built by Mvk", cr.x + 58, cr.y + 13, cr.w - mit_w - 92, th.title_fg, .bold, atlas_size, ga);
+        try appendTextBoundGpu(gpa, instances, glyphs, card_vis, "Indium · FreeType · fontconfig · Pixora", cr.x + 58, cr.y + 35, cr.w - mit_w - 92, th.muted_fg, .regular, atlas_size, ga);
     }
 
     fn appendEditorModalGpu(
@@ -4073,7 +4073,7 @@ pub const Menu = struct {
             software.fillRoundedRectPremult(buf, W, H, ban.x, ban.y, ban.w, ban.h, 13, ban_bg, 220, 0, 0, false, null);
             software.fillAuroraRectPremult(buf, W, H, ban.x, ban.y, ban.w, 82, 13, th.accent, th.accent_hi, 2, self.anim_time_s, 0.9);
             blitTextCpu(buf, W, H, atlas, glyphs, "Zinc 0.2.1", ban.x + 18, ban.y + 72, th.hero_word, .bold);
-            blitTextCpu(buf, W, H, atlas, glyphs, "Dithered GPU terminal · Linux Wayland", ban.x + 18, ban.y + 96, th.tab_fg, .regular);
+            blitTextCpu(buf, W, H, atlas, glyphs, "Wayland terminal · Linux", ban.x + 18, ban.y + 96, th.tab_fg, .regular);
 
             const ix = ab.open_card.x;
             const iw = lay.card.w - 32;
@@ -4104,8 +4104,8 @@ pub const Menu = struct {
             software.fillRoundedRectPremult(buf, W, H, ab.credits.x, ab.credits.y, ab.credits.w, ab.credits.h, 14, th.tile_bg, 255, 0, 0, false, null);
             software.fillRoundedRectPremult(buf, W, H, ab.credits.x + 12, ab.credits.y + 14, 36, 36, 10, th.icon_bg, 255, 0, 0, false, null);
             blitDinkieCpu(buf, W, H, ab.credits.x + 19, ab.credits.y + 18, 2, DINKIE_HEART, th.accent_hi);
-            blitTextBoundCpu(buf, W, H, atlas, glyphs, "Indium GPU & dithercn", ab.credits.x + 58, ab.credits.y + 13, ab.credits.w - 76, th.title_fg, .bold);
-            blitTextBoundCpu(buf, W, H, atlas, glyphs, "Bayer 8x8 shaders · fontconfig · FreeType", ab.credits.x + 58, ab.credits.y + 35, ab.credits.w - 76, th.muted_fg, .regular);
+            blitTextBoundCpu(buf, W, H, atlas, glyphs, "Built by Mvk", ab.credits.x + 58, ab.credits.y + 13, ab.credits.w - 76, th.title_fg, .bold);
+            blitTextBoundCpu(buf, W, H, atlas, glyphs, "Indium · FreeType · fontconfig · Pixora", ab.credits.x + 58, ab.credits.y + 35, ab.credits.w - 76, th.muted_fg, .regular);
         } else {
             const hcols = computeHelpCols(lay.card, glyphs.cell_w);
             const row_h = @divTrunc(CARD_H - 16, @as(i32, HELP_BINDS.len));
