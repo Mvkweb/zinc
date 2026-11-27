@@ -131,6 +131,9 @@ pub fn Context(comptime cfg: config_mod.Config) type {
         alt_saved_row: u16 = 0,
         alt_saved_wrap: bool = false,
         prompt_start_row: ?u16 = null,
+        prompt_input_row: ?u16 = null,
+        prompt_input_col: ?u16 = null,
+        seen_semantic_prompt: bool = false,
         in_prompt: bool = false,
         /// OSC 8 hyperlink table: owned URIs, cell link_idx = slot + 1
         /// (0 = none). Lookups bounds-check, so a table reset can never
@@ -1412,18 +1415,30 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     if (parts.payload.len > 0) {
                         switch (parts.payload[0]) {
                             'A' => {
+                                self.seen_semantic_prompt = true;
                                 self.prompt_start_row = self.cursor_row;
+                                self.prompt_input_row = null;
+                                self.prompt_input_col = null;
                                 self.in_prompt = true;
                             },
                             'B' => {
+                                self.seen_semantic_prompt = true;
+                                self.prompt_input_row = self.cursor_row;
+                                self.prompt_input_col = self.cursor_col;
                                 self.in_prompt = true;
                             },
                             'C' => {
+                                self.seen_semantic_prompt = true;
                                 self.in_prompt = false;
                                 self.prompt_start_row = null;
+                                self.prompt_input_row = null;
+                                self.prompt_input_col = null;
                             },
                             'D' => {
+                                self.seen_semantic_prompt = true;
                                 self.in_prompt = false;
+                                self.prompt_input_row = null;
+                                self.prompt_input_col = null;
                             },
                             else => {},
                         }
@@ -2022,10 +2037,18 @@ pub fn Context(comptime cfg: config_mod.Config) type {
 
         fn scrollRegionUp(self: *Self) void {
             if (self.prompt_start_row) |*psr| {
-                if (psr.* > 0) {
+                if (psr.* > self.scroll_top) {
                     psr.* -= 1;
                 } else {
                     self.prompt_start_row = null;
+                }
+            }
+            if (self.prompt_input_row) |*pir| {
+                if (pir.* > self.scroll_top) {
+                    pir.* -= 1;
+                } else {
+                    self.prompt_input_row = null;
+                    self.prompt_input_col = null;
                 }
             }
             if (self.scroll_top == 0 and self.scroll_bot == self.grid.rows - 1) {
@@ -2161,6 +2184,8 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     if (mode == 3 and cfg.scrollback_clear_on_ed3) self.grid.clearScrollback();
                     self.in_prompt = false;
                     self.prompt_start_row = null;
+                    self.prompt_input_row = null;
+                    self.prompt_input_col = null;
                 },
                 else => {},
             }
@@ -2227,6 +2252,9 @@ pub fn Context(comptime cfg: config_mod.Config) type {
             self.saved_wrap = false;
             self.in_prompt = false;
             self.prompt_start_row = null;
+            self.prompt_input_row = null;
+            self.prompt_input_col = null;
+            self.seen_semantic_prompt = false;
             self.cur_link = 0;
             self.decckm = false;
             self.decscusr_style = null;
@@ -2316,8 +2344,51 @@ pub fn Context(comptime cfg: config_mod.Config) type {
                     @memset(rslice, .{ .bg = cell_mod.COLOR_DEFAULT });
                 }
                 self.prompt_start_row = start_r;
+                self.prompt_input_row = null;
+                self.prompt_input_col = null;
                 self.grid.markRowsDirty(start_r, new_crow);
+            } else {
+                self.prompt_input_row = null;
+                self.prompt_input_col = null;
             }
+        }
+
+        /// True when any visible row below `cursor_row` holds non-blank cells
+        /// (e.g. fish/zsh Tab completion pagers, Ctrl+R history lists, inline menus).
+        pub fn hasContentBelowCursor(self: *const Self) bool {
+            var r: u16 = self.cursor_row + 1;
+            while (r < self.grid.rows) : (r += 1) {
+                const slice = self.grid.rowSliceConst(r);
+                for (slice) |cell| {
+                    if ((cell.rune != 0 and cell.rune != ' ') or
+                        !cell_mod.isDefaultColor(cell.bg) or
+                        cell.combining_count > 0)
+                    {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        }
+
+        /// True only when bare Escape should open Zinc's Settings overlay rather
+        /// than being sent to the shell/app (completion pagers, running commands,
+        /// typed prompt input, alt-screen, mouse/DECCKM apps, or Indium layers).
+        pub fn canOpenMenuOnBareEscape(self: *const Self) bool {
+            if (!cfg.indium) return false;
+            if (self.alt_active) return false;
+            if (self.indium.layers.items.len > 0) return false;
+            if (self.mouse_mode != .off or self.decckm) return false;
+            if (self.seen_semantic_prompt) {
+                if (!self.in_prompt) return false;
+                if (self.prompt_input_row) |ir| {
+                    if (self.cursor_row != ir or self.cursor_col != (self.prompt_input_col orelse 0)) {
+                        return false;
+                    }
+                }
+            }
+            if (self.hasContentBelowCursor()) return false;
+            return true;
         }
     };
 }
@@ -3683,6 +3754,35 @@ test "resize clears active prompt rows when in_prompt" {
 
     // Active prompt row should be cleared to blank default cells
     try std.testing.expect(ctx.grid.at(0, ctx.cursor_row).rune == 0 or ctx.grid.at(0, ctx.cursor_row).rune == ' ');
+}
+
+test "canOpenMenuOnBareEscape yields to pagers, commands, and typed input" {
+    var ctx = try Context(.{}).init(std.testing.allocator);
+    defer ctx.deinit();
+
+    // Fresh shell at prompt (OSC 133;A + prompt + OSC 133;B): safe to open menu.
+    ctx.parse("\x1b]133;A\x07~/zinc> \x1b]133;B\x07");
+    try std.testing.expect(ctx.canOpenMenuOnBareEscape());
+
+    // Completion pager drawn below cursor (e.g. fish Tab): Esc must go to shell.
+    ctx.parse("\x1b[s\r\n! (command)\x1b[u");
+    try std.testing.expect(ctx.hasContentBelowCursor());
+    try std.testing.expect(!ctx.canOpenMenuOnBareEscape());
+
+    // Clearing pager restores bare Esc menu shortcut.
+    ctx.parse("\x1b[J");
+    try std.testing.expect(!ctx.hasContentBelowCursor());
+    try std.testing.expect(ctx.canOpenMenuOnBareEscape());
+
+    // Typed command text moves cursor past 133;B: Esc goes to shell (vi mode / autosuggest).
+    ctx.parse("ls");
+    try std.testing.expect(!ctx.canOpenMenuOnBareEscape());
+    ctx.parse("\x08\x08");
+    try std.testing.expect(ctx.canOpenMenuOnBareEscape());
+
+    // Active running command (133;C): Esc goes to foreground process.
+    ctx.parse("\x1b]133;C\x07");
+    try std.testing.expect(!ctx.canOpenMenuOnBareEscape());
 }
 
 test "focus tracking reports exact CSI I and CSI O sequences" {

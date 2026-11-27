@@ -48,4 +48,5 @@ package() {
 
 	cp -a "$srcdir/stage/." "$pkgdir/usr/"
 	install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
+	install -Dm644 THIRD_PARTY.md "$pkgdir/usr/share/licenses/$pkgname/THIRD_PARTY.md"
 }

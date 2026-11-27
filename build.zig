@@ -157,9 +157,7 @@ pub fn build(b: *std.Build) void {
             },
         }),
     });
-    b.installArtifact(indium_demo);
     const indium_demo_run = b.addRunArtifact(indium_demo);
-    indium_demo_run.step.dependOn(b.getInstallStep());
     const indium_demo_step = b.step("indium-demo", "Run the Indium UI showcase demo (run inside zinc)");
     indium_demo_step.dependOn(&indium_demo_run.step);
 
@@ -235,7 +233,6 @@ pub fn build(b: *std.Build) void {
 const uninstall_rel_paths = [_][]const u8{
     "bin/zinc",
     "bin/zinc-gpu",
-    "bin/indium-demo",
     "share/applications/io.github.mvkweb.zinc.desktop",
     "share/metainfo/io.github.mvkweb.zinc.metainfo.xml",
     "share/pixmaps/zinc.png",

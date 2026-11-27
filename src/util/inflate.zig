@@ -1,7 +1,7 @@
 //! RFC1951 DEFLATE decoder: stored + fixed/dynamic Huffman + LZ77.
 //! Output-bounded (zip-bomb safe); the only allocation is the output.
-//! Serves kitty PNG (f=100) IDAT and zlib-wrapped (o=z) payloads.
-//! PNG IDAT is a raw DEFLATE stream; o=z wraps it in a zlib header+Adler32.
+//! Serves kitty zlib-wrapped (o=z) and PNG IDAT zlib payloads, plus raw DEFLATE.
+//! Note: per RFC 2083, PNG IDAT is a zlib-wrapped DEFLATE stream (header + Adler32).
 
 const std = @import("std");
 
@@ -251,8 +251,8 @@ pub fn adler32(data: []const u8) u32 {
     return (b << 16) | a;
 }
 
-/// zlib-wrapped DEFLATE (kitty o=z): validates CMF/FLG + Adler32, then
-/// decodes with the same output bound. PNG IDAT is raw DEFLATE (no wrapper).
+/// zlib-wrapped DEFLATE (PNG IDAT, kitty o=z): validates CMF/FLG + Adler32,
+/// then decodes with the same output bound.
 pub fn zlibDecompressBounded(gpa: std.mem.Allocator, src: []const u8, max_out: usize) InflateError![]u8 {
     if (src.len < 6) return error.InvalidData;
     const cmf = src[0];

@@ -440,6 +440,7 @@ test {
     _ = @import("config/loader.zig");
     _ = @import("config/writer.zig");
     _ = @import("config/editors.zig");
+    _ = @import("ui/pixora.zig");
     _ = @import("context.zig");
     _ = @import("term/cell.zig");
     _ = @import("term/grid.zig");

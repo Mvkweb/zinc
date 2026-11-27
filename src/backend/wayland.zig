@@ -4239,6 +4239,20 @@ pub fn App(comptime cfg: config_mod.Config) type {
             }
         }
 
+        fn openMenuUi(self: *Self) void {
+            if (!cfg.indium) return;
+            self.menu.openMenu(context_mod.nowMs());
+            self.menu.cell_w = self.cell_w;
+            self.menu.syncTheme(self.ctx.bg, self.ctx.fg, &self.ctx.palette);
+            self.menu.syncConfig(cfg, &self.runtime_cfg, false);
+            self.menu.renderer_label = if (self.menuCpuActive()) "CPU SHM" else if (self.egl_sub.active) "EGL Sub" else "GLES 3.0";
+            const raw_sh = self.runtime_cfg.shell orelse (if (std.c.getenv("SHELL")) |sp| std.mem.span(sp) else "sh");
+            self.menu.shell_label = if (std.mem.lastIndexOfScalar(u8, raw_sh, '/')) |si| raw_sh[si + 1 ..] else if (raw_sh.len > 0) raw_sh else "sh";
+            self.clearHover();
+            self.refreshCursor();
+            self.needs_render = true;
+        }
+
         fn handleSym(self: *Self, sym: u32, keycode: u32) void {
             if (self.xkb_state == null) return;
             const mods = self.currentMods();
@@ -4246,6 +4260,19 @@ pub fn App(comptime cfg: config_mod.Config) type {
             // Modifier-only press: hover-underline visibility may change.
             if (sym >= 0xFFE1 and sym <= 0xFFEE) {
                 if (cfg.hyperlinks and (sym == K.Control_L or sym == K.Control_R)) self.needs_render = true;
+                return;
+            }
+
+            // Ctrl+, (and Ctrl+Shift+,) always toggles Settings from any mode/app.
+            if (cfg.indium and mods.ctrl and !mods.alt and !mods.super and (sym == ',' or (mods.shift and sym == '<'))) {
+                if (self.menu.open) {
+                    self.menu.closeMenu(self.gpa);
+                    self.ctx.grid.markAllDirty();
+                    self.refreshCursor();
+                    self.needs_render = true;
+                } else {
+                    self.openMenuUi();
+                }
                 return;
             }
 
@@ -4438,17 +4465,8 @@ pub fn App(comptime cfg: config_mod.Config) type {
                 self.closeFind();
             }
 
-            if (cfg.indium and sym == K.Escape and !mods.ctrl and !mods.alt and !mods.shift and !mods.super and !self.ctx.alt_active and self.ctx.indium.layers.items.len == 0) {
-                self.menu.openMenu(context_mod.nowMs());
-                self.menu.cell_w = self.cell_w;
-                self.menu.syncTheme(self.ctx.bg, self.ctx.fg, &self.ctx.palette);
-                self.menu.syncConfig(cfg, &self.runtime_cfg, false);
-                self.menu.renderer_label = if (self.menuCpuActive()) "CPU SHM" else if (self.egl_sub.active) "EGL Sub" else "GLES 3.0";
-                const raw_sh = self.runtime_cfg.shell orelse (if (std.c.getenv("SHELL")) |sp| std.mem.span(sp) else "sh");
-                self.menu.shell_label = if (std.mem.lastIndexOfScalar(u8, raw_sh, '/')) |si| raw_sh[si + 1 ..] else if (raw_sh.len > 0) raw_sh else "sh";
-                self.clearHover();
-                self.refreshCursor();
-                self.needs_render = true;
+            if (cfg.indium and sym == K.Escape and !mods.ctrl and !mods.alt and !mods.shift and !mods.super and self.ctx.canOpenMenuOnBareEscape()) {
+                self.openMenuUi();
                 return;
             }
 

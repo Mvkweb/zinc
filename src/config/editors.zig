@@ -5,13 +5,24 @@ const std = @import("std");
 const linux = std.os.linux;
 const png_mod = @import("../util/png.zig");
 const kitty_mod = @import("../gfx/kitty.zig");
+const pixora = @import("../ui/pixora.zig");
 
-pub const ICON_PX: u16 = 24;
+/// Rendered icon size in the editor picker. 32 keeps Pixora's 16x16 pixel art
+/// on an integer 2x grid while giving system-theme PNGs a little more detail.
+pub const ICON_PX: u16 = 32;
 
 pub const EditorKind = enum {
     gui,
     tui,
 };
+
+/// `ZINC_ICON_THEME=pixora` puts the bundled pixel-art editor icons ahead of
+/// the installed icon theme. Default keeps the system theme first so users who
+/// already have artwork for these apps keep it.
+fn preferPixora() bool {
+    const v = std.c.getenv("ZINC_ICON_THEME") orelse return false;
+    return std.ascii.eqlIgnoreCase(std.mem.span(v), "pixora");
+}
 
 pub const DetectedEditor = struct {
     name: []u8,
@@ -42,6 +53,8 @@ const Candidate = struct {
     desktop_ids: []const []const u8,
     bins: []const []const u8,
     arg_tpl: []const u8,
+    /// Pixora fallback key; empty when the set has no artwork for this editor.
+    icon_key: []const u8 = "",
 };
 
 const GUI_CANDIDATES = [_]Candidate{
@@ -50,24 +63,28 @@ const GUI_CANDIDATES = [_]Candidate{
         .desktop_ids = &.{ "dev.zed.Zed.desktop", "zed.desktop", "dev.zed.Zed-Preview.desktop" },
         .bins = &.{ "zed", "zeditor", "zedit" },
         .arg_tpl = "{bin} {file}:{line}:{col}",
+        .icon_key = "zed",
     },
     .{
         .name = "VS Code",
         .desktop_ids = &.{ "code.desktop", "visual-studio-code.desktop", "com.visualstudio.code.desktop" },
         .bins = &.{"code"},
         .arg_tpl = "{bin} --goto {file}:{line}:{col}",
+        .icon_key = "vscode",
     },
     .{
         .name = "Code - OSS",
         .desktop_ids = &.{"code-oss.desktop"},
         .bins = &.{"code-oss"},
         .arg_tpl = "{bin} --goto {file}:{line}:{col}",
+        .icon_key = "vscode",
     },
     .{
         .name = "VSCodium",
         .desktop_ids = &.{ "codium.desktop", "com.vscodium.codium.desktop" },
         .bins = &.{"codium"},
         .arg_tpl = "{bin} --goto {file}:{line}:{col}",
+        .icon_key = "vscode",
     },
     .{
         .name = "Cursor",
@@ -98,12 +115,14 @@ const GUI_CANDIDATES = [_]Candidate{
         .desktop_ids = &.{"org.gnome.TextEditor.desktop"},
         .bins = &.{"gnome-text-editor"},
         .arg_tpl = "{bin} {file}",
+        .icon_key = "gnome-text-editor",
     },
     .{
         .name = "Neovide",
         .desktop_ids = &.{ "neovide.desktop", "com.neovide.neovide.desktop" },
         .bins = &.{"neovide"},
         .arg_tpl = "{bin} +{line} {file}",
+        .icon_key = "nvim",
     },
     .{
         .name = "Emacs",
@@ -125,6 +144,7 @@ const TUI_CANDIDATES = [_]Candidate{
         .desktop_ids = &.{"nvim.desktop"},
         .bins = &.{"nvim"},
         .arg_tpl = "{bin} +{line} {file}",
+        .icon_key = "nvim",
     },
     .{
         .name = "Helix",
@@ -143,12 +163,14 @@ const TUI_CANDIDATES = [_]Candidate{
         .desktop_ids = &.{"vim.desktop"},
         .bins = &.{"vim"},
         .arg_tpl = "{bin} +{line} {file}",
+        .icon_key = "vim",
     },
     .{
         .name = "Micro",
         .desktop_ids = &.{"micro.desktop"},
         .bins = &.{"micro"},
         .arg_tpl = "{bin} +{line}:{col} {file}",
+        .icon_key = "micro",
     },
     .{
         .name = "Kakoune",
@@ -457,7 +479,13 @@ pub fn discoverEditors(gpa: std.mem.Allocator, kind: EditorKind) !EditorCatalog 
             errdefer gpa.free(cmd_owned);
             const icon_owned = try gpa.dupe(u8, found_icon);
             errdefer gpa.free(icon_owned);
-            const px = findAndLoadIconPng(gpa, data_dirs.items, found_icon);
+            // Installed icon themes win by default; Pixora is the guaranteed
+            // fallback and can be forced with ZINC_ICON_THEME=pixora.
+            const px = if (preferPixora())
+                pixora.load(gpa, cand.icon_key) orelse findAndLoadIconPng(gpa, data_dirs.items, found_icon)
+            else
+                findAndLoadIconPng(gpa, data_dirs.items, found_icon) orelse pixora.load(gpa, cand.icon_key);
+            errdefer if (px) |p| gpa.free(p);
 
             try cat.items.append(gpa, .{
                 .name = name_owned,
@@ -536,4 +564,15 @@ test "labelForCommand identifies editors cleanly" {
     try std.testing.expectEqualStrings("Off (GUI)", labelForCommand("", .tui));
     try std.testing.expectEqualStrings("VS Code", labelForCommand("code --goto {file}:{line}:{col}", .gui));
     try std.testing.expectEqualStrings("Neovim", labelForCommand("/usr/bin/nvim +{line} {file}", .tui));
+}
+
+test "candidate icon keys resolve to Pixora assets" {
+    for (GUI_CANDIDATES) |cand| {
+        if (cand.icon_key.len == 0) continue;
+        try std.testing.expect(pixora.pngFor(cand.icon_key) != null);
+    }
+    for (TUI_CANDIDATES) |cand| {
+        if (cand.icon_key.len == 0) continue;
+        try std.testing.expect(pixora.pngFor(cand.icon_key) != null);
+    }
 }

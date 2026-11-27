@@ -74,7 +74,7 @@ pub const HelpSpec = struct {
 };
 
 pub const HELP_BINDS = [_]HelpSpec{
-    .{ .keys = "Esc", .desc = "Open or close this menu" },
+    .{ .keys = "Esc / Ctrl+,", .desc = "Open or close this menu" },
     .{ .keys = "Left / Right", .desc = "Switch Settings / Help / About / Quit" },
     .{ .keys = "Up / Down / Enter", .desc = "Navigate & edit card rows" },
     .{ .keys = "Ctrl + Shift + C/V", .desc = "Copy / paste Wayland clipboard" },
@@ -2381,7 +2381,7 @@ pub const Menu = struct {
                 .vis = vis_rect,
                 .c0 = .{ 1, 1, 1, 1 },
                 .c1 = .{ 0, 0, 0, 0 },
-                .p0 = .{ 5.0, -1.0, 0, 0 },
+                .p0 = .{ 0.0, -1.0, 0, 0 },
                 .p1 = .{ 0, 0, 0, 0 },
                 .flags = .{ 11, 0, 0, ga },
                 .uv = .{
@@ -2394,9 +2394,13 @@ pub const Menu = struct {
             return;
         }
         // Polaris `ow-icon-fallback`: rounded Bayer dotted square + monogram initial.
-        const fx: f32 = @floatFromInt(x);
-        const fy: f32 = @floatFromInt(y);
-        const fsz: f32 = @floatFromInt(sz);
+        // Keep large 32px icon slots capped at a clean 24x24 fallback badge centered in the slot.
+        const bsz: i32 = if (sz > 26) 24 else sz;
+        const bx = x + @divTrunc(sz - bsz, 2);
+        const by = y + @divTrunc(sz - bsz, 2);
+        const fx: f32 = @floatFromInt(bx);
+        const fy: f32 = @floatFromInt(by);
+        const fsz: f32 = @floatFromInt(bsz);
         try instances.append(gpa, .{
             .rect = .{ fx, fy, fsz, fsz },
             .mask = .{ 0, 0, 0, 0 },
@@ -2420,7 +2424,7 @@ pub const Menu = struct {
             .uv = .{ 0, 0, 0, 0 },
         });
         const ch = [1]u8{std.ascii.toUpper(initial)};
-        try appendTextGpu(gpa, instances, glyphs, vis_rect, &ch, x + @divTrunc(sz - glyphs.cell_w, 2), y + @divTrunc(sz - glyphs.ascent - 4, 2), th.accent_hi, .bold, atlas_size, ga);
+        try appendTextGpu(gpa, instances, glyphs, vis_rect, &ch, bx + @divTrunc(bsz - glyphs.cell_w, 2), by + @divTrunc(bsz - glyphs.ascent - 4, 2), th.accent_hi, .bold, atlas_size, ga);
     }
 
     pub fn appendGpuInstances(
@@ -3711,10 +3715,11 @@ pub const Menu = struct {
 
             const pos: ?atlas_mod.Atlas.Pos = if (i < ep.packed_icons.items.len) ep.packed_icons.items[i].packed_pos else null;
             const init_ch: u8 = if (item.name.len > 0) item.name[0] else 'E';
-            try appendBadgeGpu(gpa, instances, glyphs, list_vis, row_x_i + 6, ry + 8, 24, pos, init_ch, th, atlas_size, ga);
+            const icon_sz: i32 = @intCast(editors_mod.ICON_PX);
+            try appendBadgeGpu(gpa, instances, glyphs, list_vis, row_x_i + 6, ry + 4, icon_sz, pos, init_ch, th, atlas_size, ga);
 
-            const name_x = row_x_i + 38;
-            const name_max_w = @max(60, row_w_i - 74);
+            const name_x = row_x_i + 46;
+            const name_max_w = @max(60, row_w_i - 82);
             if (item.cmd_template.len > 0) {
                 try appendTextBoundGpu(gpa, instances, glyphs, list_vis, item.name, name_x, ry + 5, name_max_w, if (is_sel) th.hero_word else th.tab_fg, .bold, atlas_size, ga);
                 try appendTextBoundGpu(gpa, instances, glyphs, list_vis, item.cmd_template, name_x, ry + 22, name_max_w, th.muted_fg, .regular, atlas_size, ga);
@@ -4126,10 +4131,10 @@ pub const Menu = struct {
                 if (ry + 40 < eg.list_top or ry >= eg.list_top + eg.list_h) continue;
                 if (i < ep.packed_icons.items.len) {
                     if (ep.packed_icons.items[i].packed_pos) |pos| {
-                        software.blitColorAtlasRect(buf, W, H, color_atlas.pixels, atlas_mod.ColorAtlas.SIZE, pos.x, pos.y, editors_mod.ICON_PX, editors_mod.ICON_PX, modal.x + 20, ry + 8);
+                        software.blitColorAtlasRect(buf, W, H, color_atlas.pixels, atlas_mod.ColorAtlas.SIZE, pos.x, pos.y, editors_mod.ICON_PX, editors_mod.ICON_PX, modal.x + 20, ry + 4);
                     }
                 }
-                blitTextBoundCpu(buf, W, H, atlas, glyphs, item.name, modal.x + 52, ry + 10, modal.w - 92, th.title_fg, .bold);
+                blitTextBoundCpu(buf, W, H, atlas, glyphs, item.name, modal.x + 60, centerTextY(ry, 40, glyphs.ascent), modal.w - 100, th.title_fg, .bold);
             }
             software.fillRoundedRectPremult(buf, W, H, eg.cancel_btn.x, eg.cancel_btn.y, eg.cancel_btn.w, eg.cancel_btn.h, 8, th.tile_bg, 255, th.keycap_border, 75, false, null);
             blitTextCpu(buf, W, H, atlas, glyphs, "Cancel", eg.cancel_btn.x + @divTrunc(eg.cancel_btn.w - textWidthPx("Cancel", glyphs.cell_w), 2), centerTextY(eg.cancel_btn.y, eg.cancel_btn.h, glyphs.ascent), th.tab_fg, .regular);
