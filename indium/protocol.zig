@@ -1,4 +1,5 @@
 //! Indium wire protocol encoder & stdin event parser (`ESC _ I;... ESC \`).
+//! Copyright (c) 2026 Mvkweb — part of zinc (MIT).
 //! Pure Zig 0.17.0, zero platform UI dependencies.
 
 const std = @import("std");

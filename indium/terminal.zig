@@ -1,4 +1,5 @@
 //! Indium terminal session: raw termios, alt-screen, buffered stdout,
+//! Copyright (c) 2026 Mvkweb — part of zinc (MIT).
 //! zinc capability probe, and non-blocking event polling (Zig 0.17.0).
 
 const std = @import("std");

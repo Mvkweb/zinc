@@ -140,26 +140,12 @@ pub fn build(b: *std.Build) void {
     bench_step.dependOn(&b.addRunArtifact(bench_exe).step);
     check_step.dependOn(&bench_exe.step);
 
-    // Indium TUI library + interactive showcase demo.
+    // Indium GPU overlay SDK (tests wired into check/test).
     const indium_module = b.createModule(.{
         .root_source_file = b.path("indium/root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const indium_demo = b.addExecutable(.{
-        .name = "indium-demo",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("indium/examples/showcase.zig"),
-            .target = target,
-            .optimize = optimize,
-            .imports = &.{
-                .{ .name = "indium", .module = indium_module },
-            },
-        }),
-    });
-    const indium_demo_run = b.addRunArtifact(indium_demo);
-    const indium_demo_step = b.step("indium-demo", "Run the Indium UI showcase demo (run inside zinc)");
-    indium_demo_step.dependOn(&indium_demo_run.step);
 
     const indium_tests = b.addTest(.{
         .name = "indium-tests",
@@ -167,7 +153,6 @@ pub fn build(b: *std.Build) void {
     });
     const run_indium_tests = b.addRunArtifact(indium_tests);
     test_step.dependOn(&run_indium_tests.step);
-    check_step.dependOn(&indium_demo.step);
     check_step.dependOn(&indium_tests.step);
 
     // Desktop integration: `zig build install --prefix ~/.local` (or /usr

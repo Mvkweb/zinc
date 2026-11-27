@@ -1,4 +1,5 @@
-//! Indium: High-FPS animated Zig TUI library for Zinc.
+//! Indium: High-FPS animated Zig overlay SDK for Zinc.
+//! Copyright (c) 2026 Mvkweb — part of zinc (MIT).
 //! Exposes retained compositor layers, spring physics, Bayer-dithered cards,
 //! animated buttons, pixel-smooth dropdowns/menus, and collapsible sidebars.
 

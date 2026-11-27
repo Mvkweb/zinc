@@ -1,4 +1,5 @@
 //! Indium draw-list builder & obsidian theme palette.
+//! Copyright (c) 2026 Mvkweb — part of zinc (MIT).
 //! Emits compact rounded rects, 4x4 Bayer-dithered gradients, dithered
 //! donut arcs, dividers, and native FreeType text ops into APC payloads.
 

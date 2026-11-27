@@ -16,9 +16,16 @@ Keep in mind this is still experimental and you will surely find issues. If you 
 - **Smart click**: `Ctrl+click` files to open in your editor, `Ctrl+click` folders to `cd`.
 - **Smart selection**: double-click words/URLs, triple-click lines, and `Alt+drag` for a rectangular column of text.
 - **Follows your cwd**: optionally start new windows in the last active zinc window's directory with `session-inherit-cwd = true`; `zinc --cwd /path` overrides it.
-- **Lightweight**: memory footprint stays around ~23MB in a maximized window.
+- **Settings GUI**: press `Esc` on an empty prompt (or `Ctrl+,` anywhere) to change settings live.
+- **Lightweight**: ~14-16MB idle (~23MB maximized).
 
 Full breakdown in [features.md](features.md).
+
+## Indium
+
+Indium (`zinc-gpu` + `indium/`) is the GPU overlay engine behind Zinc's `Esc` / `Ctrl+,` settings menu and custom overlays using the Zig SDK (`ESC _ I;... ESC \`).
+
+Normally `zinc` only uses CPU shared memory with no OpenGL driver loaded. When an overlay or the settings menu opens, it spawns `zinc-gpu` (DMA-BUF + GLES 3.0) on a Wayland subsurface and kills it again as soon as it closes. Falls back to `ZINC_INDIUM_EGL=1` or `ZINC_INDIUM_CPU=1` if needed.
 
 <details>
 <summary><b>Default configuration (<code>~/.config/zinc/config</code>)</b></summary>

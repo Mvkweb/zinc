@@ -1,4 +1,5 @@
-//! Indium retained overlay protocol (`ESC _ I;... ESC \`).
+//! Indium retained overlay engine & APC protocol (`ESC _ I;... ESC \`).
+//! Copyright (c) 2026 Mvkweb — part of zinc (MIT).
 //!
 //! Apps declare retained layers (cards, dropdowns, menus, buttons, charts,
 //! sidebars) with pixel dimensions, cell/pixel anchors, clip reveal rects,

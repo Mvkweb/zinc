@@ -1,6 +1,7 @@
-//! Indium UI components: dither-sdk-faithful animated buttons, pixel-smooth
-//! dropdowns/menus, collapsible reflowing sidebar, Bayer-dithered bar chart,
-//! donut chart, 4x4 Bayer tile heatmap, progress bar, DitherSwitch, and UptimeBar.
+//! Indium UI components: animated buttons, pixel-smooth dropdowns/menus,
+//! Copyright (c) 2026 Mvkweb — part of zinc (MIT).
+//! collapsible reflowing sidebar, Bayer-dithered bar chart, donut chart,
+//! 4x4 Bayer tile heatmap, progress bar, DitherSwitch, and UptimeBar.
 
 const std = @import("std");
 const proto = @import("protocol.zig");
